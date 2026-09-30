@@ -1,4 +1,6 @@
 """Shared helpers: locations, JSON reading, time formatting, state directory."""
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -213,3 +215,23 @@ def fmt_ms(ms):
 
 def now_rfc3339():
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+class LockBusy(Exception):
+    """Another write operation of this tool is already running."""
+
+
+@contextlib.contextmanager
+def write_lock(paths):
+    """One writer at a time for every command that changes the Claude storage."""
+    d = safe_subdir(paths)
+    fd = os.open(os.path.join(d, "mutate.lock"),
+                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise LockBusy("another write operation of this tool is running")
+        yield
+    finally:
+        os.close(fd)

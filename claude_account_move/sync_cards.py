@@ -217,6 +217,9 @@ def _safe_remove(path, dev, ino, digest):
         ours = (os.path.isfile(quarantine) and not os.path.islink(quarantine)
                 and (st.st_dev, st.st_ino) == (dev, ino)
                 and sha256_file(quarantine) == digest)
+        after = os.lstat(quarantine)
+        if (after.st_size, after.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
+            ours = False          # written through an already-open descriptor
     except OSError:
         ours = False
     if ours:

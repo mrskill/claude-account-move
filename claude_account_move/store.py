@@ -178,6 +178,11 @@ def scan(paths):
         if not s.exists:
             continue
         base_real = os.path.realpath(base)
+        if not inside(base_real, os.path.realpath(paths.support)):
+            obs.excluded_outside += 1
+            obs.errors.append("store root resolves outside the support folder: "
+                              "%s -> %s" % (base, base_real))
+            continue
         try:
             accs = sorted(os.listdir(base))
         except OSError as exc:

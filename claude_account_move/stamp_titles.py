@@ -101,45 +101,69 @@ def read_raw(path):
 
 
 def plan_stamps(index, tmap):
-    """(items, stats). Item: path, title, new, when, raw."""
-    stats = {"cards": 0, "no_transcript": 0, "empty_title": 0,
+    """(items, stats). Item: path, title, new, when, raw.
+
+    Everything about a card (title, session id, rollback bytes) comes from ONE
+    freshly read document, never from the earlier scan, so a card the app
+    changed in between is planned coherently. Problems met here (unreadable
+    card or transcript, conflicting session ids behind one card name) go to
+    `index.obs`; the caller must refuse to write while it is incomplete.
+    """
+    stats = {"cards": 0, "no_transcript": 0, "empty_title": 0, "conflict": 0,
              "unknown_format": 0, "current": 0, "planned": 0}
     groups = {}
     for store in STORES:
         for real, info in sorted(index.stores[store].dirs.items()):
-            for name, card in info["cards"].items():
-                groups.setdefault(name, []).append((real, card))
+            for name in info["cards"]:
+                path = os.path.join(real, name)
+                try:
+                    raw = read_raw(path)
+                    d = json.loads(raw)
+                    if not isinstance(d, dict):
+                        raise ValueError("card is not an object")
+                except (OSError, ValueError):
+                    index.obs.unreadable_cards += 1
+                    index.obs.errors.append("card unreadable while planning: %s" % path)
+                    continue
+                groups.setdefault(name, []).append((path, raw, d))
     items = []
     for name, copies in sorted(groups.items()):
+        cids = sorted({str(d.get("cliSessionId") or "").strip().lower()
+                       for _, _, d in copies} - {""})
+        if len(cids) > 1:
+            stats["conflict"] += len(copies)
+            index.obs.errors.append("conflicting session ids behind one card "
+                                    "name: %s" % name)
+            continue
         best = None
-        for sid in sorted({c["cid"].lower() for _, c in copies if c["cid"]}):
+        for sid in cids:
+            for f in tmap.get(sid) or []:
+                try:
+                    with open(f, "rb"):
+                        pass
+                except OSError:
+                    index.obs.errors.append("transcript unreadable: %s" % f)
             ms = st.session_last_ms(tmap, sid)
             if ms is not None and (best is None or ms > best):
                 best = ms
-        for real, card in copies:
+        for path, raw, d in copies:
             stats["cards"] += 1
             if best is None:
                 stats["no_transcript"] += 1
                 continue
-            if not card["title"].strip():
+            title = d.get("title")
+            if not isinstance(title, str) or not title.strip():
                 stats["empty_title"] += 1
                 continue
             when = datetime.datetime.fromtimestamp(best / 1000).astimezone()
-            new = stamped(card["title"], when)
-            if new == card["title"]:
+            new = stamped(title, when)
+            if new == title:
                 stats["current"] += 1
                 continue
-            path = os.path.join(real, name)
-            try:
-                raw = read_raw(path)
-                d = json.loads(raw)
-            except (OSError, ValueError):
-                index.obs.unreadable_cards += 1
-                continue
-            if not isinstance(d, dict) or style_of(raw, d)[0] is None:
+            if style_of(raw, d)[0] is None:
                 stats["unknown_format"] += 1
                 continue
-            items.append({"path": path, "title": card["title"], "new": new,
+            items.append({"path": path, "title": title, "new": new,
                           "when": when, "raw": raw})
             stats["planned"] += 1
     return items, stats
@@ -150,9 +174,86 @@ def new_journal_path(state_dir):
         time.strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:8]))
 
 
-def apply_stamps(items, journal_path, home_id, before_replace=None):
-    """Write the planned stamps. Returns {"written","changed","skipped","failed"}."""
-    res = {"written": 0, "changed": 0, "skipped": 0, "failed": 0}
+def _put_back(src, dst):
+    """Give `src` its name `dst` back without overwriting anything.
+
+    A hard link first; if that fails for a reason other than "name taken"
+    (for example no space for a directory entry) a plain rename, which needs no
+    new space. If the name is taken the file stays under `src`.
+    """
+    try:
+        os.link(src, dst)
+        os.unlink(src)
+    except FileExistsError:
+        pass
+    except OSError:
+        if not os.path.lexists(dst):
+            try:
+                os.rename(src, dst)
+            except OSError:
+                pass
+
+
+def _quarantine_name(path, tag):
+    return os.path.join(os.path.dirname(path), ".%s-%s-%s" % (
+        tag, uuid.uuid4().hex[:8], os.path.basename(path)))
+
+
+def _sig(path):
+    t = os.lstat(path)
+    return (t.st_ino, t.st_size, t.st_mtime_ns)
+
+
+def _publish(path, tmp, planned_raw, seen_ino):
+    """Replace `path` by `tmp` only if the file replaced is the one checked.
+
+    The card is first moved away with one atomic rename; only the moved file is
+    inspected. If it is not exactly the planned document (same inode, same
+    bytes) it is put back and nothing is published. After publishing, the moved
+    file is checked once more for a late write through a descriptor that was
+    already open: if one happened, the newer document is put back over the stamp.
+    Returns "written" | "changed" | "failed".
+    """
+    hold = _quarantine_name(path, "stamp-old")
+    try:
+        os.rename(path, hold)
+    except FileNotFoundError:
+        return "changed"
+    try:
+        sig = _sig(hold)
+        same = sig[0] == seen_ino and read_raw(hold) == planned_raw
+    except OSError:
+        same = False
+    if not same:
+        _put_back(hold, path)                # never overwriting; else it stays as `hold`
+        return "changed"
+    try:
+        os.link(tmp, path)                   # fails if the name was re-created
+    except FileExistsError:
+        os.unlink(hold)                      # their newer card wins; ours is stale
+        return "changed"
+    except OSError:
+        _put_back(hold, path)
+        return "failed"
+    try:
+        late = _sig(hold) != sig
+    except OSError:
+        late = True
+    if late:
+        os.replace(hold, path)               # keep the newer document, drop the stamp
+        return "changed"
+    os.unlink(hold)
+    return "written"
+
+
+def apply_stamps(items, journal_path, home_id, before_replace=None,
+                 support_real=None):
+    """Write the planned stamps.
+
+    Returns {"written","changed","skipped","failed","unacknowledged"}.
+    """
+    res = {"written": 0, "changed": 0, "skipped": 0, "failed": 0,
+           "unacknowledged": 0}
     op_id = uuid.uuid4().hex
     jr = Journal(journal_path, op_id)
     try:
@@ -163,10 +264,15 @@ def apply_stamps(items, journal_path, home_id, before_replace=None):
             path = it["path"]
             tmp = None
             try:
+                if support_real and not inside(os.path.realpath(os.path.dirname(path)),
+                                               support_real):
+                    res["skipped"] += 1          # outside the Claude support folder
+                    continue
                 raw = read_raw(path)
                 if raw != it["raw"]:
                     res["changed"] += 1          # changed since the plan: not touched
                     continue
+                seen_ino = os.stat(path).st_ino
                 d = json.loads(raw)
                 style, nl = style_of(raw, d)
                 if style is None or not isinstance(d.get("title"), str):
@@ -189,17 +295,22 @@ def apply_stamps(items, journal_path, home_id, before_replace=None):
                        dev=tst.st_dev, ino=tst.st_ino)
                 if before_replace is not None:
                     before_replace(path)
-                if read_raw(path) != raw:        # last look before the replace
-                    jr.add(op="failed", path=path, error="changed before replace")
-                    res["changed"] += 1
-                    continue
-                os.replace(tmp, path)
-                tmp = None
-                jr.add(op="done", path=path)
-                res["written"] += 1
+                outcome = _publish(path, tmp, raw, seen_ino)
+                if outcome == "written":
+                    res["written"] += 1
+                    try:
+                        jr.add(op="done", path=path)
+                    except OSError:
+                        res["unacknowledged"] += 1   # published; intent still proves it
+                else:
+                    res[outcome] += 1
+                    jr.add(op="failed", path=path, error=outcome)
             except (OSError, ValueError) as exc:
-                jr.add(op="failed", path=path, error=str(exc)[:80])
                 res["failed"] += 1
+                try:
+                    jr.add(op="failed", path=path, error=str(exc)[:80])
+                except OSError:
+                    pass
             finally:
                 if tmp and os.path.exists(tmp):
                     os.unlink(tmp)
@@ -211,24 +322,23 @@ def apply_stamps(items, journal_path, home_id, before_replace=None):
 def _restore(path, rec):
     """Restore one card byte for byte if it is provably the file we wrote.
 
-    Returns "restored" | "ambiguous" | "gone".
+    The stamped card is moved aside first and is deleted ONLY after the restored
+    card has been published and verified. On any failure it stays (or goes
+    back), so no card is ever lost. Returns "restored" | "ambiguous" | "gone".
     """
-    quarantine = os.path.join(os.path.dirname(path), ".undo-%s-%s" % (
-        uuid.uuid4().hex[:8], os.path.basename(path)))
+    quarantine = _quarantine_name(path, "undo")
     try:
         os.rename(path, quarantine)
     except FileNotFoundError:
         return "gone"
 
     def put_back():
-        try:
-            os.link(quarantine, path)
-            os.unlink(quarantine)
-        except OSError:
-            pass                      # the name is taken again: keep the copy aside
+        _put_back(quarantine, path)
 
+    tmp = None
     try:
         stt = os.lstat(quarantine)
+        sig = (stt.st_ino, stt.st_size, stt.st_mtime_ns)
         if not os.path.isfile(quarantine) or os.path.islink(quarantine):
             put_back()
             return "ambiguous"
@@ -247,25 +357,41 @@ def _restore(path, rec):
         if sha_text(text) != rec["sha_before"]:
             put_back()
             return "ambiguous"
-    except (OSError, ValueError):
-        put_back()
-        return "ambiguous"
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".stamp-",
-                               suffix=".tmp")
-    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".stamp-",
+                                   suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp, stt.st_mode & 0o7777)
-        os.link(tmp, path)            # fails if a new card appeared meanwhile
-    except OSError:
-        os.unlink(tmp)
-        os.unlink(quarantine)         # ours, and someone wrote a newer card: keep theirs
+        os.link(tmp, path)            # publish; fails if a newer card appeared
+    except FileExistsError:
+        _drop(tmp)
+        return "ambiguous"            # a newer card exists; the stamped one stays aside
+    except (OSError, ValueError):
+        _drop(tmp)
+        put_back()                    # never delete on a failed restore
         return "ambiguous"
-    os.unlink(tmp)
+    try:
+        verified = sha_text(read_raw(path)) == rec["sha_before"]
+        unchanged = (os.lstat(quarantine).st_ino, os.lstat(quarantine).st_size,
+                     os.lstat(quarantine).st_mtime_ns) == sig
+    except OSError:
+        verified = unchanged = False
+    if not (verified and unchanged):
+        _drop(tmp)
+        return "ambiguous"            # keep the stamped card aside for recovery
+    _drop(tmp)
     os.unlink(quarantine)
     return "restored"
+
+
+def _drop(tmp):
+    if tmp:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def undo_stamps(journal_path, home_id, support_real):

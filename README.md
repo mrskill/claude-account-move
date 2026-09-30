@@ -157,20 +157,41 @@ transcripts); cards without a transcript, with an empty title, in a file layout
 that cannot be reproduced byte for byte, or already stamped correctly are left
 alone. Only the `title` field changes; the file layout and permissions stay.
 
-`--apply` writes each card through a temporary file and an atomic replace, and
-checks twice (before writing and right before the replace) that the card still
-holds exactly the planned bytes; a card changed in between (for example by the
-app) is left alone, reported, and the exit code is `3`. `--undo` restores a card
-byte for byte only when its inode and content still equal the journal's, under
-the same ownership rules and home binding as `sync --undo`; a card changed since
-is kept and reported.
+Title, session id and rollback bytes of every card come from one freshly read
+copy of the card, so a card the app changed after the scan is planned coherently.
+`stamp` refuses to write anything while the observation is incomplete: an
+unreadable card or transcript, a storage root that resolves outside the Claude
+support folder, or two session ids behind one card name.
+
+`--apply` writes each card through a temporary file. It then moves the card
+away with one atomic rename and inspects only the moved file: it must be the very
+file (same inode) and hold exactly the planned bytes. If not, it is put back
+without overwriting anything and the card is reported as changed (exit `3`). Only
+then is the stamped file published, and the moved file is checked once more for a
+late write through a descriptor that was already open; if one happened, the newer
+document is put back over the stamp. The card is therefore never replaced
+blindly. What cannot be excluded from outside: a writer that holds the file open
+and writes after that final check, and a process that recreates the name between
+the rename and the publication (its newer card then wins and the stamp is not
+written). Every write command (`sync --apply`, `sync --undo`, `stamp --apply`,
+`stamp --undo`) takes a lock in the state directory, so two of them never run at
+once (the second exits `3`). `--undo` restores a card byte for byte only when its
+inode and content still equal the journal's, under the same ownership rules and
+home binding as `sync --undo`. The stamped card is moved aside first and deleted
+only after the restored card has been published and verified; on any failure it
+stays (or goes back), and a card set aside stays under a `.undo-*` name in the
+same folder. A card changed since the stamp is kept and reported. A journal line
+for a published card that could not be acknowledged does not disable undo.
 
 When to run it: the panel re-reads cards at start and at a change of account, so
 stamping BEFORE signing out (step 2) makes the stamps show right after the
 switch. Stamping after `finish` (optional step 6) works too, but shows only
 after the app is restarted (which ends running sessions). The stamp uses the
-time zone of this machine. Stamp while the app is idle: the tiny window between
-the last check and the replace cannot be closed from outside.
+time zone of this machine. Stamp while the app is idle anyway: the protections
+above cannot stop a process that writes through an already-open descriptor at
+just the wrong moment, and a journal only proves what this tool wrote; it is not
+authentication (a forged journal of the same home directory that names real
+cards in its recorded targets is honoured).
 
 ### Optional: a sync job of your own
 
@@ -243,7 +264,8 @@ prevent that too.)
   when the operation began. The destination is first moved to a private name with
   one atomic rename and checked there, so nobody can swap the file between the
   check and the deletion; a file that turns out not to be ours is put back without
-  overwriting anything (the name is briefly absent). A file that merely has the
+  overwriting anything (the name is briefly absent); a write through an already
+  open descriptor while the file is checked makes it ambiguous and it is kept. A file that merely has the
   same name or bytes (a card the app wrote, a card you restored) is kept and
   reported as ambiguous. Every record must carry its required fields: a record
   that does not is damage, and only the intact prefix before it is used. An

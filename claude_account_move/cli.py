@@ -24,7 +24,7 @@ from . import sync_cards
 from .common import (EXIT_FAIL, EXIT_INPUT, EXIT_INTERNAL, EXIT_LOGIN_TIMEOUT,
                      EXIT_NO_BASELINE, EXIT_NO_STORE, EXIT_OK, EXIT_WAIT,
                      ENV_STATE, Paths, read_identity, safe_subdir,
-                     state_dir_problem, write_json)
+                     state_dir_problem, write_json, LockBusy, write_lock)
 
 SYNC_POLL_S = 10.0
 LOGIN_POLL_S = 2.0
@@ -342,8 +342,9 @@ def cmd_sync(args):
         st.parse_override(args.active_pair)      # PairError -> exit 2, before any storage check
     if args.undo:
         try:
-            res = sync_cards.undo(args.undo, snap.path_id(paths.home),
-                                  os.path.realpath(paths.support))
+            with write_lock(paths):
+                res = sync_cards.undo(args.undo, snap.path_id(paths.home),
+                                      os.path.realpath(paths.support))
         except sync_cards.JournalError as exc:
             return fail(args, out, "sync", started, EXIT_INPUT, "input_error",
                         "journal rejected: %s" % exc)
@@ -408,9 +409,11 @@ def cmd_sync(args):
         emit(args, out, _report("sync", code, "dry_run", started, **base))
         return code
     try:
-        jdir = safe_subdir(paths)
-        journal = sync_cards.new_journal_path(jdir)
-        copied, failed = sync_cards.apply_plan(plan, journal, snap.path_id(paths.home))
+        with write_lock(paths):
+            jdir = safe_subdir(paths)
+            journal = sync_cards.new_journal_path(jdir)
+            copied, failed = sync_cards.apply_plan(plan, journal,
+                                                   snap.path_id(paths.home))
     except OSError as exc:
         return fail(args, out, "sync", started, EXIT_INTERNAL, "internal_error",
                     "cannot write the journal or copy: %s" % exc)
@@ -433,8 +436,9 @@ def cmd_stamp(args):
                     "error: " + prob)
     if args.undo:
         try:
-            res = stamp_titles.undo_stamps(args.undo, snap.path_id(paths.home),
-                                           os.path.realpath(paths.support))
+            with write_lock(paths):
+                res = stamp_titles.undo_stamps(args.undo, snap.path_id(paths.home),
+                                               os.path.realpath(paths.support))
         except sync_cards.JournalError as exc:
             return fail(args, out, "stamp", started, EXIT_INPUT, "input_error",
                         "journal rejected: %s" % exc)
@@ -462,6 +466,12 @@ def cmd_stamp(args):
                     observation=index.obs.as_dict())
     tmap = st.transcripts(paths)
     items, stats = stamp_titles.plan_stamps(index, tmap)
+    if not index.obs.complete():
+        return fail(args, out, "stamp", started, EXIT_FAIL, "incomplete_observation",
+                    "problems while planning (%d unreadable cards, %s): refusing "
+                    "to stamp from partial or conflicting input"
+                    % (index.obs.unreadable_cards, "; ".join(index.obs.errors[:3])),
+                    observation=index.obs.as_dict())
     out.say("cards %(cards)d: to stamp %(planned)d, already current %(current)d, "
             "no transcript %(no_transcript)d, empty title %(empty_title)d, "
             "unknown file format %(unknown_format)d" % stats)
@@ -475,15 +485,19 @@ def cmd_stamp(args):
         emit(args, out, _report("stamp", EXIT_OK, "dry_run", started, **base))
         return EXIT_OK
     try:
-        jdir = safe_subdir(paths)
-        journal = stamp_titles.new_journal_path(jdir)
-        res = stamp_titles.apply_stamps(items, journal, snap.path_id(paths.home))
+        with write_lock(paths):
+            jdir = safe_subdir(paths)
+            journal = stamp_titles.new_journal_path(jdir)
+            res = stamp_titles.apply_stamps(items, journal, snap.path_id(paths.home),
+                                            support_real=os.path.realpath(paths.support))
     except OSError as exc:
         return fail(args, out, "stamp", started, EXIT_INTERNAL, "internal_error",
                     "cannot write the journal or the cards: %s" % exc)
     out.say("written %(written)d, changed since the plan (left alone) %(changed)d, "
-            "skipped %(skipped)d, failed %(failed)d; journal: " % res + journal)
-    code = EXIT_FAIL if (res["changed"] or res["skipped"] or res["failed"]) else EXIT_OK
+            "skipped %(skipped)d, failed %(failed)d, written but not acknowledged "
+            "in the journal %(unacknowledged)d; journal: " % res + journal)
+    code = EXIT_FAIL if (res["changed"] or res["skipped"] or res["failed"]
+                         or res["unacknowledged"]) else EXIT_OK
     emit(args, out, _report("stamp", code, "applied", started, result=res,
                             journal=journal, **base))
     return code
@@ -503,6 +517,9 @@ def main(argv=None):
     except st.PairError as exc:
         return fail(args, Out(args.json), args.command, started, EXIT_INPUT,
                     "input_error", "error: %s" % exc)
+    except LockBusy as exc:
+        return fail(args, Out(args.json), args.command, started, EXIT_FAIL,
+                    "busy", "error: %s" % exc)
     except KeyboardInterrupt:
         if args.json:
             print(json.dumps(_report(args.command, EXIT_INTERNAL, "interrupted",
