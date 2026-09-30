@@ -1,0 +1,228 @@
+# claude-account-move
+
+Version 0.1.1. Move Claude Code (the desktop app for Mac and the CLI) from one
+Claude account to another without losing your sessions, and prove afterwards
+that nothing was lost.
+
+This is an independent tool. It is not an official Anthropic product and is not
+endorsed by Anthropic. The storage layout it reads is an implementation detail
+of the Claude desktop app and can change between app versions.
+
+Author: **Mr. Skill** ([@mrskill](https://github.com/mrskill))
+
+Russian version: [README.ru.md](README.ru.md)
+
+## What it does
+
+| Command | When | What happens |
+|---|---|---|
+| `prepare` | before you sign out | Runs readiness checks, records a "before" snapshot of this move (metadata only), prints a verdict. One pass. |
+| `finish` | after you signed in to the app and ran `claude /login` | Waits until the CLI account equals the app account, then compares the storage with the snapshot of THIS move and prints a verdict. |
+| `sync` | optional repair | Copies session cards that are missing in the new account's folder. Dry run by default (it prints the files). `sync --apply` adds files and `sync --undo` removes exactly the files a journal proves were added; these are the only operations that write into the Claude storage. |
+
+The checks, all judged by names and ids recorded before the move, not by counts
+alone (every number is printed with its denominator):
+
+- storage read completely (no unreadable card, transcript or task file);
+- the source account is readable (a move needs a known starting point) and the
+  settings file, if there is one, is readable;
+- the directory the app writes into exists and is writable by permission bits;
+- the app keeps cards fresh (median lag of live sessions);
+- no session is deleted in the panel and still has a live card;
+- the active folder holds the newest copy of every card;
+- no card lost its `cliSessionId` while its transcript exists (the session is on
+  disk but cannot be opened);
+- no session owns two different card files;
+- after the move: every card name, every deletion mark and every scheduled task
+  recorded before still exists; the target's copy of each card is bound to the
+  same session id as recorded and is not older; every recorded transcript still
+  has its size and its last message (judged per session, not by one global
+  maximum); settings are unchanged (permissions and hooks are compared by a
+  digest of their full content, so replacing one entry with another is seen);
+  both accounts match the target.
+
+A value that could be measured before the move and cannot be measured after it
+is a failure, never a pass.
+
+## What it does not do
+
+- It never signs in for you and never asks for, reads or stores a password or
+  token. You sign in to the app and run `claude /login` yourself. It parses
+  `~/.claude.json` and the app's `config.json` as whole JSON documents but keeps
+  only the account and organization ids; nothing else from them is stored.
+- `prepare`, `finish` and the checks change nothing in the Claude storage or in
+  your settings. Everything they write goes to the state directory (see below).
+  They do not even write a probe file into the storage. The only commands that
+  touch the storage are `sync --apply` (adds card files) and `sync --undo`
+  (deletes the files that a journal proves `--apply` added).
+- It does not migrate scheduled tasks: `finish` reports recorded tasks that are
+  missing in the new account, but moving them is up to you.
+- It does not decide for you between two different session ids behind one card
+  name: `sync` lists such conflicts, copies nothing for them and exits `3`.
+- It does not trust an explicit `--active-pair` blindly: the account in it must be
+  the account the app is signed in to, otherwise the command stops with exit `2`.
+
+## Requirements
+
+- macOS (paths are the ones of the Claude desktop app on macOS);
+- Python 3.9 or newer, standard library only;
+- Claude desktop app and Claude Code CLI.
+
+## Install
+
+```sh
+git clone https://github.com/mrskill/claude-account-move.git
+cd claude-account-move
+./claude-account-move --version      # claude-account-move 0.1.1
+```
+
+Or download a release archive, unpack it and run `./claude-account-move` from
+the unpacked directory. To call it from anywhere, link it into a directory on
+your `PATH`: `ln -s "$PWD/claude-account-move" /usr/local/bin/claude-account-move`.
+The entry script resolves the link, so the package next to it is found.
+
+## A move, step by step
+
+The commands below use `./claude-account-move` from the cloned or unpacked
+directory. If you linked it into your `PATH`, drop the `./`.
+
+1. In a terminal, before leaving the old account:
+
+   ```sh
+   ./claude-account-move prepare
+   ```
+
+   Exit code `0` means ready. Anything else: read the `FAIL` lines, fix the
+   cause, run `prepare` again. A snapshot taken when the verdict was not ready is
+   kept for diagnosis but `finish` never picks it by itself.
+2. Sign out of the Claude desktop app and sign in with the new account. You do
+   this yourself.
+3. In a terminal, sign the CLI in with the same new account: `claude /login`.
+4. Run:
+
+   ```sh
+   ./claude-account-move finish
+   ```
+
+   It waits up to 15 minutes (`--wait-login SECONDS`) for the CLI account to
+   equal the app account, then verifies. Exit code `0` means everything arrived.
+5. If `finish` says that names are missing in the new account's folder (exit
+   `3` with `target_names` failing, nothing missing anywhere), copy them and
+   verify again:
+
+   ```sh
+   ./claude-account-move sync            # dry run: prints the files it would copy
+   ./claude-account-move sync --apply    # copies; only adds files
+   ./claude-account-move finish
+   ```
+
+   Then restart the Claude app once: it reads its session list only at start.
+   Restarting ends running sessions, so save your work first.
+
+Useful options: `--json` (every command and every outcome, failures included,
+prints exactly one JSON report on stdout; human text goes to stderr),
+`--home DIR` (inspect another home directory), `--state-dir DIR`,
+`--wait-sync SECONDS`, `--allow-same-account` (re-login to the same account),
+`--move-id ID`, `--max-age-hours N` (default 72), `--active-pair ACCOUNT/ORG`
+(when the app log cannot name the pair the app writes into; the account must be
+the one the app is signed in to), `prepare --full-copy` (also copy every card
+file into the snapshot; large).
+
+### Optional: a sync job of your own
+
+If you run a background job that keeps the account folders in step, make it
+touch a file on every run and pass it with `--heartbeat FILE` (or the
+`CLAUDE_ACCOUNT_MOVE_SYNC_HEARTBEAT` variable). `prepare` then requires the file
+to be younger than `--sync-max-age-min` (default 30), and `finish` answers `5`
+("wait") instead of `3` while the job is alive and names are still arriving. With
+no heartbeat configured that check is skipped.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | `prepare`: ready to move. `finish`: everything arrived and all checks passed. `sync`: done or dry run with nothing wrong. |
+| 1 | Internal error of the tool, or a required state write failed (snapshot, pointer, journal, a symlink inside the state directory). Says nothing about loss or readiness. A failure to save the optional JSON report file is only warned about on stderr. |
+| 2 | Input error: no command, state directory overlapping the Claude storage, your settings or logs, malformed or foreign `--active-pair`, a journal that cannot be used (unreadable, no begin record, belongs to another home directory). |
+| 3 | Failure on substance. `prepare`: a readiness check is red. `finish`: something is missing or different (card, target binding, transcript, deletion mark, task, settings, account, folder). `sync`: input could not be read completely, no target folder could be determined, a copy failed, a conflict was found, or (`--undo`) a journal has a torn or damaged part or names files that are not proven to be ours (those are kept). |
+| 4 | Storage not found (no Claude application support folder, or no account/organization folder in it). |
+| 5 | `finish`: nothing is lost but not everything is delivered yet and your sync job is alive. Wait and run again. |
+| 6 | `finish`: the wait for login ran out. `login.reason` in the JSON report says why: `cli_lags`, `app_not_switched`, `identity_invalid`. |
+| 7 | `finish`: no usable "before" snapshot of this move (missing, damaged, not ready, without a source account, older than `--max-age-hours`, other home directory, unknown `--move-id`). |
+
+When several causes apply, the code is chosen per command in this order:
+`prepare`: 2, 4, 1, 3, 0. `finish`: 2, 4, 7, 6, 3, 5, 0 (a storage with no
+account folder gives 4 even when no snapshot exists). `sync`: 2, 4, 1, 3, 0.
+
+## Where state lives
+
+Everything the tool writes, except what `sync --apply` copies into the Claude
+storage, goes under `~/.claude-account-move/` (override with the
+`CLAUDE_ACCOUNT_MOVE_HOME` variable or `--state-dir`):
+
+```
+moves/<move-id>/before.json      metadata of the cards, deletion marks, accounts, task ids, transcript sizes and last-message times, settings counts and digests
+moves/<move-id>/manifest.json    checksum of before.json, ready flag, fingerprint of the home directory, creation time
+moves/<move-id>/report-*.json    the JSON reports of each run
+moves/<move-id>/cards-copy/      only with prepare --full-copy
+current-ready-move-id            the newest ready snapshot
+sync-<time>-<id>.jsonl           journal of one sync --apply (a new file per run)
+```
+
+In the default metadata-only mode the snapshot holds account and organization
+ids, session ids and card file names. It holds no titles, no message text, no
+email address and no path of your home directory (only a short fingerprint of
+it). With `prepare --full-copy` the snapshot also contains complete raw copies of
+the card and task files, which can hold titles, prompts and other private
+fields. Either way, treat the directory as private and do not publish it.
+The tool refuses to use a state directory that overlaps the Claude storage, your
+Claude settings or logs, and refuses to write through a symlink anywhere inside
+it. It never writes bytecode caches.
+
+## Rolling back
+
+- `prepare`, `finish` and all checks changed nothing; there is nothing to undo.
+  Delete `moves/<move-id>` whenever you like.
+- `sync --apply` only adds files and never overwrites. Undo exactly what it added:
+  `./claude-account-move sync --undo ~/.claude-account-move/sync-<time>-<id>.jsonl`.
+  A file is removed only when the journal proves this run published it (same
+  device and inode as the staged copy, same content) and the journal belongs to
+  this home directory. A file that merely has the same name or bytes (a card the
+  app wrote, a card you restored) is kept and reported as ambiguous. An
+  interrupted journal is used up to its last complete line and the torn part is
+  reported. Undo itself writes to the storage (it deletes), so it is exempt from
+  the read-only promise above.
+- The old account's folders are never touched. To go back, sign in to the app and
+  the CLI with the old account again.
+
+## Limitations
+
+- Read-only everywhere except `sync --apply` (adds card files and may create the
+  agent-mode folder of the target account when it does not exist yet) and
+  `sync --undo` (removes what `--apply` added).
+- Scheduled-task files must match the expected shape (a list of objects with an
+  id); anything else is reported as an unreadable observation, not as "no tasks".
+- The active folder is taken from the last mention in the app log
+  (`~/Library/Logs/Claude/main.log`), because the organization is not always the
+  one in `~/.claude.json`. If the log is missing, pass `--active-pair`.
+- Permissions are checked by permission bits; writing is not attempted, so a
+  read-only mount that still reports write permission is not detected.
+- The storage layout was derived from observation of the desktop app, not from
+  documentation. Newer app versions may move things.
+- Python 3.9 to 3.12 were tried; only macOS is supported.
+
+## Development
+
+```sh
+python3 -m unittest discover -s tests
+```
+
+The tests build a synthetic home directory in a temporary folder and never
+touch your real one. The privacy test proves its scanner on invented words only;
+the real list of private names is kept outside the repository. To apply such a
+list as well, point `CLAUDE_ACCOUNT_MOVE_DENYLIST` at a file of `re:<pattern>` or
+`cs:<pattern>` lines.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Copyright (c) 2026 Mr. Skill.
