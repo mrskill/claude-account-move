@@ -501,11 +501,13 @@ def cmd_stamp(args):
     except OSError as exc:
         return fail(args, out, "stamp", started, EXIT_INTERNAL, "internal_error",
                     "cannot write the journal or the cards: %s" % exc)
-    out.say("written %(written)d, changed since the plan (left alone) %(changed)d, "
+    out.say("written %(written)d, changed while writing (not stamped, or the newer file kept beside) %(changed)d, "
             "skipped %(skipped)d, failed %(failed)d, written but not acknowledged "
             "in the journal %(unacknowledged)d; journal: " % res + journal)
+    for a in res["aside"]:
+        out.say("  file kept beside its card, recover by renaming it: %s" % a)
     code = EXIT_FAIL if (res["changed"] or res["skipped"] or res["failed"]
-                         or res["unacknowledged"]) else EXIT_OK
+                         or res["unacknowledged"] or res["aside"]) else EXIT_OK
     emit(args, out, _report("stamp", code, "applied", started, result=res,
                             journal=journal, **base))
     return code

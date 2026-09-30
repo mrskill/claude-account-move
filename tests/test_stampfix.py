@@ -475,5 +475,95 @@ class AppMustBeClosed(Base):
             return fh.read()
 
 
+class ReportedPathsAndTranscriptReads(Base):
+    def test_apply_reports_every_path_kept_beside_its_card(self):
+        import contextlib
+        import io
+        from claude_account_move import cli
+        p = self.card()
+        rp = os.path.realpath(p)
+        real_link = os.link
+
+        def late_write(src, dst, **kw):
+            if dst == rp:
+                for f in os.listdir(self.d):
+                    if f.startswith(".stamp-old-"):
+                        with open(os.path.join(self.d, f), "a") as fh:
+                            fh.write(" ")
+            return real_link(src, dst, **kw)
+
+        buf = io.StringIO()
+        with mock.patch.object(cli.common, "claude_app_running", return_value=False), \
+                mock.patch.object(stamp_titles.os, "link", side_effect=late_write), \
+                contextlib.redirect_stdout(buf):
+            rc = cli.main(["stamp", "--apply", "--json", "--home", self.h.home,
+                           "--state-dir", self.h.state])
+        self.assertEqual(rc, 3)
+        rep = json.loads(buf.getvalue())
+        aside = rep["result"]["aside"]
+        self.assertEqual(len(aside), 1)
+        self.assertTrue(os.path.basename(aside[0]).startswith(".stamp-old-"))
+        self.assertTrue(os.path.exists(aside[0]))
+
+    def test_apply_prints_the_kept_path_in_text_mode(self):
+        import contextlib
+        import io
+        from claude_account_move import cli
+        p = self.card()
+        rp = os.path.realpath(p)
+        real_link = os.link
+
+        def late_write(src, dst, **kw):
+            if dst == rp:
+                for f in os.listdir(self.d):
+                    if f.startswith(".stamp-old-"):
+                        with open(os.path.join(self.d, f), "a") as fh:
+                            fh.write(" ")
+            return real_link(src, dst, **kw)
+
+        buf = io.StringIO()
+        with mock.patch.object(cli.common, "claude_app_running", return_value=False), \
+                mock.patch.object(stamp_titles.os, "link", side_effect=late_write), \
+                contextlib.redirect_stdout(buf):
+            cli.main(["stamp", "--apply", "--home", self.h.home,
+                      "--state-dir", self.h.state])
+        self.assertIn("file kept beside its card", buf.getvalue())
+        self.assertIn(".stamp-old-", buf.getvalue())
+
+    def test_a_transcript_read_error_is_an_observation_error(self):
+        self.card()
+        paths = self.paths()
+        idx = st.scan(paths)
+        with mock.patch.object(st, "_last_message", side_effect=OSError(errno.EIO, "io")):
+            items, stats = stamp_titles.plan_stamps(idx, st.transcripts(paths))
+        self.assertFalse(idx.obs.complete())
+        self.assertTrue(any("transcript unreadable" in e for e in idx.obs.errors))
+        self.assertEqual(items, [])
+
+    def test_late_change_keeps_undo_working_for_the_published_card(self):
+        p = self.card()
+        original = self.read(p)
+        _, (items, _) = self.plan()
+        os.makedirs(self.h.state)
+        jp = os.path.join(self.h.state, "j.jsonl")
+        rp = os.path.realpath(p)
+        real_link = os.link
+
+        def late_write(src, dst, **kw):
+            if dst == rp:
+                for f in os.listdir(self.d):
+                    if f.startswith(".stamp-old-"):
+                        with open(os.path.join(self.d, f), "a") as fh:
+                            fh.write(" ")
+            return real_link(src, dst, **kw)
+
+        with mock.patch.object(stamp_titles.os, "link", side_effect=late_write):
+            stamp_titles.apply_stamps(items, jp, path_id(self.h.home))
+        res = stamp_titles.undo_stamps(jp, path_id(self.h.home),
+                                       os.path.realpath(self.h.support))
+        self.assertEqual(res["restored"], 1)
+        self.assertEqual(self.read(p), original)
+
+
 if __name__ == "__main__":
     unittest.main()

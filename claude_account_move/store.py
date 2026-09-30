@@ -350,12 +350,21 @@ def _last_ts(lines):
 
 
 def last_message_ms(path):
+    """Time of the last real turn, or None when there is none or it cannot be read."""
+    try:
+        return _last_message(path)
+    except OSError:
+        return None
+
+
+def _last_message(path):
     """Time of the last real user/assistant turn inside a transcript.
 
     The tail of the file is read first; the whole file only when the tail holds
-    no real turn. File modification time is never used.
+    no real turn. File modification time is never used. Raises OSError when the
+    file cannot be read.
     """
-    try:
+    if True:
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
             start = max(0, size - TAIL_BYTES)
@@ -369,8 +378,6 @@ def last_message_ms(path):
                 return ms
             fh.seek(0)
             return _last_ts(fh.read().split(b"\n"))
-    except OSError:
-        return None
 
 
 def session_last_ms(tmap, sid):

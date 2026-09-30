@@ -139,13 +139,12 @@ def plan_stamps(index, tmap):
         for sid in cids:
             for f in tmap.get(sid) or []:
                 try:
-                    with open(f, "rb"):
-                        pass
+                    ms = st._last_message(f)       # the real read, not just an open
                 except OSError:
                     index.obs.errors.append("transcript unreadable: %s" % f)
-            ms = st.session_last_ms(tmap, sid)
-            if ms is not None and (best is None or ms > best):
-                best = ms
+                    continue
+                if ms is not None and (best is None or ms > best):
+                    best = ms
         for path, raw, d in copies:
             stats["cards"] += 1
             if best is None:
@@ -210,14 +209,20 @@ def _publish(path, tmp, planned_raw, seen_ino):
     inspected. If it is not exactly the planned document (same inode, same
     bytes) it is put back and nothing is published. After publishing, the moved
     file is checked once more for a late write through a descriptor that was
-    already open: if one happened, the newer document is put back over the stamp.
-    Returns "written" | "changed" | "failed".
+    already open: if one happened the moved file stays next to the card
+    (nothing is overwritten) and "late" is returned.
+    Returns (outcome, aside): outcome is "written" | "changed" | "late" |
+    "failed"; `aside` is the moved file when it stays next to the card.
     """
     hold = _quarantine_name(path, "stamp-old")
+
+    def aside():
+        return hold if os.path.lexists(hold) else None
+
     try:
         os.rename(path, hold)
     except FileNotFoundError:
-        return "changed"
+        return "changed", None
     try:
         sig = _sig(hold)
         same = sig[0] == seen_ino and read_raw(hold) == planned_raw
@@ -225,34 +230,36 @@ def _publish(path, tmp, planned_raw, seen_ino):
         same = False
     if not same:
         _put_back(hold, path)                # never overwriting; else it stays as `hold`
-        return "changed"
+        return "changed", aside()
     try:
         os.link(tmp, path)                   # fails if the name was re-created
     except FileExistsError:
-        os.unlink(hold)                      # their newer card wins; ours is stale
-        return "changed"
+        return "changed", aside()            # their newer card wins; ours stays aside
     except OSError:
         _put_back(hold, path)
-        return "failed"
+        return "failed", aside()
     try:
         late = _sig(hold) != sig
     except OSError:
         late = True
     if late:
-        return "changed"                     # the moved file holds a newer document:
-        # it stays next to the card as .stamp-old-*, nothing is overwritten
-    os.unlink(hold)
-    return "written"
+        return "late", hold                  # a newer document: stays next to the card
+    try:
+        os.unlink(hold)
+    except OSError:
+        return "written", aside()            # published; the old copy stays aside
+    return "written", None
 
 
 def apply_stamps(items, journal_path, home_id, before_replace=None,
                  support_real=None):
     """Write the planned stamps.
 
-    Returns {"written","changed","skipped","failed","unacknowledged"}.
+    Returns {"written","changed","skipped","failed","unacknowledged","aside"};
+    `aside` lists every file that stays next to its card for recovery.
     """
     res = {"written": 0, "changed": 0, "skipped": 0, "failed": 0,
-           "unacknowledged": 0}
+           "unacknowledged": 0, "aside": []}
     op_id = uuid.uuid4().hex
     jr = Journal(journal_path, op_id)
     try:
@@ -294,8 +301,12 @@ def apply_stamps(items, journal_path, home_id, before_replace=None,
                        dev=tst.st_dev, ino=tst.st_ino)
                 if before_replace is not None:
                     before_replace(path)
-                outcome = _publish(path, tmp, raw, seen_ino)
-                if outcome == "written":
+                outcome, kept = _publish(path, tmp, raw, seen_ino)
+                if kept:
+                    res["aside"].append(kept)
+                if outcome == "late":
+                    res["changed"] += 1          # published; intent still proves it
+                elif outcome == "written":
                     res["written"] += 1
                     try:
                         jr.add(op="done", path=path)

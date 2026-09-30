@@ -168,9 +168,14 @@ support folder, or two session ids behind one card name.
 **The Claude app must be closed.** `stamp --apply` and `stamp --undo` refuse
 (exit `3`, "Quit the Claude app first") while the desktop app is running: a
 process named `Claude` or any process started from `/Applications/Claude.app`.
-If the check itself cannot be run, the answer is "running". With the app closed
-there is no second writer, which is what makes the write safe; the dry run does
-not need it. Quit with Cmd+Q, run the command, open the app again.
+If the check itself cannot be run, the answer is "running". A closed app and the
+lock below exclude the writers that matter: this program and the app. They do
+not exclude any other process that writes into that folder after the last check
+(for instance a program holding a card open); such a write cannot be prevented
+from outside. In that case the write is refused, or the file is left beside its
+name and reported. Keep the app and every other program that touches Claude's
+files stopped for the whole run. The dry run does not need the app closed. Quit
+with Cmd+Q, run the command, open the app again.
 
 `--apply` writes each card through a temporary file. It then moves the card
 away with one atomic rename and inspects only the moved file: it must be the very
@@ -271,7 +276,10 @@ prevent that too.)
   one atomic rename and checked there, so nobody can swap the file between the
   check and the deletion; a file that turns out not to be ours is put back without
   overwriting anything (the name is briefly absent); a write through an already
-  open descriptor while the file is checked makes it ambiguous and it is kept. A file that merely has the
+  open descriptor while the file is checked makes it ambiguous and it is kept.
+  A write that lands after the last check and before the deletion cannot be
+  excluded from outside, so keep the app and other programs stopped while
+  undoing. A file that merely has the
   same name or bytes (a card the app wrote, a card you restored) is kept and
   reported as ambiguous. Every record must carry its required fields: a record
   that does not is damage, and only the intact prefix before it is used. An
