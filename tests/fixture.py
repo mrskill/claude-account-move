@@ -34,6 +34,7 @@ class Home(object):
     def env(self, **extra):
         e = dict(os.environ)
         e.update({"HOME": self.home, "CLAUDE_ACCOUNT_MOVE_HOME": self.state,
+                  "PYTHONDONTWRITEBYTECODE": "1",
                   "CLAUDE_ACCOUNT_MOVE_POLL_S": "0.05",
                   "CLAUDE_ACCOUNT_MOVE_LOGIN_POLL_S": "0.05"})
         e.pop("CLAUDE_ACCOUNT_MOVE_SYNC_HEARTBEAT", None)

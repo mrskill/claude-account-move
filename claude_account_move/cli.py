@@ -1,10 +1,11 @@
-"""Command line: prepare, finish, sync.
+"""Command line: prepare, finish, sync, stamp.
 
 prepare  before signing out: readiness checks, "before" snapshot, one pass.
 finish   after signing in to the app and running `claude /login`: waits until
          the CLI account equals the app account, then verifies against the
          snapshot of THIS move.
 sync     optional repair: copy missing cards into the target pair (writes).
+stamp    optional: last-message time into every session title (writes with --apply).
 """
 import argparse
 import json
@@ -18,6 +19,7 @@ from . import post_move_check as post
 from . import pre_move_check as pre
 from . import store as st
 from . import post_move_verify as verify
+from . import stamp_titles
 from . import sync_cards
 from .common import (EXIT_FAIL, EXIT_INPUT, EXIT_INTERNAL, EXIT_LOGIN_TIMEOUT,
                      EXIT_NO_BASELINE, EXIT_NO_STORE, EXIT_OK, EXIT_WAIT,
@@ -102,6 +104,13 @@ def build_parser():
     f.add_argument("--allow-unready-baseline", action="store_true",
                    help="diagnostic: accept a snapshot that was not ready")
     f.add_argument("--max-age-hours", type=float, default=72.0)
+    t = sub.add_parser("stamp", help="put the last-message time into session titles (writes with --apply)")
+    t.add_argument("--home", help="home directory to inspect (default: the HOME variable)")
+    t.add_argument("--state-dir", help="state directory")
+    t.add_argument("--json", action="store_true",
+                   help="print exactly one JSON report on stdout")
+    t.add_argument("--apply", action="store_true", help="really write (default: dry run)")
+    t.add_argument("--undo", metavar="JOURNAL", help="restore titles from a journal")
     s = sub.add_parser("sync", help="copy missing cards into the target pair (writes)")
     add_common(s)
     s.add_argument("--apply", action="store_true", help="really copy (default: dry run)")
@@ -414,6 +423,72 @@ def cmd_sync(args):
     return code
 
 
+def cmd_stamp(args):
+    started = time.monotonic()
+    out = Out(args.json)
+    paths = make_paths(args)
+    prob = state_dir_problem(paths)
+    if prob:
+        return fail(args, out, "stamp", started, EXIT_INPUT, "input_error",
+                    "error: " + prob)
+    if args.undo:
+        try:
+            res = stamp_titles.undo_stamps(args.undo, snap.path_id(paths.home),
+                                           os.path.realpath(paths.support))
+        except sync_cards.JournalError as exc:
+            return fail(args, out, "stamp", started, EXIT_INPUT, "input_error",
+                        "journal rejected: %s" % exc)
+        out.say("restored %(restored)d cards byte for byte, skipped %(skipped)d, "
+                "ambiguous %(ambiguous)d (changed since the stamp: kept), invalid "
+                "%(invalid)d (outside this operation's targets); journal status: "
+                "%(status)s" % res)
+        code = EXIT_OK if (res["status"] == "ok" and not res["ambiguous"]
+                           and not res["invalid"]) else EXIT_FAIL
+        emit(args, out, _report("stamp", code, "undo", started, undo=res,
+                                write_verified=False))
+        return code
+    if not os.path.isdir(paths.support):
+        return fail(args, out, "stamp", started, EXIT_NO_STORE, "no_store",
+                    "storage not found: %s" % paths.support)
+    index = st.scan(paths)
+    if not index.any_pairs():
+        return fail(args, out, "stamp", started, EXIT_NO_STORE, "no_store",
+                    "no account/organization pair found under %s" % paths.support)
+    if not index.obs.complete():
+        return fail(args, out, "stamp", started, EXIT_FAIL, "incomplete_observation",
+                    "storage could not be read completely (%d unreadable cards, "
+                    "%d errors): refusing to stamp from partial input"
+                    % (index.obs.unreadable_cards, len(index.obs.errors)),
+                    observation=index.obs.as_dict())
+    tmap = st.transcripts(paths)
+    items, stats = stamp_titles.plan_stamps(index, tmap)
+    out.say("cards %(cards)d: to stamp %(planned)d, already current %(current)d, "
+            "no transcript %(no_transcript)d, empty title %(empty_title)d, "
+            "unknown file format %(unknown_format)d" % stats)
+    for it in items[:50]:
+        out.say("  %s  ->  %s" % (it["title"], it["new"]))
+    if len(items) > 50:
+        out.say("  ... and %d more" % (len(items) - 50))
+    base = dict(stats=stats, dry_run=not args.apply, write_verified=False)
+    if not args.apply:
+        out.say("dry run: nothing written. Add --apply to write.")
+        emit(args, out, _report("stamp", EXIT_OK, "dry_run", started, **base))
+        return EXIT_OK
+    try:
+        jdir = safe_subdir(paths)
+        journal = stamp_titles.new_journal_path(jdir)
+        res = stamp_titles.apply_stamps(items, journal, snap.path_id(paths.home))
+    except OSError as exc:
+        return fail(args, out, "stamp", started, EXIT_INTERNAL, "internal_error",
+                    "cannot write the journal or the cards: %s" % exc)
+    out.say("written %(written)d, changed since the plan (left alone) %(changed)d, "
+            "skipped %(skipped)d, failed %(failed)d; journal: " % res + journal)
+    code = EXIT_FAIL if (res["changed"] or res["skipped"] or res["failed"]) else EXIT_OK
+    emit(args, out, _report("stamp", code, "applied", started, result=res,
+                            journal=journal, **base))
+    return code
+
+
 def main(argv=None):
     JsonArgumentParser.argv = tuple(sys.argv[1:] if argv is None else argv)
     ap = build_parser()
@@ -424,7 +499,7 @@ def main(argv=None):
     started = time.monotonic()
     try:
         return {"prepare": cmd_prepare, "finish": cmd_finish,
-                "sync": cmd_sync}[args.command](args)
+                "sync": cmd_sync, "stamp": cmd_stamp}[args.command](args)
     except st.PairError as exc:
         return fail(args, Out(args.json), args.command, started, EXIT_INPUT,
                     "input_error", "error: %s" % exc)

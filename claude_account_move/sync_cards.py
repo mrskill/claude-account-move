@@ -153,11 +153,11 @@ def apply_plan(plan, journal_path, home_id="unbound"):
     return copied, failed
 
 
-def valid_record(rec):
+def valid_record(rec, op_fields=None):
     """True when a journal record has every field its operation requires."""
     if not isinstance(rec, dict) or not isinstance(rec.get("op"), str):
         return False
-    fields = OP_FIELDS.get(rec["op"])
+    fields = (op_fields or OP_FIELDS).get(rec["op"])
     if fields is None or not isinstance(rec.get("op_id"), str):
         return False
     for key, typ in fields:
@@ -169,7 +169,7 @@ def valid_record(rec):
     return True
 
 
-def read_journal(path):
+def read_journal(path, op_fields=None):
     """(records, status). status: ok | torn_tail | damaged.
 
     The intact, fully validated prefix is always returned. A last line that is
@@ -190,7 +190,7 @@ def read_journal(path):
             rec = json.loads(line)
         except ValueError:
             return recs, ("torn_tail" if n == len(lines) - 1 else "damaged")
-        if not valid_record(rec):
+        if not valid_record(rec, op_fields):
             return recs, "damaged"
         recs.append(rec)
     return recs, "ok"

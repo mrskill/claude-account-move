@@ -18,7 +18,11 @@ Russian version: [README.ru.md](README.ru.md)
 |---|---|---|
 | `prepare` | before you sign out | Runs readiness checks, records a "before" snapshot of this move (metadata only), prints a verdict. One pass. |
 | `finish` | after you signed in to the app and ran `claude /login` | Waits until the CLI account equals the app account, then compares the storage with the snapshot of THIS move and prints a verdict. |
-| `sync` | optional repair | Copies session cards that are missing in the new account's folder. Dry run by default (it prints the files). `sync --apply` adds files and `sync --undo` removes exactly the files a journal proves were added; these are the only operations that write into the Claude storage. |
+| `sync` | optional repair | Copies session cards that are missing in the new account's folder. Dry run by default (it prints the files). `sync --apply` adds files and `sync --undo` removes exactly the files a journal proves were added. |
+| `stamp` | optional, see below | Puts the date and time of the last real message into the title of every session. Dry run by default (it lists "was -> will be"). `stamp --apply` writes, `stamp --undo` restores the cards byte for byte. |
+
+`sync --apply`, `sync --undo`, `stamp --apply` and `stamp --undo` are the only
+operations that write into the Claude storage.
 
 The checks, all judged by names and ids recorded before the move, not by counts
 alone (every number is printed with its denominator):
@@ -57,8 +61,9 @@ is a failure, never a pass.
 - `prepare`, `finish` and the checks change nothing in the Claude storage or in
   your settings. Everything they write goes to the state directory (see below).
   They do not even write a probe file into the storage. The only commands that
-  touch the storage are `sync --apply` (adds card files) and `sync --undo`
-  (deletes the files that a journal proves `--apply` added).
+  touch the storage are `sync --apply` (adds card files), `sync --undo` (deletes
+  the files that a journal proves `--apply` added), `stamp --apply` (rewrites the
+  `title` field of cards) and `stamp --undo` (puts the old bytes back).
 - It does not migrate scheduled tasks: `finish` reports recorded tasks that are
   missing in the new account, but moving them is up to you.
 - It does not decide for you between two different session ids behind one card
@@ -122,6 +127,9 @@ directory. If you linked it into your `PATH`, drop the `./`.
 
    Then restart the Claude app once: it reads its session list only at start.
    Restarting ends running sessions, so save your work first.
+6. Optional: put the last-message time into the session titles with
+   `./claude-account-move stamp --apply` (see "stamp" below; it is best done
+   before step 2, and after `finish` it shows after the next app start).
 
 Useful options: `--json` (every command and every outcome, failures, usage
 errors and an interrupt included, prints exactly one JSON report on stdout;
@@ -132,6 +140,37 @@ human text goes to stderr),
 (when the app log cannot name the pair the app writes into; the account must be
 the one the app is signed in to), `prepare --full-copy` (also copy every card
 file into the snapshot; large).
+
+### Optional: stamp the last-message time into session titles
+
+```sh
+./claude-account-move stamp           # dry run: lists "was  ->  will be", writes nothing
+./claude-account-move stamp --apply   # writes, with a journal
+./claude-account-move stamp --undo ~/.claude-account-move/stamp-<time>-<id>.jsonl
+```
+
+Every session title gets one suffix `<title> · DD.MM HH:MM` (middle dot), the
+local time of the last real user or assistant message, read from the
+transcripts. A second run does not double the suffix: an older stamp is cut off
+first. All copies of one session get the same stamp (the newest of their
+transcripts); cards without a transcript, with an empty title, in a file layout
+that cannot be reproduced byte for byte, or already stamped correctly are left
+alone. Only the `title` field changes; the file layout and permissions stay.
+
+`--apply` writes each card through a temporary file and an atomic replace, and
+checks twice (before writing and right before the replace) that the card still
+holds exactly the planned bytes; a card changed in between (for example by the
+app) is left alone, reported, and the exit code is `3`. `--undo` restores a card
+byte for byte only when its inode and content still equal the journal's, under
+the same ownership rules and home binding as `sync --undo`; a card changed since
+is kept and reported.
+
+When to run it: the panel re-reads cards at start and at a change of account, so
+stamping BEFORE signing out (step 2) makes the stamps show right after the
+switch. Stamping after `finish` (optional step 6) works too, but shows only
+after the app is restarted (which ends running sessions). The stamp uses the
+time zone of this machine. Stamp while the app is idle: the tiny window between
+the last check and the replace cannot be closed from outside.
 
 ### Optional: a sync job of your own
 
@@ -149,7 +188,7 @@ no heartbeat configured that check is skipped.
 | 0 | `prepare`: ready to move. `finish`: everything arrived and all checks passed. `sync`: done or dry run with nothing wrong. |
 | 1 | Internal error of the tool, or a required state write failed (snapshot, pointer, journal, a symlink inside the state directory). Says nothing about loss or readiness. A failure to save the optional JSON report file is only warned about on stderr. |
 | 2 | Input error: no command, state directory overlapping the Claude storage, your settings or logs, malformed or foreign `--active-pair`, a journal that cannot be used (unreadable, no begin record, belongs to another home directory). |
-| 3 | Failure on substance. `prepare`: a readiness check is red. `finish`: something is missing or different (card, target binding, transcript, deletion mark, task, settings, account, folder). `sync`: input could not be read completely, no target folder could be determined, a copy failed, a conflict was found, or (`--undo`) a journal has a torn or damaged part or names files that are not proven to be ours (those are kept). |
+| 3 | Failure on substance. `prepare`: a readiness check is red. `finish`: something is missing or different (card, target binding, transcript, deletion mark, task, settings, account, folder). `sync`: input could not be read completely, no target folder could be determined, a copy failed, a conflict was found, or (`--undo`) a journal has a torn or damaged part or names files that are not proven to be ours (those are kept). `stamp`: input could not be read completely, a card changed between plan and write (left alone), a write failed, or (`--undo`) a card changed since the stamp (kept). |
 | 4 | Storage not found (no Claude application support folder, or no account/organization folder in it). |
 | 5 | `finish`: nothing is lost but not everything is delivered yet and your sync job is alive. Wait and run again. |
 | 6 | `finish`: the wait for login ran out. `login.reason` in the JSON report says why: `cli_lags`, `app_not_switched`, `identity_invalid`. |
@@ -176,6 +215,7 @@ moves/<move-id>/report-*.json    the JSON reports of each run
 moves/<move-id>/cards-copy/      only with prepare --full-copy
 current-ready-move-id            the newest ready snapshot
 sync-<time>-<id>.jsonl           journal of one sync --apply (a new file per run)
+stamp-<time>-<id>.jsonl          journal of one stamp --apply (a new file per run)
 ```
 
 In the default metadata-only mode the snapshot holds account and organization
@@ -186,7 +226,10 @@ the card and task files, which can hold titles, prompts and other private
 fields. Either way, treat the directory as private and do not publish it.
 The tool refuses to use a state directory that overlaps the Claude storage, your
 Claude settings or logs, and refuses to write through a symlink anywhere inside
-it. It never writes bytecode caches.
+it. Its own code never writes bytecode caches. (The macOS system Python may
+itself cache the bytecode of its standard library under `~/Library/Caches` on its
+first start with a given home directory; set `PYTHONDONTWRITEBYTECODE=1` to
+prevent that too.)
 
 ## Rolling back
 
@@ -213,8 +256,12 @@ it. It never writes bytecode caches.
 ## Limitations
 
 - Read-only everywhere except `sync --apply` (adds card files and may create the
-  agent-mode folder of the target account when it does not exist yet) and
-  `sync --undo` (removes what `--apply` added).
+  agent-mode folder of the target account when it does not exist yet),
+  `sync --undo` (removes what `--apply` added), `stamp --apply` (rewrites card
+  titles) and `stamp --undo`.
+- `stamp` refuses to run when the storage could not be read completely, and its
+  suffix is in local time, so after a change of time zone every old stamp moves
+  by the same whole number of hours.
 - Scheduled-task files must match the expected shape (a list of objects with
   unique ids; a missing key is an empty list, an explicit null is not);
   anything else is reported as an unreadable observation, not as "no tasks".

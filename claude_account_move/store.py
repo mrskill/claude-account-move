@@ -19,7 +19,9 @@ from .common import (CARD_PREFIX, STORES, TOMB_PREFIX, TRANSCRIPT_RE, UUID_RE,
 
 TAIL_BYTES = 400000
 INJECTED_PREFIXES = ("<system-reminder", "<local-command",
-                     "<cross-session-message")
+                     "<cross-session-message", "Stop hook feedback",
+                     "SessionStart:", "UserPromptSubmit hook",
+                     "[Request interrupted")
 PAIR_RE = re.compile(r"claude-code-sessions/([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})")
 
 
