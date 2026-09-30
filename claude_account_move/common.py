@@ -2,6 +2,7 @@
 import contextlib
 import fcntl
 import hashlib
+import subprocess
 import json
 import os
 import re
@@ -218,20 +219,51 @@ def now_rfc3339():
 
 
 class LockBusy(Exception):
-    """Another write operation of this tool is already running."""
+    """Another write operation on this home directory is already running."""
 
 
 @contextlib.contextmanager
 def write_lock(paths):
-    """One writer at a time for every command that changes the Claude storage."""
-    d = safe_subdir(paths)
-    fd = os.open(os.path.join(d, "mutate.lock"),
-                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    """One writer at a time per Claude storage, whatever state directory is used.
+
+    The lock is an flock on the resolved Claude support folder itself, so it is
+    derived from the storage, not from the state directory, and no lock file is
+    created anywhere.
+    """
+    target = os.path.realpath(paths.support)
+    if not os.path.isdir(target):
+        yield
+        return
+    fd = os.open(target, os.O_RDONLY)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            raise LockBusy("another write operation of this tool is running")
+            raise LockBusy("another write operation on this Claude storage is running")
         yield
     finally:
         os.close(fd)
+
+
+APP_PATTERNS = (("-x", "Claude"), ("-f", "/Applications/Claude.app/Contents/"))
+
+
+def claude_app_running():
+    """True when the Claude desktop app is running, or when that cannot be told.
+
+    Two checks: a process named exactly Claude, and any process started from
+    the app bundle (its helpers). A failure to run the check counts as
+    "running": the answer must be known before the storage is written.
+    The pgrep command can be replaced with CLAUDE_ACCOUNT_MOVE_PGREP (tests).
+    """
+    cmd = os.environ.get("CLAUDE_ACCOUNT_MOVE_PGREP", "pgrep")
+    for args in APP_PATTERNS:
+        try:
+            r = subprocess.run([cmd] + list(args), capture_output=True)
+        except OSError:
+            return True
+        if r.returncode == 0:
+            return True
+        if r.returncode not in (0, 1):
+            return True
+    return False

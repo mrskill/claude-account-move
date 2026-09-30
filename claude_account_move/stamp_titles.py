@@ -175,23 +175,22 @@ def new_journal_path(state_dir):
 
 
 def _put_back(src, dst):
-    """Give `src` its name `dst` back without overwriting anything.
+    """Give `src` its name `dst` back, never overwriting anything.
 
-    A hard link first; if that fails for a reason other than "name taken"
-    (for example no space for a directory entry) a plain rename, which needs no
-    new space. If the name is taken the file stays under `src`.
+    Only a hard link is used (it fails when the name is taken or when no
+    directory entry can be made). On any failure the file stays under `src`,
+    which is a recoverable name next to the card, and the caller reports it.
+    Returns True when the name was restored.
     """
     try:
         os.link(src, dst)
-        os.unlink(src)
-    except FileExistsError:
-        pass
     except OSError:
-        if not os.path.lexists(dst):
-            try:
-                os.rename(src, dst)
-            except OSError:
-                pass
+        return False
+    try:
+        os.unlink(src)
+    except OSError:
+        pass
+    return True
 
 
 def _quarantine_name(path, tag):
@@ -240,8 +239,8 @@ def _publish(path, tmp, planned_raw, seen_ino):
     except OSError:
         late = True
     if late:
-        os.replace(hold, path)               # keep the newer document, drop the stamp
-        return "changed"
+        return "changed"                     # the moved file holds a newer document:
+        # it stays next to the card as .stamp-old-*, nothing is overwritten
     os.unlink(hold)
     return "written"
 
@@ -320,13 +319,19 @@ def apply_stamps(items, journal_path, home_id, before_replace=None,
 
 
 def _restore(path, rec):
+    """(status, aside): `aside` is a card left next to its name, or None."""
+    quarantine = _quarantine_name(path, "undo")
+    status = _restore_with(path, rec, quarantine)
+    return status, (quarantine if os.path.lexists(quarantine) else None)
+
+
+def _restore_with(path, rec, quarantine):
     """Restore one card byte for byte if it is provably the file we wrote.
 
     The stamped card is moved aside first and is deleted ONLY after the restored
     card has been published and verified. On any failure it stays (or goes
     back), so no card is ever lost. Returns "restored" | "ambiguous" | "gone".
     """
-    quarantine = _quarantine_name(path, "undo")
     try:
         os.rename(path, quarantine)
     except FileNotFoundError:
@@ -413,7 +418,7 @@ def undo_stamps(journal_path, home_id, support_real):
     targets = set(begin["targets"])
     failed = {r["path"] for r in recs if r["op"] == "failed"}
     out = {"restored": 0, "skipped": 0, "ambiguous": 0, "invalid": 0,
-           "status": status}
+           "status": status, "aside": []}
     for r in recs[1:]:
         if r["op"] == "begin":
             raise JournalError("journal has a second begin record")
@@ -430,7 +435,9 @@ def undo_stamps(journal_path, home_id, support_real):
         if p in failed:
             out["skipped"] += 1
             continue
-        res = _restore(os.path.join(parent, base), r)
+        res, aside = _restore(os.path.join(parent, base), r)
+        if aside:
+            out["aside"].append(aside)       # left next to the card, recoverable
         if res == "restored":
             out["restored"] += 1
         elif res == "gone":

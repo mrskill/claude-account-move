@@ -18,6 +18,7 @@ from . import panel_snapshot as snap
 from . import post_move_check as post
 from . import pre_move_check as pre
 from . import store as st
+from . import common
 from . import post_move_verify as verify
 from . import stamp_titles
 from . import sync_cards
@@ -434,6 +435,11 @@ def cmd_stamp(args):
     if prob:
         return fail(args, out, "stamp", started, EXIT_INPUT, "input_error",
                     "error: " + prob)
+    if args.apply or args.undo:
+        if common.claude_app_running():
+            return fail(args, out, "stamp", started, EXIT_FAIL, "app_running",
+                        "Quit the Claude app first (Cmd+Q), then run this command "
+                        "again: stamping changes the cards the app keeps open.")
     if args.undo:
         try:
             with write_lock(paths):
@@ -446,6 +452,8 @@ def cmd_stamp(args):
                 "ambiguous %(ambiguous)d (changed since the stamp: kept), invalid "
                 "%(invalid)d (outside this operation's targets); journal status: "
                 "%(status)s" % res)
+        for a in res["aside"]:
+            out.say("  card left beside its name, recover by renaming it: %s" % a)
         code = EXIT_OK if (res["status"] == "ok" and not res["ambiguous"]
                            and not res["invalid"]) else EXIT_FAIL
         emit(args, out, _report("stamp", code, "undo", started, undo=res,

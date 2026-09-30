@@ -97,9 +97,41 @@ class S1UndoNeverLosesTheCard(Base):
         self.check_failure(mock.patch.object(stamp_titles.os, "chmod",
                                              side_effect=OSError(errno.EPERM, "perm")))
 
-    def test_link_fails_for_lack_of_space(self):
-        self.check_failure(mock.patch.object(stamp_titles.os, "link",
-                                             side_effect=OSError(errno.ENOSPC, "full")))
+    def test_link_fails_for_lack_of_space_the_card_stays_beside_its_name(self):
+        p, original, stamped = self.stamped_card()
+        with mock.patch.object(stamp_titles.os, "link",
+                               side_effect=OSError(errno.ENOSPC, "full")):
+            res = self.undo()
+        self.assertEqual((res["restored"], res["ambiguous"]), (0, 1))
+        self.assertEqual(len(res["aside"]), 1)
+        self.assertEqual(self.read(res["aside"][0]), stamped)     # nothing lost
+        self.assertFalse(os.path.exists(p))                        # and no blind rename
+        os.rename(res["aside"][0], p)                              # manual recovery
+        self.assertEqual(self.undo()["restored"], 1)
+        self.assertEqual(self.read(p), original)
+
+    def test_no_overwriting_fallback_when_a_newer_card_appears_during_recovery(self):
+        p, original, stamped = self.stamped_card()
+        rp = os.path.realpath(p)
+        created = {"n": 0}
+        real_lexists = os.path.lexists
+
+        def lexists(path):
+            ans = real_lexists(path)
+            if path == rp and not ans and not created["n"]:
+                created["n"] = 1                   # the app writes a newer card now
+                with open(rp, "w") as fh:
+                    fh.write('{"newer": true}')
+            return ans
+
+        with mock.patch.object(stamp_titles.os, "link",
+                               side_effect=OSError(errno.ENOSPC, "full")), \
+                mock.patch.object(stamp_titles.os.path, "lexists", lexists):
+            res = self.undo()
+        if created["n"]:
+            self.assertEqual(self.read(p), b'{"newer": true}')    # never overwritten
+        self.assertTrue(res["aside"])
+        self.assertEqual(self.read(res["aside"][0]), stamped)
 
     def test_a_newer_card_that_appeared_meanwhile_is_kept_and_so_is_ours(self):
         p, original, stamped = self.stamped_card()
@@ -203,7 +235,7 @@ class S3ConditionalReplacement(Base):
         self.assertEqual(doc["title"], "Fix the login")
         self.assertEqual(self.no_leftovers(), [])
 
-    def test_late_write_through_an_open_descriptor_keeps_the_newer_document(self):
+    def test_late_write_through_an_open_descriptor_is_kept_aside_nothing_overwritten(self):
         p = self.card()
         _, (items, _) = self.plan()
         os.makedirs(self.h.state)
@@ -211,7 +243,7 @@ class S3ConditionalReplacement(Base):
         rp = os.path.realpath(p)
 
         def late_write(src, dst, **kw):
-            if dst == rp:                              # the old file is already aside
+            if dst == rp:                             # the old file is already aside
                 for f in os.listdir(self.d):
                     if f.startswith(".stamp-old-"):
                         with open(os.path.join(self.d, f), "a") as fh:
@@ -221,19 +253,22 @@ class S3ConditionalReplacement(Base):
         with mock.patch.object(stamp_titles.os, "link", side_effect=late_write):
             res = stamp_titles.apply_stamps(items, os.path.join(self.h.state, "j.jsonl"),
                                             path_id(self.h.home))
-        self.assertEqual((res["written"], res["changed"]), (0, 1))
-        self.assertTrue(self.read(p).endswith(b" "))
-        self.assertEqual(self.no_leftovers(), [])
+        self.assertEqual(res["changed"], 1)
+        aside = [f for f in os.listdir(self.d) if f.startswith(".stamp-old-")]
+        self.assertEqual(len(aside), 1)                # the newer document is kept
+        self.assertTrue(self.read(os.path.join(self.d, aside[0])).endswith(b" "))
 
-    def test_two_writers_cannot_run_at_once(self):
+    def test_two_writers_cannot_run_at_once_even_with_different_state_dirs(self):
         self.card()
-        os.makedirs(self.h.state)
-        fd = os.open(os.path.join(self.h.state, "mutate.lock"), os.O_RDWR | os.O_CREAT)
+        fd = os.open(os.path.realpath(self.h.support), os.O_RDONLY)
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             r = self.h.run("stamp", "--apply", "--json")
             self.assertEqual(r.returncode, 3, r.stdout)
             self.assertEqual(parse(r)["verdict"], "busy")
+            other_state = os.path.join(self.tmp, "state-two")
+            r = self.h.run("stamp", "--apply", "--state-dir", other_state)
+            self.assertEqual(r.returncode, 3)
             self.assertEqual(self.h.run("sync", "--apply").returncode, 3)
         finally:
             os.close(fd)
@@ -359,6 +394,85 @@ class SyncUndoLateWrite(Base):
         self.assertEqual(res["ambiguous"], 1)
         with open(dst) as fh:
             self.assertTrue(fh.read().endswith(" late"))
+
+
+class AppMustBeClosed(Base):
+    def stub(self, code):
+        p = os.path.join(self.tmp, "pgrep-%d.sh" % code)
+        with open(p, "w") as fh:
+            fh.write("#!/bin/sh\nexit %d\n" % code)
+        os.chmod(p, 0o755)
+        return p
+
+    def test_apply_and_undo_refuse_while_the_app_runs(self):
+        p = self.card()
+        original = self.read(p)
+        r = self.h.run("stamp", "--apply", "--json",
+                       CLAUDE_ACCOUNT_MOVE_PGREP=self.stub(0))
+        self.assertEqual(r.returncode, 3, r.stdout)
+        rep = parse(r)
+        self.assertEqual(rep["verdict"], "app_running")
+        self.assertIn("Quit the Claude app first", rep["reason"])
+        self.assertEqual(self.read(p), original)
+        self.assertFalse(os.path.exists(self.h.state))
+        self.assertEqual(self.h.run("stamp", "--apply").returncode, 0)   # app closed
+        r = self.h.run("stamp", "--undo", self.journal(),
+                       CLAUDE_ACCOUNT_MOVE_PGREP=self.stub(0))
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("Quit the Claude app first", r.stdout)
+        self.assertNotEqual(self.read(p), original)                       # still stamped
+
+    def test_dry_run_does_not_need_the_app_closed(self):
+        self.card()
+        r = self.h.run("stamp", CLAUDE_ACCOUNT_MOVE_PGREP=self.stub(0))
+        self.assertEqual(r.returncode, 0)
+
+    def test_the_check_function_and_its_failure_mode(self):
+        from claude_account_move import common
+        with mock.patch.dict(os.environ, {"CLAUDE_ACCOUNT_MOVE_PGREP": self.stub(0)}):
+            self.assertTrue(common.claude_app_running())
+        with mock.patch.dict(os.environ, {"CLAUDE_ACCOUNT_MOVE_PGREP": self.stub(1)}):
+            self.assertFalse(common.claude_app_running())
+        with mock.patch.dict(os.environ, {"CLAUDE_ACCOUNT_MOVE_PGREP": self.stub(2)}):
+            self.assertTrue(common.claude_app_running())          # cannot tell: refuse
+        with mock.patch.dict(os.environ, {"CLAUDE_ACCOUNT_MOVE_PGREP":
+                                          os.path.join(self.tmp, "missing")}):
+            self.assertTrue(common.claude_app_running())
+
+    def test_function_can_be_replaced_in_process(self):
+        import io
+        import contextlib
+        from claude_account_move import cli
+        self.card()
+        buf = io.StringIO()
+        with mock.patch.object(cli.common, "claude_app_running", return_value=True), \
+                contextlib.redirect_stdout(buf):
+            rc = cli.main(["stamp", "--apply", "--json", "--home", self.h.home,
+                           "--state-dir", self.h.state])
+        self.assertEqual(rc, 3)
+        self.assertEqual(json.loads(buf.getvalue())["verdict"], "app_running")
+
+    def test_both_process_patterns_are_asked(self):
+        from claude_account_move import common
+        log = os.path.join(self.tmp, "calls.txt")
+        p = os.path.join(self.tmp, "pgrep-log.sh")
+        with open(p, "w") as fh:
+            fh.write('#!/bin/sh\necho "$@" >> "%s"\nexit 1\n' % log)
+        os.chmod(p, 0o755)
+        with mock.patch.dict(os.environ, {"CLAUDE_ACCOUNT_MOVE_PGREP": p}):
+            self.assertFalse(common.claude_app_running())
+        with open(log) as fh:
+            calls = fh.read()
+        self.assertIn("-x Claude", calls)
+        self.assertIn("/Applications/Claude.app/Contents/", calls)
+
+    def journal(self):
+        names = sorted(f for f in os.listdir(self.h.state) if f.startswith("stamp-"))
+        return os.path.join(self.h.state, names[-1])
+
+    def read(self, p):
+        with open(p, "rb") as fh:
+            return fh.read()
 
 
 if __name__ == "__main__":

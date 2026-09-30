@@ -63,7 +63,8 @@ is a failure, never a pass.
   They do not even write a probe file into the storage. The only commands that
   touch the storage are `sync --apply` (adds card files), `sync --undo` (deletes
   the files that a journal proves `--apply` added), `stamp --apply` (rewrites the
-  `title` field of cards) and `stamp --undo` (puts the old bytes back).
+  `title` field of cards) and `stamp --undo` (puts the old bytes back). The last
+  two refuse while the Claude app is running.
 - It does not migrate scheduled tasks: `finish` reports recorded tasks that are
   missing in the new account, but moving them is up to you.
 - It does not decide for you between two different session ids behind one card
@@ -104,10 +105,14 @@ directory. If you linked it into your `PATH`, drop the `./`.
    Exit code `0` means ready. Anything else: read the `FAIL` lines, fix the
    cause, run `prepare` again. A snapshot taken when the verdict was not ready is
    kept for diagnosis but `finish` never picks it by itself.
-2. Sign out of the Claude desktop app and sign in with the new account. You do
+2. Optional, only now: put the last-message time into the session titles. Quit
+   the Claude app completely (Cmd+Q; `stamp --apply` refuses while it runs), run
+   `./claude-account-move stamp --apply`, then open the app again (see "stamp"
+   below).
+3. Sign out of the Claude desktop app and sign in with the new account. You do
    this yourself.
-3. In a terminal, sign the CLI in with the same new account: `claude /login`.
-4. Run:
+4. In a terminal, sign the CLI in with the same new account: `claude /login`.
+5. Run:
 
    ```sh
    ./claude-account-move finish
@@ -115,7 +120,7 @@ directory. If you linked it into your `PATH`, drop the `./`.
 
    It waits up to 15 minutes (`--wait-login SECONDS`) for the CLI account to
    equal the app account, then verifies. Exit code `0` means everything arrived.
-5. If `finish` says that names are missing in the new account's folder (exit
+6. If `finish` says that names are missing in the new account's folder (exit
    `3` with `target_names` failing, nothing missing anywhere), copy them and
    verify again:
 
@@ -127,9 +132,6 @@ directory. If you linked it into your `PATH`, drop the `./`.
 
    Then restart the Claude app once: it reads its session list only at start.
    Restarting ends running sessions, so save your work first.
-6. Optional: put the last-message time into the session titles with
-   `./claude-account-move stamp --apply` (see "stamp" below; it is best done
-   before step 2, and after `finish` it shows after the next app start).
 
 Useful options: `--json` (every command and every outcome, failures, usage
 errors and an interrupt included, prints exactly one JSON report on stdout;
@@ -163,35 +165,39 @@ copy of the card, so a card the app changed after the scan is planned coherently
 unreadable card or transcript, a storage root that resolves outside the Claude
 support folder, or two session ids behind one card name.
 
+**The Claude app must be closed.** `stamp --apply` and `stamp --undo` refuse
+(exit `3`, "Quit the Claude app first") while the desktop app is running: a
+process named `Claude` or any process started from `/Applications/Claude.app`.
+If the check itself cannot be run, the answer is "running". With the app closed
+there is no second writer, which is what makes the write safe; the dry run does
+not need it. Quit with Cmd+Q, run the command, open the app again.
+
 `--apply` writes each card through a temporary file. It then moves the card
 away with one atomic rename and inspects only the moved file: it must be the very
 file (same inode) and hold exactly the planned bytes. If not, it is put back
-without overwriting anything and the card is reported as changed (exit `3`). Only
-then is the stamped file published, and the moved file is checked once more for a
-late write through a descriptor that was already open; if one happened, the newer
-document is put back over the stamp. The card is therefore never replaced
-blindly. What cannot be excluded from outside: a writer that holds the file open
-and writes after that final check, and a process that recreates the name between
-the rename and the publication (its newer card then wins and the stamp is not
-written). Every write command (`sync --apply`, `sync --undo`, `stamp --apply`,
-`stamp --undo`) takes a lock in the state directory, so two of them never run at
-once (the second exits `3`). `--undo` restores a card byte for byte only when its
-inode and content still equal the journal's, under the same ownership rules and
-home binding as `sync --undo`. The stamped card is moved aside first and deleted
-only after the restored card has been published and verified; on any failure it
-stays (or goes back), and a card set aside stays under a `.undo-*` name in the
-same folder. A card changed since the stamp is kept and reported. A journal line
-for a published card that could not be acknowledged does not disable undo.
+and the card is reported as changed (exit `3`). Only then is the stamped file
+published, and the moved file is checked once more; if it changed, it stays next
+to the card as `.stamp-old-*` and is reported. No recovery path overwrites
+anything: a file is put back only with a hard link (which fails if the name is
+taken), otherwise it stays beside its name under a recoverable name and is listed
+in the output. Every write command (`sync --apply`, `sync --undo`, `stamp
+--apply`, `stamp --undo`) takes a lock on the Claude support folder itself (not
+on the state directory), so two of them never run at once even with different
+`--state-dir` values (the second exits `3`). `--undo` restores a card byte for
+byte only when its inode and content still equal the journal's, under the same
+ownership rules and home binding as `sync --undo`. The stamped card is moved
+aside first and deleted only after the restored card has been published and
+verified; on any failure it stays (or goes back), and a card set aside stays
+under a `.undo-*` name in the same folder (rename it back by hand). A card
+changed since the stamp is kept and reported. A journal line for a published card
+that could not be acknowledged does not disable undo.
 
-When to run it: the panel re-reads cards at start and at a change of account, so
-stamping BEFORE signing out (step 2) makes the stamps show right after the
-switch. Stamping after `finish` (optional step 6) works too, but shows only
-after the app is restarted (which ends running sessions). The stamp uses the
-time zone of this machine. Stamp while the app is idle anyway: the protections
-above cannot stop a process that writes through an already-open descriptor at
-just the wrong moment, and a journal only proves what this tool wrote; it is not
-authentication (a forged journal of the same home directory that names real
-cards in its recorded targets is honoured).
+When to run it: in the move, before you sign out (step 2): quit the app with
+Cmd+Q, run `stamp --apply`, open the app, then sign out. The panel re-reads its
+cards at start and at a change of account, so the stamps show right after the
+switch. The stamp uses the time zone of this machine. A journal only proves what
+this tool wrote; it is not authentication (a forged journal of the same home
+directory that names real cards in its recorded targets is honoured).
 
 ### Optional: a sync job of your own
 
@@ -308,7 +314,8 @@ python3 -m unittest discover -s tests
 ```
 
 The tests build a synthetic home directory in a temporary folder and never
-touch your real one. The privacy test proves its scanner on invented words only;
+touch your real one. The running-app check calls `pgrep`; the tests point
+`CLAUDE_ACCOUNT_MOVE_PGREP` at a stand-in script. The privacy test proves its scanner on invented words only;
 the real list of private names is kept outside the repository. To apply such a
 list as well, point `CLAUDE_ACCOUNT_MOVE_DENYLIST` at a file of `re:<pattern>` or
 `cs:<pattern>` lines.
