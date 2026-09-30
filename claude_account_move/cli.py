@@ -17,6 +17,7 @@ from . import panel_snapshot as snap
 from . import post_move_check as post
 from . import pre_move_check as pre
 from . import store as st
+from . import post_move_verify as verify
 from . import sync_cards
 from .common import (EXIT_FAIL, EXIT_INPUT, EXIT_INTERNAL, EXIT_LOGIN_TIMEOUT,
                      EXIT_NO_BASELINE, EXIT_NO_STORE, EXIT_OK, EXIT_WAIT,
@@ -59,9 +60,27 @@ def add_common(ap):
                     "when the app log cannot tell")
 
 
+class JsonArgumentParser(argparse.ArgumentParser):
+    """Usage errors exit 2 and, with --json on the command line, print a report."""
+
+    argv = ()
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        if "--json" in self.argv:
+            cmd = next((a for a in self.argv if not a.startswith("-")), None)
+            print(json.dumps({"schema": "claude-account-move/report/1",
+                              "command": cmd, "exit_code": EXIT_INPUT,
+                              "verdict": "input_error", "reason": message,
+                              "write_verified": False}, indent=1, sort_keys=True))
+        else:
+            print("%s: error: %s" % (self.prog, message), file=sys.stderr)
+        raise SystemExit(EXIT_INPUT)
+
+
 def build_parser():
-    ap = argparse.ArgumentParser(prog="claude-account-move", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = JsonArgumentParser(prog="claude-account-move", description=__doc__,
+                            formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version",
                     version="claude-account-move %s" % __version__)
     sub = ap.add_subparsers(dest="command")
@@ -108,7 +127,7 @@ def emit(args, out, rep, move_dir=None):
         try:
             write_json(os.path.join(move_dir, name), rep)
         except OSError as exc:
-            out.say("could not write report: %s" % exc)
+            print("warning: could not write report: %s" % exc, file=sys.stderr)
     if args.json:
         print(json.dumps(rep, indent=1, sort_keys=True, ensure_ascii=False))
 
@@ -135,6 +154,8 @@ def cmd_prepare(args):
     if prob:
         return fail(args, out, "prepare", started, EXIT_INPUT, "input_error",
                     "error: " + prob)
+    if args.active_pair:
+        st.parse_override(args.active_pair)      # PairError -> exit 2, before any storage check
     if not os.path.isdir(paths.support):
         return fail(args, out, "prepare", started, EXIT_NO_STORE, "no_store",
                     "storage not found: %s" % paths.support)
@@ -231,6 +252,8 @@ def cmd_finish(args):
     if prob:
         return fail(args, out, "finish", started, EXIT_INPUT, "input_error",
                     "error: " + prob)
+    if args.active_pair:
+        st.parse_override(args.active_pair)      # PairError -> exit 2, before any storage check
     if not os.path.isdir(paths.support) or not st.has_pairs(paths):
         return fail(args, out, "finish", started, EXIT_NO_STORE, "no_store",
                     "storage or account/organization pair not found under %s"
@@ -306,6 +329,8 @@ def cmd_sync(args):
     if prob:
         return fail(args, out, "sync", started, EXIT_INPUT, "input_error",
                     "error: " + prob)
+    if args.active_pair:
+        st.parse_override(args.active_pair)      # PairError -> exit 2, before any storage check
     if args.undo:
         try:
             res = sync_cards.undo(args.undo, snap.path_id(paths.home),
@@ -314,9 +339,11 @@ def cmd_sync(args):
             return fail(args, out, "sync", started, EXIT_INPUT, "input_error",
                         "journal rejected: %s" % exc)
         out.say("removed %(removed)d files, skipped %(skipped)d, ambiguous "
-                "%(ambiguous)d (same name, not proven to be ours: kept); journal "
+                "%(ambiguous)d (same name, not proven to be ours: kept), invalid "
+                "%(invalid)d (outside this operation's targets); journal "
                 "status: %(status)s" % res)
-        code = EXIT_OK if (res["status"] == "ok" and not res["ambiguous"]) else EXIT_FAIL
+        code = EXIT_OK if (res["status"] == "ok" and not res["ambiguous"]
+                           and not res["invalid"]) else EXIT_FAIL
         emit(args, out, _report("sync", code, "undo", started, undo=res,
                                 write_verified=False))
         return code
@@ -342,11 +369,19 @@ def cmd_sync(args):
     active = st.pair_dir(paths, pair[0], pair[1]) if pair else None
     if active and active not in index.stores[st.STORES[0]].dirs:
         active = None
-    if active is None and index.stores[st.STORES[0]].union_names():
-        return fail(args, out, "sync", started, EXIT_FAIL, "no_target",
-                    "cannot determine the claude-code-sessions folder of the "
-                    "target account (the app log names none yet; sign in to the "
-                    "app first or pass --active-pair): not reporting success")
+    for store_name in st.STORES:
+        s_ = index.stores[store_name]
+        if not s_.union_names():
+            continue
+        if store_name == st.STORES[0]:
+            resolved = active is not None
+        else:
+            resolved = bool(verify.target_dirs(index, store_name, target)) or bool(pair)
+        if not resolved:
+            return fail(args, out, "sync", started, EXIT_FAIL, "no_target",
+                        "cannot determine the %s folder of the target account "
+                        "(the app log names none yet; sign in to the app first or "
+                        "pass --active-pair): not reporting success" % store_name)
     plan, conflicts = sync_cards.plan_sync(index, target, active, pair)
     out.say("cards missing in the target pair(s): %d" % len(plan))
     for item in plan[:50]:
@@ -380,6 +415,7 @@ def cmd_sync(args):
 
 
 def main(argv=None):
+    JsonArgumentParser.argv = tuple(sys.argv[1:] if argv is None else argv)
     ap = build_parser()
     args = ap.parse_args(argv)
     if not args.command:
@@ -393,6 +429,10 @@ def main(argv=None):
         return fail(args, Out(args.json), args.command, started, EXIT_INPUT,
                     "input_error", "error: %s" % exc)
     except KeyboardInterrupt:
+        if args.json:
+            print(json.dumps(_report(args.command, EXIT_INTERNAL, "interrupted",
+                                     started, reason="interrupted",
+                                     write_verified=False), indent=1, sort_keys=True))
         return EXIT_INTERNAL
     except Exception as exc:  # last resort: never a silent success
         msg = "internal error: %s: %s" % (type(exc).__name__, exc)

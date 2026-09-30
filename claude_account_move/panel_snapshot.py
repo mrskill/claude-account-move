@@ -71,7 +71,7 @@ def settings_state(paths):
 
 
 def settings_summary(paths):
-    """Counts plus digests of permissions and hooks, or None when not usable.
+    """Counts plus digests of ALL settings keys, or None when not usable.
 
     Digests cover the full canonical content, so replacing one permission with
     another, or changing a hook's command or event, changes the summary even
@@ -97,7 +97,10 @@ def settings_summary(paths):
             "ask": len(perm.get("ask") or []),
             "hook_events": len(hooks), "hook_commands": n_hooks,
             "permissions_digest": _digest(canon_perm),
-            "hooks_digest": _digest(hooks)}
+            "hooks_digest": _digest(hooks),
+            "other_settings_digest": _digest(
+                {k: v for k, v in data.items()
+                 if k not in ("permissions", "hooks", "cleanupPeriodDays")})}
 
 
 def newest_message(index, tmap):

@@ -161,14 +161,20 @@ def evaluate(paths, before, index, tmap, identity, target, source,
 
         wrong_cid, regressed = [], []
         for n, rec in (exp.get("cards") or {}).items():
-            copies = [s.dirs[r]["cards"][n] for r in t_dirs
+            # Every target copy must keep the recorded binding, not only the
+            # best one: a second target folder with a wrong id still opens the
+            # wrong session.
+            copies = [(r, s.dirs[r]["cards"][n]) for r in t_dirs
                       if n in s.dirs[r]["cards"]]
             if not copies:
                 continue
-            tc = max(copies, key=lambda c: (1 if c["cid"] else 0, c["act"], c["turns"]))
-            if rec.get("cid") and tc["cid"].lower() != rec["cid"].lower():
+            want = (rec.get("cid") or "").lower()
+            if want and any(c["cid"].lower() != want for _, c in copies):
                 wrong_cid.append(n)
-            elif tc["act"] < rec.get("act", 0) or tc["turns"] < rec.get("turns", 0):
+                continue
+            tc = max((c for _, c in copies),
+                     key=lambda c: (1 if c["cid"] else 0, c["act"], c["turns"]))
+            if tc["act"] < rec.get("act", 0) or tc["turns"] < rec.get("turns", 0):
                 regressed.append(n)
 
         st_report = {
@@ -275,20 +281,36 @@ def evaluate(paths, before, index, tmap, identity, target, source,
                      "sessions after that many days" % cleanup)
 
     bad_tr = []
+    unchecked = 0
     for sid, rec in ev_before.items():
         cur = ev_now.get(sid) or {"size": 0, "last_ms": None}
         if not tmap.get(sid):
             bad_tr.append("%s (missing)" % sid)
-        elif cur["size"] < rec.get("size", 0):
+            continue
+        if cur["size"] < rec.get("size", 0):
             bad_tr.append("%s (truncated %d < %d bytes)" % (sid, cur["size"], rec["size"]))
-        elif rec.get("last_ms") is not None and cur["last_ms"] is None:
+            continue
+        if rec.get("last_ms") is not None and cur["last_ms"] is None:
             bad_tr.append("%s (no readable message any more)" % sid)
-        elif rec.get("last_ms") is not None and cur["last_ms"] < rec["last_ms"]:
+            continue
+        if rec.get("last_ms") is not None and cur["last_ms"] < rec["last_ms"]:
             bad_tr.append("%s (last message became older)" % sid)
+            continue
+        if rec.get("prefix_sha256"):
+            ok_prefix = any(st.prefix_digest(f, rec["prefix_len"]) == rec["prefix_sha256"]
+                            for f in tmap[sid])
+            if not ok_prefix:
+                bad_tr.append("%s (content of the first %d bytes changed)"
+                              % (sid, rec["prefix_len"]))
+        elif rec.get("size"):
+            unchecked += 1                  # snapshot of an older version: no digest
     _check(checks, "transcripts", not bad_tr,
-           "%d of %d recorded transcripts intact (size and last message)%s"
+           "%d of %d recorded transcripts intact (size, last message, content of "
+           "the recorded prefix)%s%s"
            % (len(ev_before) - len(bad_tr), len(ev_before),
-              ": " + ", ".join(bad_tr[:3]) if bad_tr else ""))
+              ": " + ", ".join(bad_tr[:3]) if bad_tr else "",
+              "; %d without a content digest (older snapshot)" % unchecked
+              if unchecked else ""))
     lost |= bool(bad_tr)
     report["transcripts_bad"] = len(bad_tr)
 

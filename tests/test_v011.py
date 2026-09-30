@@ -69,9 +69,11 @@ class C1UndoOwnership(Base):
         jp = os.path.join(self.h.state, "crash.jsonl")
         with open(jp, "w") as fh:
             fh.write(json.dumps({"op": "begin", "home_id": path_id(self.h.home),
-                                 "op_id": "x", "version": 1}) + "\n")
+                                 "op_id": "x", "version": 1,
+                                 "targets": [os.path.realpath(target)]}) + "\n")
             fh.write(json.dumps({"op": "intent", "path": path, "src": "s",
-                                 "sha256": digest, "dev": 1, "ino": 1}) + "\n")
+                                 "sha256": digest, "dev": 1, "ino": 1,
+                                 "op_id": "x"}) + "\n")
         r = self.h.run("sync", "--undo", jp)
         self.assertTrue(os.path.exists(path))
         self.assertEqual(r.returncode, 3)

@@ -1,6 +1,6 @@
 # claude-account-move
 
-Version 0.1.1. Move Claude Code (the desktop app for Mac and the CLI) from one
+Version 0.1.2. Move Claude Code (the desktop app for Mac and the CLI) from one
 Claude account to another without losing your sessions, and prove afterwards
 that nothing was lost.
 
@@ -34,22 +34,26 @@ alone (every number is printed with its denominator):
   disk but cannot be opened);
 - no session owns two different card files;
 - after the move: every card name, every deletion mark and every scheduled task
-  recorded before still exists; the target's copy of each card is bound to the
-  same session id as recorded and is not older; every recorded transcript still
-  has its size and its last message (judged per session, not by one global
-  maximum); settings are unchanged (permissions and hooks are compared by a
-  digest of their full content, so replacing one entry with another is seen);
-  both accounts match the target.
+  recorded before still exists; EVERY copy of a card in the target folders (not
+  only the best one) is bound to the session id recorded before, and the best
+  copy is not older; every recorded transcript still has its size, its last
+  message and a byte-identical prefix (transcripts only grow, so the first
+  bytes recorded, up to 64 MiB per file, must not change); settings are
+  unchanged (every top-level key of the settings file is compared by a digest
+  of its full content, so replacing one entry with another is seen); both
+  accounts match the target.
 
 A value that could be measured before the move and cannot be measured after it
 is a failure, never a pass.
 
 ## What it does not do
 
-- It never signs in for you and never asks for, reads or stores a password or
-  token. You sign in to the app and run `claude /login` yourself. It parses
-  `~/.claude.json` and the app's `config.json` as whole JSON documents but keeps
-  only the account and organization ids; nothing else from them is stored.
+- It never signs in for you and never asks you for a password or token. You sign
+  in to the app and run `claude /login` yourself. It does not use or store
+  credentials: it parses `~/.claude.json` and the app's `config.json` as whole
+  JSON documents (so anything in them, including a token if present, passes
+  through memory), keeps only the account and organization ids, and never writes,
+  logs or transmits anything else from them.
 - `prepare`, `finish` and the checks change nothing in the Claude storage or in
   your settings. Everything they write goes to the state directory (see below).
   They do not even write a probe file into the storage. The only commands that
@@ -73,7 +77,7 @@ is a failure, never a pass.
 ```sh
 git clone https://github.com/mrskill/claude-account-move.git
 cd claude-account-move
-./claude-account-move --version      # claude-account-move 0.1.1
+./claude-account-move --version      # claude-account-move 0.1.2
 ```
 
 Or download a release archive, unpack it and run `./claude-account-move` from
@@ -119,8 +123,9 @@ directory. If you linked it into your `PATH`, drop the `./`.
    Then restart the Claude app once: it reads its session list only at start.
    Restarting ends running sessions, so save your work first.
 
-Useful options: `--json` (every command and every outcome, failures included,
-prints exactly one JSON report on stdout; human text goes to stderr),
+Useful options: `--json` (every command and every outcome, failures, usage
+errors and an interrupt included, prints exactly one JSON report on stdout;
+human text goes to stderr),
 `--home DIR` (inspect another home directory), `--state-dir DIR`,
 `--wait-sync SECONDS`, `--allow-same-account` (re-login to the same account),
 `--move-id ID`, `--max-age-hours N` (default 72), `--active-pair ACCOUNT/ORG`
@@ -150,7 +155,11 @@ no heartbeat configured that check is skipped.
 | 6 | `finish`: the wait for login ran out. `login.reason` in the JSON report says why: `cli_lags`, `app_not_switched`, `identity_invalid`. |
 | 7 | `finish`: no usable "before" snapshot of this move (missing, damaged, not ready, without a source account, older than `--max-age-hours`, other home directory, unknown `--move-id`). |
 
-When several causes apply, the code is chosen per command in this order:
+Input errors come first: usage errors, an unsafe state directory and a malformed
+`--active-pair` (not two UUIDs) are reported before the storage is looked at. An
+`--active-pair` of the wrong account can only be recognised once the app account
+has been read, so it is reported (also as 2) after the storage check. When
+several causes apply, the code is chosen per command in this order:
 `prepare`: 2, 4, 1, 3, 0. `finish`: 2, 4, 7, 6, 3, 5, 0 (a storage with no
 account folder gives 4 even when no snapshot exists). `sync`: 2, 4, 1, 3, 0.
 
@@ -186,9 +195,15 @@ it. It never writes bytecode caches.
 - `sync --apply` only adds files and never overwrites. Undo exactly what it added:
   `./claude-account-move sync --undo ~/.claude-account-move/sync-<time>-<id>.jsonl`.
   A file is removed only when the journal proves this run published it (same
-  device and inode as the staged copy, same content) and the journal belongs to
-  this home directory. A file that merely has the same name or bytes (a card the
-  app wrote, a card you restored) is kept and reported as ambiguous. An
+  device and inode as the staged copy, same content), the journal belongs to this
+  home directory and one operation, and the file lies in a target folder recorded
+  when the operation began. The destination is first moved to a private name with
+  one atomic rename and checked there, so nobody can swap the file between the
+  check and the deletion; a file that turns out not to be ours is put back without
+  overwriting anything (the name is briefly absent). A file that merely has the
+  same name or bytes (a card the app wrote, a card you restored) is kept and
+  reported as ambiguous. Every record must carry its required fields: a record
+  that does not is damage, and only the intact prefix before it is used. An
   interrupted journal is used up to its last complete line and the torn part is
   reported. Undo itself writes to the storage (it deletes), so it is exempt from
   the read-only promise above.
@@ -200,8 +215,14 @@ it. It never writes bytecode caches.
 - Read-only everywhere except `sync --apply` (adds card files and may create the
   agent-mode folder of the target account when it does not exist yet) and
   `sync --undo` (removes what `--apply` added).
-- Scheduled-task files must match the expected shape (a list of objects with an
-  id); anything else is reported as an unreadable observation, not as "no tasks".
+- Scheduled-task files must match the expected shape (a list of objects with
+  unique ids; a missing key is an empty list, an explicit null is not);
+  anything else is reported as an unreadable observation, not as "no tasks".
+- Transcript preservation is judged by size, last message and a prefix digest
+  (first 64 MiB), which assumes transcripts are append-only. A change beyond the
+  first 64 MiB of a larger file, or a rewrite that keeps the prefix, is not seen.
+  Unparsable lines in the last 400 kB of a transcript make the observation
+  incomplete (an unfinished last line of a live session is ignored).
 - The active folder is taken from the last mention in the app log
   (`~/Library/Logs/Claude/main.log`), because the organization is not always the
   one in `~/.claude.json`. If the log is missing, pass `--active-pair`.

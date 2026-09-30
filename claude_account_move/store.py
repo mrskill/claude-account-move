@@ -115,9 +115,9 @@ def read_tasks_file(path):
         data = json.load(fh)
     if not isinstance(data, dict):
         raise ValueError("tasks file is not an object")
-    tasks = data.get("scheduledTasks")
-    if tasks is None:
+    if "scheduledTasks" not in data:
         return {}
+    tasks = data["scheduledTasks"]
     if not isinstance(tasks, list):
         raise ValueError("scheduledTasks is not a list")
     out = {}
@@ -132,6 +132,8 @@ def read_tasks_file(path):
         ap = t.get("approvedPermissions")
         if ap is not None and not isinstance(ap, list):
             raise ValueError("approvedPermissions is not a list")
+        if str(tid) in out:
+            raise ValueError("duplicate task id")
         out[str(tid)] = {"enabled": t.get("enabled") is not False,
                          "approved": len(ap) if ap else 0}
     return out
@@ -249,6 +251,14 @@ class PairError(Exception):
     """An explicit --active-pair that cannot be trusted."""
 
 
+def parse_override(override):
+    """(acc, org) from an explicit ACCOUNT/ORG, or PairError."""
+    parts = override.lower().split("/")
+    if len(parts) != 2 or not (UUID_RE.match(parts[0]) and UUID_RE.match(parts[1])):
+        raise PairError("--active-pair must look like ACCOUNT/ORG (two UUIDs)")
+    return parts[0], parts[1]
+
+
 def live_pair(paths, account=None, override=None):
     """(acc, org) the app writes into, or None when it cannot be determined.
 
@@ -259,13 +269,11 @@ def live_pair(paths, account=None, override=None):
     target.
     """
     if override:
-        parts = override.lower().split("/")
-        if len(parts) != 2 or not (UUID_RE.match(parts[0]) and UUID_RE.match(parts[1])):
-            raise PairError("--active-pair must look like ACCOUNT/ORG (two UUIDs)")
+        parts = parse_override(override)
         if account and parts[0] != account.lower():
             raise PairError("--active-pair account %s differs from the expected "
                             "account %s" % (parts[0], account.lower()))
-        return parts[0], parts[1]
+        return parts
     hits = app_pairs(paths, account)
     if not hits:
         return None
@@ -364,27 +372,91 @@ def session_last_ms(tmap, sid):
     return max(vals) if vals else None
 
 
-def transcript_evidence(tmap, sids, obs=None):
-    """{sid: {"size": int, "last_ms": int or None}} for the given sessions.
+PREFIX_CAP = 64 * 1024 * 1024
 
-    Size is the largest transcript file of the session; last_ms is the time of
-    its last real turn. A file that cannot be read is an observation error.
+
+def prefix_digest(path, length):
+    """sha256 of the first `length` bytes, or None if the file is shorter/unreadable.
+
+    Transcripts only grow, so the prefix recorded before the move must still be
+    byte-identical afterwards, whatever was appended meanwhile.
+    """
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            left = length
+            while left > 0:
+                chunk = fh.read(min(1 << 20, left))
+                if not chunk:
+                    return None
+                h.update(chunk)
+                left -= len(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def tail_parse_errors(path):
+    """Number of complete lines in the tail that are not valid JSON."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            start = max(0, size - TAIL_BYTES)
+            fh.seek(start)
+            data = fh.read()
+    except OSError:
+        return 0
+    lines = data.split(b"\n")
+    if start > 0:
+        lines = lines[1:]               # first line may be cut
+    if lines and lines[-1] == b"":
+        lines.pop()                     # file ended with a newline
+    elif lines:
+        lines.pop()                     # unterminated last line: still being written
+    bad = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            json.loads(line)
+        except ValueError:
+            bad += 1
+    return bad
+
+
+def transcript_evidence(tmap, sids, obs=None):
+    """Per-session evidence: size, last message time, prefix digest.
+
+    {sid: {"size", "last_ms", "prefix_len", "prefix_sha256"}} for the largest
+    transcript file of each session. A file that cannot be read, or whose tail
+    holds lines that are not valid JSON, is an observation error.
     """
     out = {}
     for sid in sids:
         files = tmap.get(sid) or []
-        size, last = 0, None
+        best, last = None, None
         for f in files:
             try:
-                size = max(size, os.path.getsize(f))
+                size = os.path.getsize(f)
                 with open(f, "rb"):
                     pass
             except OSError:
                 if obs is not None:
                     obs.errors.append("transcript unreadable: %s" % f)
                 continue
+            bad = tail_parse_errors(f)
+            if bad and obs is not None:
+                obs.errors.append("transcript has %d unparsable lines: %s" % (bad, f))
             ms = last_message_ms(f)
             if ms and (last is None or ms > last):
                 last = ms
-        out[sid] = {"size": size, "last_ms": last}
+            if best is None or size > best[0]:
+                best = (size, f)
+        rec = {"size": 0, "last_ms": last, "prefix_len": 0, "prefix_sha256": None}
+        if best:
+            plen = min(best[0], PREFIX_CAP)
+            rec.update(size=best[0], prefix_len=plen,
+                       prefix_sha256=prefix_digest(best[1], plen) if plen else None)
+        out[sid] = rec
     return out
