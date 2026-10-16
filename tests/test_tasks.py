@@ -217,6 +217,47 @@ class TaskRework(Base):
         self.assertEqual(e["createdAt"], 12)
         self.assertEqual([f for f, _ in store.task_type_issues(e)], ["enabled"])
 
+    def test_undo_refused_while_app_runs(self):
+        src, dst = self.setup_move()
+        self.assertEqual(self.h.run("sync", "--apply").returncode, 0)
+        after = read_bytes(os.path.join(dst, NAME))
+        journal = [f for f in os.listdir(self.h.state) if f.startswith("sync-")][0]
+        r = self.h.run("sync", "--undo", os.path.join(self.h.state, journal),
+                       CLAUDE_ACCOUNT_MOVE_PGREP=OPEN)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Quit the Claude app", r.stdout + r.stderr)
+        self.assertEqual(read_bytes(os.path.join(dst, NAME)), after)
+
+    def test_error_after_publish_keeps_backup_and_undo_restores(self):
+        import tempfile
+        from claude_account_move import sync_cards as sc
+        root = os.path.realpath(tempfile.mkdtemp(prefix="cam-pub-", dir=self.tmp))
+        d = os.path.join(root, "pair")
+        os.makedirs(d)
+        raw = b'{"scheduledTasks":[{"id":"own"}]}\r\n'
+        with open(os.path.join(d, NAME), "wb") as fh:
+            fh.write(raw)
+        item = {"store": CC, "dst_dir": d, "add": [task("t1")], "coerce": 0,
+                "create_dir": False}
+        orig = sc.Journal.add
+
+        def flaky(self, **rec):
+            if rec.get("op") == "task_done":
+                raise OSError("disk full")
+            return orig(self, **rec)
+        sc.Journal.add = flaky
+        try:
+            copied, failed, tw, tf = sc.apply_all([], [item],
+                                                  os.path.join(root, "j.jsonl"), "h")
+        finally:
+            sc.Journal.add = orig
+        self.assertEqual((tw, tf), (1, 0))
+        self.assertNotEqual(read_bytes(os.path.join(d, NAME)), raw)
+        self.assertEqual(len([f for f in os.listdir(d) if ".bak-move-" in f]), 1)
+        res = sc.undo(os.path.join(root, "j.jsonl"), "h", root)
+        self.assertEqual(res["tasks_restored"], 1)
+        self.assertEqual(read_bytes(os.path.join(d, NAME)), raw)
+
 
 from test_cli import A as A_, O1 as O1_  # noqa: E402
 from fixture import uid  # noqa: E402

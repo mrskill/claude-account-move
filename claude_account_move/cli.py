@@ -342,6 +342,10 @@ def cmd_sync(args):
     if args.active_pair:
         st.parse_override(args.active_pair)      # PairError -> exit 2, before any storage check
     if args.undo:
+        if common.claude_app_running():
+            return fail(args, out, "sync", started, EXIT_FAIL, "app_running",
+                        "Quit the Claude app first (Cmd+Q), then run this command "
+                        "again: undo rewrites files the app keeps open.")
         try:
             with write_lock(paths):
                 res = sync_cards.undo(args.undo, snap.path_id(paths.home),

@@ -416,6 +416,7 @@ def apply_tasks(plan, jr=None):
         dst = os.path.join(item["dst_dir"], TASKS_NAME)
         tmp = os.path.join(item["dst_dir"], ".tmp-tasks-%s" % op)
         bak = ""
+        published = False
         try:
             if item.get("create_dir"):
                 os.makedirs(item["dst_dir"], exist_ok=True)
@@ -441,12 +442,18 @@ def apply_tasks(plan, jr=None):
                 jr.add(op="task_intent", path=dst, backup=bak,
                        sha256=sha256_file(tmp), dev=st.st_dev, ino=st.st_ino)
             os.replace(tmp, dst)
+            published = True               # from here the file is live
+            written += 1
             if jr:
                 jr.add(op="task_done", path=dst)
-            written += 1
         except (OSError, ValueError, AttributeError):
+            if published:
+                continue                   # keep backup and intent: undo restores
             if jr:
-                jr.add(op="task_failed", path=dst)
+                try:
+                    jr.add(op="task_failed", path=dst)
+                except OSError:
+                    pass
             failed += 1
             if bak:
                 try:
