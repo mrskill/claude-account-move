@@ -143,6 +143,9 @@ class Tasks(Base):
         self.assertEqual(self.h.run("prepare").returncode, 0)
         switch_to_target(self.h)
         self.h.run("sync", "--apply")
+        tgt = os.path.join(self.h.support, CC, B, O2, "scheduled-tasks.json")
+        self.assertTrue(os.path.exists(tgt))   # sync now migrates tasks
+        os.unlink(tgt)                          # but a lost file is still caught
         r = self.h.run("finish", "--wait-login", "0", "--json")
         self.assertEqual(r.returncode, 3)
         self.assertTrue(any(c["id"] == "tasks" and not c["ok"]

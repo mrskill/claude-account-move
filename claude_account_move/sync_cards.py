@@ -22,7 +22,9 @@ still used.
 
 Not copied: cards of sessions deleted in the panel (a `deleted_<id>` mark exists
 somewhere), and cards whose copies disagree on the session id (reported as
-conflicts). Scheduled tasks are not migrated.
+conflicts). Scheduled tasks are merged by id (see plan_tasks/apply_tasks): entries missing
+in the target scheduled-tasks.json are added, target entries are kept, the old
+file is backed up first, the new one is written atomically.
 """
 import json
 import os
@@ -34,6 +36,7 @@ import uuid
 
 from . import post_move_verify as verify
 from .common import CARD_PREFIX, STORES, inside, open_new_file, sha256_file
+from .store import TASK_INT_FIELDS
 
 
 class JournalError(Exception):
@@ -280,3 +283,95 @@ def undo(journal_path, home_id, support_real):
         else:
             out["ambiguous"] += 1         # same name, not proven ours: kept
     return out
+
+
+TASKS_NAME = "scheduled-tasks.json"
+
+
+def _load_task_list(path):
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict) or not isinstance(data.get("scheduledTasks"), list):
+        raise ValueError("unexpected scheduled-tasks.json shape")
+    return data
+
+
+def coerce_task(entry):
+    """Digit strings in integer timestamp fields become int. True if changed."""
+    changed = False
+    for f in TASK_INT_FIELDS:
+        v = entry.get(f)
+        if isinstance(v, str) and v.isdigit():
+            entry[f] = int(v)
+            changed = True
+    return changed
+
+
+def plan_tasks(index, target_account, active_dir):
+    """[{store, dst_dir, add: [entries], coerce: n}] for target dirs that lack tasks.
+
+    Sources are the other directories of the same store that hold a tasks file
+    (read-only). The first copy of an id wins among sources; a target entry
+    always wins over any source entry.
+    """
+    out = []
+    for name in STORES:
+        s = index.stores[name]
+        dirs = [d for d in verify.target_dirs(index, name, target_account,
+                                              active_dir) if d in s.dirs]
+        srcs = [d for d in sorted(s.dirs) if d not in dirs
+                and s.dirs[d]["tasks"]]
+        for dst in dirs:
+            have, coerce = set(), 0
+            tpath = os.path.join(dst, TASKS_NAME)
+            if s.dirs[dst]["tasks"]:
+                for t in _load_task_list(tpath)["scheduledTasks"]:
+                    have.add(str(t.get("id")))
+                    coerce += int(any(isinstance(t.get(f), str) and t[f].isdigit()
+                                      for f in TASK_INT_FIELDS))
+            add = []
+            for sd in srcs:
+                for t in _load_task_list(os.path.join(sd, TASKS_NAME))["scheduledTasks"]:
+                    if str(t.get("id")) not in have:
+                        have.add(str(t.get("id")))
+                        add.append(t)
+            if add or coerce:
+                out.append({"store": name, "dst_dir": dst, "add": add,
+                            "coerce": coerce})
+    return out
+
+
+def apply_tasks(plan):
+    """Merge into each target file. Returns (written, failed)."""
+    written, failed = 0, 0
+    op = uuid.uuid4().hex[:8]
+    for item in plan:
+        dst = os.path.join(item["dst_dir"], TASKS_NAME)
+        tmp = os.path.join(item["dst_dir"], ".tmp-tasks-%s" % op)
+        try:
+            if os.path.exists(dst):
+                data = _load_task_list(dst)
+                with open(dst, encoding="utf-8") as fh, \
+                        open_new_file(dst + ".bak-move-" + op) as bak:
+                    bak.write(fh.read())
+                    bak.flush()
+                    os.fsync(bak.fileno())
+            else:
+                data = {"scheduledTasks": []}
+            data["scheduledTasks"].extend(item["add"])
+            for t in data["scheduledTasks"]:
+                coerce_task(t)
+            with open_new_file(tmp) as fh:
+                fh.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, dst)
+            written += 1
+        except (OSError, ValueError, AttributeError):
+            failed += 1
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return written, failed

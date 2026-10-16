@@ -395,6 +395,17 @@ def cmd_sync(args):
                         "pass --active-pair): not reporting success" % store_name)
     plan, conflicts = sync_cards.plan_sync(index, target, active, pair)
     out.say("cards missing in the target pair(s): %d" % len(plan))
+    try:
+        tplan = sync_cards.plan_tasks(index, target, active)
+    except (OSError, ValueError) as exc:
+        return fail(args, out, "sync", started, EXIT_FAIL, "incomplete_observation",
+                    "scheduled-tasks.json could not be planned: %s" % exc)
+    out.say("scheduled tasks missing in the target: %d (files to write: %d)"
+            % (sum(len(i["add"]) for i in tplan), len(tplan)))
+    for i in tplan:
+        out.say("  would merge %d task(s), fix %d type(s) in %s"
+                % (len(i["add"]), i["coerce"],
+                   os.path.join(i["dst_dir"], sync_cards.TASKS_NAME)))
     for item in plan[:50]:
         out.say("  would copy %s -> %s" % (item["name"], item["dst_dir"]))
     if len(plan) > 50:
@@ -403,7 +414,8 @@ def cmd_sync(args):
         out.say("  conflict, not copied: %s %s has session ids %s"
                 % (c["store"], c["name"], ", ".join(c["session_ids"])))
     base = dict(planned=len(plan), conflicts=conflicts, dry_run=not args.apply,
-                write_verified=False)
+                write_verified=False,
+                tasks_planned=sum(len(i["add"]) for i in tplan))
     if not args.apply:
         out.say("dry run: nothing written. Add --apply to copy.")
         code = EXIT_FAIL if conflicts else EXIT_OK
@@ -415,10 +427,14 @@ def cmd_sync(args):
             journal = sync_cards.new_journal_path(jdir)
             copied, failed = sync_cards.apply_plan(plan, journal,
                                                    snap.path_id(paths.home))
+            tw, tf = sync_cards.apply_tasks(tplan)
+            failed += tf
     except OSError as exc:
         return fail(args, out, "sync", started, EXIT_INTERNAL, "internal_error",
                     "cannot write the journal or copy: %s" % exc)
     out.say("copied %d, failed %d; journal: %s" % (copied, failed, journal))
+    out.say("scheduled-tasks files written: %d (old file kept as "
+            "scheduled-tasks.json.bak-move-*)" % tw)
     out.say("Restart the Claude app so the panel re-reads the cards "
             "(this ends running sessions: save your work first).")
     code = EXIT_FAIL if (failed or conflicts) else EXIT_OK

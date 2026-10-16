@@ -106,6 +106,37 @@ def read_card(path):
             "title": title if isinstance(title, str) else ""}
 
 
+# Timestamp fields the app validates as numbers (a digit string makes it reject
+# the WHOLE file). Measured 16.10.2026: createdAt "1787838292655" -> ZodError.
+TASK_INT_FIELDS = ("createdAt",)
+
+
+def task_problems(path):
+    """["<id>: <field> ...", ...] for entries whose fields have the wrong type.
+
+    Tolerant: an unreadable or differently shaped file gives [] here because
+    read_tasks_file reports that case.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        tasks = data["scheduledTasks"]
+        out = []
+        for t in tasks:
+            tid = t.get("id")
+            for f in TASK_INT_FIELDS:
+                if f in t and (isinstance(t[f], bool)
+                               or not isinstance(t[f], (int, float))):
+                    out.append("%s: %s is %s, expected a number"
+                               % (tid, f, type(t[f]).__name__))
+            if "enabled" in t and not isinstance(t["enabled"], bool):
+                out.append("%s: enabled is %s, expected a boolean"
+                           % (tid, type(t["enabled"]).__name__))
+        return out
+    except Exception:
+        return []
+
+
 def read_tasks_file(path):
     """{task id: {"enabled", "approved"}}; raises when the file is damaged.
 
@@ -142,7 +173,8 @@ def read_tasks_file(path):
 
 
 def _read_dir(real, obs):
-    info = {"cards": {}, "tombs": set(), "tasks": False, "task_map": {}}
+    info = {"cards": {}, "tombs": set(), "tasks": False, "task_map": {},
+            "task_problems": []}
     try:
         names = sorted(os.listdir(real))
     except OSError as exc:
@@ -161,6 +193,7 @@ def _read_dir(real, obs):
             info["tombs"].add(n[len(TOMB_PREFIX):])
         elif n == "scheduled-tasks.json":
             info["tasks"] = True
+            info["task_problems"] = task_problems(p)
             try:
                 info["task_map"] = read_tasks_file(p)
             except Exception:
