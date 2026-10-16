@@ -111,28 +111,44 @@ def read_card(path):
 TASK_INT_FIELDS = ("createdAt",)
 
 
+def task_type_issues(entry):
+    """[(field, expected)] for fields of a task entry with the wrong type.
+
+    The ONE validator: `finish` reports its result, `sync` coerces what it can.
+    """
+    out = []
+    for f in TASK_INT_FIELDS:
+        if f in entry and (isinstance(entry[f], bool)
+                           or not isinstance(entry[f], (int, float))):
+            out.append((f, "a number"))
+    if "enabled" in entry and not isinstance(entry["enabled"], bool):
+        out.append(("enabled", "a boolean"))
+    return out
+
+
+def coerce_task(entry):
+    """Digit strings in number fields become int. True if anything changed."""
+    changed = False
+    for f, expected in task_type_issues(entry):
+        v = entry.get(f)
+        if expected == "a number" and isinstance(v, str) and v.isdigit():
+            entry[f] = int(v)
+            changed = True
+    return changed
+
+
 def task_problems(path):
-    """["<id>: <field> ...", ...] for entries whose fields have the wrong type.
+    """["<id>: <field> is <type>, expected ...", ...] for wrongly typed fields.
 
     Tolerant: an unreadable or differently shaped file gives [] here because
     read_tasks_file reports that case.
     """
     try:
         with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        tasks = data["scheduledTasks"]
-        out = []
-        for t in tasks:
-            tid = t.get("id")
-            for f in TASK_INT_FIELDS:
-                if f in t and (isinstance(t[f], bool)
-                               or not isinstance(t[f], (int, float))):
-                    out.append("%s: %s is %s, expected a number"
-                               % (tid, f, type(t[f]).__name__))
-            if "enabled" in t and not isinstance(t["enabled"], bool):
-                out.append("%s: enabled is %s, expected a boolean"
-                           % (tid, type(t["enabled"]).__name__))
-        return out
+            tasks = json.load(fh)["scheduledTasks"]
+        return ["%s: %s is %s, expected %s"
+                % (t.get("id"), f, type(t[f]).__name__, expected)
+                for t in tasks for f, expected in task_type_issues(t)]
     except Exception:
         return []
 

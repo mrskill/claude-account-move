@@ -36,7 +36,7 @@ import uuid
 
 from . import post_move_verify as verify
 from .common import CARD_PREFIX, STORES, inside, open_new_file, sha256_file
-from .store import TASK_INT_FIELDS
+from .store import coerce_task, task_type_issues  # noqa: F401
 
 
 class JournalError(Exception):
@@ -97,6 +97,10 @@ OP_FIELDS = {
                ("ino", int)),
     "done": (("path", str),),
     "failed": (("path", str),),
+    "task_intent": (("path", str), ("backup", str), ("sha256", str),
+                    ("dev", int), ("ino", int)),
+    "task_done": (("path", str),),
+    "task_failed": (("path", str),),
 }
 
 
@@ -122,11 +126,16 @@ def new_journal_path(state_dir):
 
 def apply_plan(plan, journal_path, home_id="unbound"):
     """Copy without ever replacing a file. Returns (copied, failed)."""
-    copied, failed = 0, 0
+    return apply_all(plan, [], journal_path, home_id)[:2]
+
+
+def apply_all(plan, tplan, journal_path, home_id="unbound"):
+    """Cards, then task files, one journal. Returns (copied, failed, tw, tf)."""
+    copied, failed, tw, tf = 0, 0, 0, 0
     op_id = uuid.uuid4().hex
     jr = Journal(journal_path, op_id)
     try:
-        targets = sorted({os.path.realpath(i["dst_dir"]) for i in plan})
+        targets = sorted({os.path.realpath(i["dst_dir"]) for i in list(plan) + list(tplan)})
         jr.add(op="begin", version=JOURNAL_VERSION, home_id=home_id,
                targets=targets, at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
         for item in plan:
@@ -151,9 +160,10 @@ def apply_plan(plan, journal_path, home_id="unbound"):
                     os.unlink(tmp)
                 except OSError:
                     pass
+        tw, tf = apply_tasks(tplan, jr)
     finally:
         jr.close()
-    return copied, failed
+    return copied, failed, tw, tf
 
 
 def valid_record(rec, op_fields=None):
@@ -236,6 +246,37 @@ def _safe_remove(path, dev, ino, digest):
     return "ambiguous"
 
 
+def _undo_task(r, failed, targets, support_real, out):
+    """Put the backed-up tasks file back, or remove the file sync created."""
+    p = r["path"]
+    parent = os.path.realpath(os.path.dirname(p))
+    if os.path.basename(p) != TASKS_NAME or not inside(parent, support_real) \
+            or parent not in targets:
+        out["invalid"] += 1
+        return
+    if p in failed:
+        out["skipped"] += 1
+        return
+    path = os.path.join(parent, TASKS_NAME)
+    bak = r["backup"]
+    if bak and (os.path.dirname(os.path.realpath(bak)) != parent
+                or not os.path.isfile(bak)):
+        out["ambiguous"] += 1          # backup gone: cannot restore, file kept
+        return
+    res = _safe_remove(path, r["dev"], r["ino"], r["sha256"])
+    if res == "ambiguous":
+        out["ambiguous"] += 1          # changed after apply: kept
+    elif not bak:
+        out["tasks_removed" if res == "removed" else "skipped"] += 1
+    else:
+        try:
+            os.link(bak, path)         # never overwrites; same bytes as before
+            os.unlink(bak)
+            out["tasks_restored"] += 1
+        except OSError:
+            out["ambiguous"] += 1
+
+
 def undo(journal_path, home_id, support_real):
     """Remove exactly the files this journal's operation published.
 
@@ -256,12 +297,15 @@ def undo(journal_path, home_id, support_real):
     if any(r["op_id"] != begin["op_id"] for r in recs):
         raise JournalError("journal mixes several operations")
     targets = set(begin["targets"])
-    failed = {r["path"] for r in recs if r["op"] == "failed"}
+    failed = {r["path"] for r in recs if r["op"] in ("failed", "task_failed")}
     out = {"removed": 0, "skipped": 0, "ambiguous": 0, "invalid": 0,
-           "status": status}
+           "status": status, "tasks_restored": 0, "tasks_removed": 0}
     for r in recs[1:]:
         if r["op"] == "begin":
             raise JournalError("journal has a second begin record")
+        if r["op"] == "task_intent":
+            _undo_task(r, failed, targets, support_real, out)
+            continue
         if r["op"] != "intent":
             continue
         p = r["path"]
@@ -289,86 +333,126 @@ TASKS_NAME = "scheduled-tasks.json"
 
 
 def _load_task_list(path):
-    with open(path, encoding="utf-8") as fh:
-        data = json.load(fh)
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    data = json.loads(raw.decode("utf-8"))
     if not isinstance(data, dict) or not isinstance(data.get("scheduledTasks"), list):
         raise ValueError("unexpected scheduled-tasks.json shape")
     return data
 
 
-def coerce_task(entry):
-    """Digit strings in integer timestamp fields become int. True if changed."""
-    changed = False
-    for f in TASK_INT_FIELDS:
-        v = entry.get(f)
-        if isinstance(v, str) and v.isdigit():
-            entry[f] = int(v)
-            changed = True
-    return changed
+def _new_binary(path):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    return os.fdopen(fd, "wb")
 
 
-def plan_tasks(index, target_account, active_dir):
-    """[{store, dst_dir, add: [entries], coerce: n}] for target dirs that lack tasks.
+def _mtime(path):
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return 0
 
-    Sources are the other directories of the same store that hold a tasks file
-    (read-only). The first copy of an id wins among sources; a target entry
-    always wins over any source entry.
+
+def plan_tasks(index, target_account, active_dir, snapshot_ids, source_account=None,
+               pair=None, card_plan=()):
+    """[{store, dst_dir, add: [entries], coerce: n, create_dir}].
+
+    Only ids recorded in the move snapshot (`snapshot_ids`: {store: set of ids})
+    that are missing in the target are added, so a task the user deleted on
+    purpose after the snapshot is never brought back. Targets are the target
+    pair directories (existing, or about to be created for cards by the card
+    plan); every other directory of the store, including other organizations
+    of the target account, is a read-only source. For an id with several
+    copies the one under the snapshot's source account wins, then the newest
+    file; a target entry always wins over any source entry.
     """
+    created = {(i["store"], i["dst_dir"]) for i in card_plan if i.get("create_dir")}
     out = []
     for name in STORES:
         s = index.stores[name]
-        dirs = [d for d in verify.target_dirs(index, name, target_account,
-                                              active_dir) if d in s.dirs]
-        srcs = [d for d in sorted(s.dirs) if d not in dirs
-                and s.dirs[d]["tasks"]]
+        wanted = set(snapshot_ids.get(name) or ())
+        if pair:
+            dirs = [os.path.realpath(os.path.join(s.base, pair[0], pair[1]))]
+            dirs = [d for d in dirs if d in s.dirs or (name, d) in created]
+        else:
+            dirs = [d for d in verify.target_dirs(index, name, target_account,
+                                                  active_dir) if d in s.dirs]
+        dirs += [d for (n_, d) in sorted(created) if n_ == name and d not in dirs]
+        dirs = [d for d in dirs if d in s.dirs or (name, d) in created]
+        real_dirs = {os.path.realpath(d) for d in dirs}
+        srcs = [d for d in sorted(s.dirs)
+                if os.path.realpath(d) not in real_dirs and s.dirs[d]["tasks"]]
+        src_acc = (source_account or "").lower()
+
+        def rank(sd):
+            acc = os.path.basename(os.path.dirname(sd)).lower()
+            return (1 if src_acc and acc == src_acc else 0,
+                    _mtime(os.path.join(sd, TASKS_NAME)))
+        srcs.sort(key=rank, reverse=True)           # best source first
         for dst in dirs:
             have, coerce = set(), 0
-            tpath = os.path.join(dst, TASKS_NAME)
-            if s.dirs[dst]["tasks"]:
-                for t in _load_task_list(tpath)["scheduledTasks"]:
+            if dst in s.dirs and s.dirs[dst]["tasks"]:
+                for t in _load_task_list(os.path.join(dst, TASKS_NAME))["scheduledTasks"]:
                     have.add(str(t.get("id")))
-                    coerce += int(any(isinstance(t.get(f), str) and t[f].isdigit()
-                                      for f in TASK_INT_FIELDS))
+                    coerce += int(coerce_task(dict(t)))
             add = []
             for sd in srcs:
                 for t in _load_task_list(os.path.join(sd, TASKS_NAME))["scheduledTasks"]:
-                    if str(t.get("id")) not in have:
-                        have.add(str(t.get("id")))
+                    tid = str(t.get("id"))
+                    if tid in wanted and tid not in have:
+                        have.add(tid)
                         add.append(t)
             if add or coerce:
                 out.append({"store": name, "dst_dir": dst, "add": add,
-                            "coerce": coerce})
+                            "coerce": coerce, "create_dir": (name, dst) in created})
     return out
 
 
-def apply_tasks(plan):
-    """Merge into each target file. Returns (written, failed)."""
+def apply_tasks(plan, jr=None):
+    """Merge into each target file, journaling first. Returns (written, failed)."""
     written, failed = 0, 0
     op = uuid.uuid4().hex[:8]
     for item in plan:
         dst = os.path.join(item["dst_dir"], TASKS_NAME)
         tmp = os.path.join(item["dst_dir"], ".tmp-tasks-%s" % op)
+        bak = ""
         try:
+            if item.get("create_dir"):
+                os.makedirs(item["dst_dir"], exist_ok=True)
             if os.path.exists(dst):
                 data = _load_task_list(dst)
-                with open(dst, encoding="utf-8") as fh, \
-                        open_new_file(dst + ".bak-move-" + op) as bak:
-                    bak.write(fh.read())
-                    bak.flush()
-                    os.fsync(bak.fileno())
+                bak = dst + ".bak-move-" + op
+                with open(dst, "rb") as fh, _new_binary(bak) as bf:
+                    bf.write(fh.read())
+                    bf.flush()
+                    os.fsync(bf.fileno())
             else:
                 data = {"scheduledTasks": []}
             data["scheduledTasks"].extend(item["add"])
             for t in data["scheduledTasks"]:
                 coerce_task(t)
-            with open_new_file(tmp) as fh:
-                fh.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+            body = (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+            with _new_binary(tmp) as fh:
+                fh.write(body)
                 fh.flush()
                 os.fsync(fh.fileno())
+            st = os.stat(tmp)
+            if jr:
+                jr.add(op="task_intent", path=dst, backup=bak,
+                       sha256=sha256_file(tmp), dev=st.st_dev, ino=st.st_ino)
             os.replace(tmp, dst)
+            if jr:
+                jr.add(op="task_done", path=dst)
             written += 1
         except (OSError, ValueError, AttributeError):
+            if jr:
+                jr.add(op="task_failed", path=dst)
             failed += 1
+            if bak:
+                try:
+                    os.unlink(bak)
+                except OSError:
+                    pass
         finally:
             try:
                 os.unlink(tmp)
