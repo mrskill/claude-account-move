@@ -338,6 +338,52 @@ class Bounded(Base):
         self.assertIn(ru.VERDICT_OK, out)
 
 
+class Resume(Base):
+    """Round 2: which move `auto` resumes, refuses, or leaves alone."""
+
+    def left_unfinished(self):
+        build_source(self.h)
+        code, out, _, _ = self.run_auto("--wait-login", "0.1", settle=0.05,
+                                        wait=self.user_logs_in("cli_lags"))
+        self.assertEqual(code, 6, out)
+        moves = os.path.join(self.h.state, "moves")
+        (name,) = [n for n in os.listdir(moves) if not n.endswith(".partial")]
+        return moves, name
+
+    def second_run(self, *extra):
+        def fix(cmd):
+            self.h.accounts(cli=B, app=B)
+            return 0
+        return self.run_auto(*extra, wait=self.user_logs_in(), cli_login=fix)
+
+    def test_newer_finished_move_ends_the_search(self):
+        moves, old = self.left_unfinished()
+        new = "99991231T000000000Z" + old[old.index("-"):]
+        shutil.copytree(os.path.join(moves, old), os.path.join(moves, new))
+        with open(os.path.join(moves, new, "report-finish.json"), "w") as fh:
+            json.dump({"command": "finish", "exit_code": 0}, fh)
+        _, _, _, m = self.second_run()
+        self.assertEqual(m["cmd_prepare"].call_count, 1)
+
+    def test_newest_expired_unfinished_move_stops_auto(self):
+        moves, old = self.left_unfinished()
+        mp = os.path.join(moves, old, "manifest.json")
+        man = json.loads(slurp(mp, "r"))
+        man["created_at"] = "2020-01-01T00:00:00+00:00"
+        with open(mp, "w") as fh:
+            json.dump(man, fh)
+        code, out, _, m = self.second_run()
+        self.assertEqual(code, common.EXIT_NO_BASELINE, out)
+        self.assertEqual(m["cmd_prepare"].call_count, 0)
+        self.assertIn(old, out)
+        self.assertIn("--new-move", out)
+
+    def test_new_move_flag_skips_the_search(self):
+        self.left_unfinished()
+        _, _, _, m = self.second_run("--new-move")
+        self.assertEqual(m["cmd_prepare"].call_count, 1)
+
+
 class Review(Base):
     """Regressions found by the review of auto_move.py."""
 

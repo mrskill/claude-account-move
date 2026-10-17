@@ -127,6 +127,8 @@ def build_parser():
     a = sub.add_parser("auto", help="the whole move in one run: prepare, stamp, wait for "
                        "login, finish, sync if needed (writes)")
     add_common(a)
+    a.add_argument("--new-move", action="store_true",
+                   help="do not resume an unfinished move: start a new one")
     a.add_argument("--no-stamp", action="store_true",
                    help="do not put the last-message time into session titles")
     a.add_argument("--wait-login", type=float, default=900.0,

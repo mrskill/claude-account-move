@@ -29,7 +29,7 @@ from . import common
 from . import panel_snapshot as snap
 from . import ru_text as ru
 from . import store as st
-from .common import (EXIT_FAIL, EXIT_INPUT, EXIT_LOGIN_TIMEOUT, EXIT_OK,
+from .common import (EXIT_FAIL, EXIT_INPUT, EXIT_NO_BASELINE, EXIT_LOGIN_TIMEOUT, EXIT_OK,
                      EXIT_WAIT, STORES, read_identity, state_dir_problem,
                      write_lock)
 
@@ -176,29 +176,36 @@ def run_cli_login(cmd, timeout=None):
 
 
 def find_unfinished_move(paths, current_app_account):
-    """(move_id, move_dir, source) of the newest unfinished move whose source
-    account differs from the account the app has now, else None.
+    """Look at the newest move directory only. Returns one of:
 
-    Unfinished: a usable ready snapshot without a finish report that ended ok.
-    Only the newest unfinished move is looked at: it is the one the owner left.
+      None                          no move dirs, or the newest is finished, or
+                                    it is a failed prepare, or its source is
+                                    the account the app has now: prepare anew;
+      ("resume", move_id, dir, src) unfinished, usable, source differs from the
+                                    current app account: continue it;
+      ("blocked", move_id, problem) unfinished but unusable (too old, damaged):
+                                    the owner decides, `auto` must not guess.
     """
     root = snap.moves_dir(paths)
     if os.path.islink(root) or not os.path.isdir(root):
         return None
-    for name in sorted(os.listdir(root), reverse=True):
-        if not snap.MOVE_ID_RE.match(name):
-            continue                              # also skips *.partial
-        before, _man, move_id, problem = snap.load_baseline(paths, name)
-        if problem:
-            continue
-        mdir = os.path.join(root, name)
-        rep, err = common.read_json(os.path.join(mdir, "report-finish.json"))
-        if not err and isinstance(rep, dict) and rep.get("exit_code") == EXIT_OK:
-            continue                              # finished: look at older ones no more
-        source = (before.get("identity") or {}).get("app_account")
-        if source and source != current_app_account:
-            return move_id, mdir, source
+    names = sorted((n for n in os.listdir(root) if snap.MOVE_ID_RE.match(n)),
+                   reverse=True)
+    if not names:
         return None
+    name = names[0]
+    mdir = os.path.join(root, name)
+    rep, err = common.read_json(os.path.join(mdir, "report-finish.json"))
+    if not err and isinstance(rep, dict) and rep.get("exit_code") == EXIT_OK:
+        return None                               # finished: a new move starts
+    before, man, move_id, problem = snap.load_baseline(paths, name, allow_unready=True)
+    if man is not None and not man.get("ready"):
+        return None                               # a prepare that was not ready
+    if problem:
+        return ("blocked", name, problem)
+    source = (before.get("identity") or {}).get("app_account")
+    if source and source != current_app_account:
+        return ("resume", move_id, mdir, source)
     return None
 
 
@@ -376,7 +383,13 @@ def cmd_auto(args, cli):
             current = read_identity(paths)["app"]["value"]
         except (KeyError, TypeError):
             current = None
-        resumed = find_unfinished_move(paths, current) if current else None
+        found = (None if args.new_move or not current
+                 else find_unfinished_move(paths, current))
+        if found and found[0] == "blocked":
+            step("resume", False, move_id=found[1], problem=found[2])
+            return stop(EXIT_NO_BASELINE, "unfinished_move_unusable",
+                        ru.UNFINISHED_BLOCKED % (found[1], found[2]))
+        resumed = found[1:] if found else None
         if resumed:
             ctx["move_id"], ctx["move_dir"], source = resumed
             step("resume", True, move_id=ctx["move_id"])
