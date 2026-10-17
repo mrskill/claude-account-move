@@ -105,9 +105,11 @@ def plan_stamps(index, tmap):
 
     Everything about a card (title, session id, rollback bytes) comes from ONE
     freshly read document, never from the earlier scan, so a card the app
-    changed in between is planned coherently. Problems met here (unreadable
-    card or transcript, conflicting session ids behind one card name) go to
-    `index.obs`; the caller must refuse to write while it is incomplete.
+    changed in between is planned coherently. A local card name is not a
+    session identity across account directories: each document is matched to
+    transcripts through its own cliSessionId. Problems met here (unreadable
+    card or transcript) go to `index.obs`; the caller must refuse to write
+    while it is incomplete.
     """
     stats = {"cards": 0, "no_transcript": 0, "empty_title": 0, "conflict": 0,
              "unknown_format": 0, "current": 0, "planned": 0}
@@ -127,26 +129,23 @@ def plan_stamps(index, tmap):
                     continue
                 groups.setdefault(name, []).append((path, raw, d))
     items = []
+    last_by_sid = {}
     for name, copies in sorted(groups.items()):
-        cids = sorted({str(d.get("cliSessionId") or "").strip().lower()
-                       for _, _, d in copies} - {""})
-        if len(cids) > 1:
-            stats["conflict"] += len(copies)
-            index.obs.errors.append("conflicting session ids behind one card "
-                                    "name: %s" % name)
-            continue
-        best = None
-        for sid in cids:
-            for f in tmap.get(sid) or []:
-                try:
-                    ms = st._last_message(f)       # the real read, not just an open
-                except OSError:
-                    index.obs.errors.append("transcript unreadable: %s" % f)
-                    continue
-                if ms is not None and (best is None or ms > best):
-                    best = ms
         for path, raw, d in copies:
             stats["cards"] += 1
+            sid = str(d.get("cliSessionId") or "").strip().lower()
+            if sid not in last_by_sid:
+                best = None
+                for f in tmap.get(sid) or []:
+                    try:
+                        ms = st._last_message(f)   # the real read, not just an open
+                    except OSError:
+                        index.obs.errors.append("transcript unreadable: %s" % f)
+                        continue
+                    if ms is not None and (best is None or ms > best):
+                        best = ms
+                last_by_sid[sid] = best
+            best = last_by_sid[sid]
             if best is None:
                 stats["no_transcript"] += 1
                 continue

@@ -1,5 +1,7 @@
-"""Command line: prepare, finish, sync, stamp.
+"""Command line: auto, prepare, finish, sync, stamp.
 
+auto     everything in one run for a non-technical owner: app closed, prepare,
+         write probe, stamp, wait for the new login, finish, sync if needed.
 prepare  before signing out: readiness checks, "before" snapshot, one pass.
 finish   after signing in to the app and running `claude /login`: waits until
          the CLI account equals the app account, then verifies against the
@@ -41,11 +43,17 @@ def _poll(default, env):
 class Out(object):
     """Human lines go to stdout, or to stderr when --json owns stdout."""
 
-    def __init__(self, as_json):
-        self.stream = sys.stderr if as_json else sys.stdout
+    def __init__(self, as_json, quiet=False):
+        self.stream = None if quiet else (sys.stderr if as_json else sys.stdout)
+
+    @classmethod
+    def of(cls, args):
+        """quiet is set only by `auto`, which prints its own summary."""
+        return cls(args.json, getattr(args, "quiet", False))
 
     def say(self, msg=""):
-        print(msg, file=self.stream)
+        if self.stream is not None:
+            print(msg, file=self.stream)
 
 
 def add_common(ap):
@@ -116,6 +124,19 @@ def build_parser():
     add_common(s)
     s.add_argument("--apply", action="store_true", help="really copy (default: dry run)")
     s.add_argument("--undo", metavar="JOURNAL", help="remove files a journal lists")
+    a = sub.add_parser("auto", help="the whole move in one run: prepare, stamp, wait for "
+                       "login, finish, sync if needed (writes)")
+    add_common(a)
+    a.add_argument("--no-stamp", action="store_true",
+                   help="do not put the last-message time into session titles")
+    a.add_argument("--wait-login", type=float, default=900.0,
+                   help="seconds to wait for the new login (default 900)")
+    a.add_argument("--wait-close", type=float, default=600.0,
+                   help="seconds to wait for the Claude app to be quit (default 600)")
+    a.add_argument("--allow-same-account", action="store_true",
+                   help="the move keeps the same account (re-login)")
+    a.add_argument("--pause", action="store_true",
+                   help="at the end wait for Enter (for the double-click launcher)")
     return ap
 
 
@@ -138,6 +159,9 @@ def emit(args, out, rep, move_dir=None):
             write_json(os.path.join(move_dir, name), rep)
         except OSError as exc:
             print("warning: could not write report: %s" % exc, file=sys.stderr)
+    captured = getattr(args, "capture", None)
+    if captured is not None:            # `auto` collects the reports of its steps
+        captured.append(rep)
     if args.json:
         print(json.dumps(rep, indent=1, sort_keys=True, ensure_ascii=False))
 
@@ -158,7 +182,7 @@ def print_checks(out, checks):
 
 def cmd_prepare(args):
     started = time.monotonic()
-    out = Out(args.json)
+    out = Out.of(args)
     paths = make_paths(args)
     prob = state_dir_problem(paths)
     if prob:
@@ -244,7 +268,7 @@ def wait_for_login(paths, source, allow_same, limit_s, poll_s, out):
             again = read_identity(paths)       # drift check before success
             if again == ident:
                 return ident, None, time.monotonic() - t0
-            continue
+            reason = "identity_invalid"        # files still changing: deadline and sleep apply
         if time.monotonic() >= deadline:
             return ident, reason, time.monotonic() - t0
         tick = int((time.monotonic() - t0) // 30)
@@ -256,7 +280,7 @@ def wait_for_login(paths, source, allow_same, limit_s, poll_s, out):
 
 def cmd_finish(args):
     started = time.monotonic()
-    out = Out(args.json)
+    out = Out.of(args)
     paths = make_paths(args)
     prob = state_dir_problem(paths)
     if prob:
@@ -333,7 +357,7 @@ def cmd_finish(args):
 
 def cmd_sync(args):
     started = time.monotonic()
-    out = Out(args.json)
+    out = Out.of(args)
     paths = make_paths(args)
     prob = state_dir_problem(paths)
     if prob:
@@ -429,7 +453,7 @@ def cmd_sync(args):
 
 def cmd_stamp(args):
     started = time.monotonic()
-    out = Out(args.json)
+    out = Out.of(args)
     paths = make_paths(args)
     prob = state_dir_problem(paths)
     if prob:
@@ -513,6 +537,22 @@ def cmd_stamp(args):
     return code
 
 
+def cmd_auto(args):
+    from . import auto_move          # imported late: auto_move calls the cmd_* above
+    return auto_move.cmd_auto(args, sys.modules[__name__])
+
+
+def _pause(args):
+    """Keep the launcher window open until Enter; never fails the run."""
+    if args.command != "auto" or not getattr(args, "pause", False):
+        return
+    from . import ru_text
+    try:
+        input("\n" + ru_text.CLOSE_PROMPT)
+    except (EOFError, KeyboardInterrupt, OSError):
+        pass
+
+
 def main(argv=None):
     JsonArgumentParser.argv = tuple(sys.argv[1:] if argv is None else argv)
     ap = build_parser()
@@ -520,15 +560,22 @@ def main(argv=None):
     if not args.command:
         ap.print_help()
         return EXIT_INPUT
+    code = _run(args)
+    _pause(args)
+    return code
+
+
+def _run(args):
     started = time.monotonic()
     try:
         return {"prepare": cmd_prepare, "finish": cmd_finish,
-                "sync": cmd_sync, "stamp": cmd_stamp}[args.command](args)
+                "sync": cmd_sync, "stamp": cmd_stamp,
+                "auto": cmd_auto}[args.command](args)
     except st.PairError as exc:
-        return fail(args, Out(args.json), args.command, started, EXIT_INPUT,
+        return fail(args, Out.of(args), args.command, started, EXIT_INPUT,
                     "input_error", "error: %s" % exc)
     except LockBusy as exc:
-        return fail(args, Out(args.json), args.command, started, EXIT_FAIL,
+        return fail(args, Out.of(args), args.command, started, EXIT_FAIL,
                     "busy", "error: %s" % exc)
     except KeyboardInterrupt:
         if args.json:

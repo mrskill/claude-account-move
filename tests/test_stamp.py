@@ -292,7 +292,7 @@ class Undo(Base):
 class Wiring(Base):
     def test_version_and_help(self):
         r = self.h.run("--version")
-        self.assertIn("0.1.2", r.stdout)
+        self.assertIn("0.1.3", r.stdout)
         self.assertIn("stamp", self.h.run("--help").stdout)
 
     def test_stamp_does_not_disturb_a_finished_move(self):
