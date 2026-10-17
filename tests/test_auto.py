@@ -54,13 +54,13 @@ class Base(unittest.TestCase):
         return fake
 
     def run_auto(self, *extra, app_running=None, wait=None, cli_login=None,
-                 read_back=None, settle=0.05):
+                 read_back=None, settle=0.05, real_login=False):
         """(exit code, stdout, stderr, mocks). Everything outside is replaced."""
         argv = ["auto", "--home", self.h.home, "--state-dir", self.h.state] + list(extra)
         running = app_running if app_running is not None else (lambda: False)
         wait = wait or self.user_logs_in()
 
-        def fake_login(cmd):
+        def fake_login(cmd, timeout=None):
             self.login_calls.append(tuple(cmd))
             return cli_login(cmd) if cli_login else 0
 
@@ -68,7 +68,8 @@ class Base(unittest.TestCase):
         with contextlib.ExitStack() as es:
             es.enter_context(mock.patch.object(common, "claude_app_running", running))
             es.enter_context(mock.patch.object(auto_move, "wait_app_switch", wait))
-            es.enter_context(mock.patch.object(auto_move, "run_cli_login", fake_login))
+            if not real_login:
+                es.enter_context(mock.patch.object(auto_move, "run_cli_login", fake_login))
             es.enter_context(mock.patch.object(auto_move, "CLI_SETTLE_MIN_S", settle))
             if read_back:
                 es.enter_context(mock.patch.object(auto_move, "_read_back", read_back))
@@ -297,6 +298,44 @@ class Login(Base):
         self.assertEqual(code, 6)
         self.assertIn(ru.LOGIN_REASON["cli_lags"], out)
         self.assertEqual(len(self.login_calls), 2)
+
+
+class Bounded(Base):
+    """P1 fixes: a CLI login that never ends, and a move left unfinished."""
+
+    def test_hanging_cli_login_stops_with_exit_6_in_budget(self):
+        build_source(self.h)
+        hang = ("python3", "-c", "import time; time.sleep(60)")
+        t0 = time.monotonic()
+        with mock.patch.object(auto_move, "LOGIN_COMMANDS", (hang,)):
+            code, out, _, m = self.run_auto("--wait-login", "0.3", settle=0.2,
+                                            real_login=True,
+                                            wait=self.user_logs_in("cli_lags"))
+        self.assertEqual(code, 6, out)
+        self.assertLess(time.monotonic() - t0, 10)
+        self.assertIn(ru.LOGIN_REASON["cli_login_timeout"], out)
+        self.assertEqual(m["cmd_finish"].call_count, 0)
+
+    def test_unfinished_move_is_resumed_not_prepared_again(self):
+        build_source(self.h)
+        code, out, _, m = self.run_auto("--wait-login", "0.1", settle=0.05,
+                                        wait=self.user_logs_in("cli_lags"))
+        self.assertEqual(code, 6, out)           # app is on B now, CLI is not
+        moves = os.path.join(self.h.state, "moves")
+        first = [n for n in os.listdir(moves) if not n.endswith(".partial")]
+        self.assertEqual(len(first), 1)
+
+        def fix(cmd):
+            self.h.accounts(cli=B, app=B)
+            return 0
+
+        code, out, _, m = self.run_auto(wait=self.user_logs_in(), cli_login=fix)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(m["cmd_prepare"].call_count, 0)
+        self.assertGreaterEqual(m["cmd_finish"].call_count, 1)
+        self.assertEqual(os.listdir(moves), first)     # no new baseline
+        self.assertIn(first[0], out)
+        self.assertIn(ru.VERDICT_OK, out)
 
 
 class Review(Base):

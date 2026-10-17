@@ -38,6 +38,7 @@ CLOSE_POLL_S = 2.0
 LOGIN_POLL_S = 2.0
 CLI_SETTLE_MIN_S = 3.0      # how long to watch for the CLI account after a login run
 CLI_SETTLE_MAX_S = 15.0
+CLI_LOGIN_FLOOR_S = 1.0     # least time a CLI login run is given
 # Tried in this order; the first finishes by itself after the login.
 LOGIN_COMMANDS = (("claude", "auth", "login"), ("claude", "/login"))
 ENTRY = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
@@ -159,13 +160,46 @@ def wait_app_switch(cli, paths, source, allow_same, limit_s, poll_s, out):
         time.sleep(min(poll_s, max(0.05, deadline - time.monotonic())))
 
 
-def run_cli_login(cmd):
+CLI_LOGIN_TIMEOUT = "timeout"     # run_cli_login result: the login did not end in time
+
+
+def run_cli_login(cmd, timeout=None):
     """Run the CLI login interactively in this window. Returns the exit code,
-    or None when the command does not exist. Tests replace this function."""
+    None when the command does not exist, or CLI_LOGIN_TIMEOUT when it did not
+    finish within `timeout` seconds (the child is killed). Tests replace this."""
     try:
-        return subprocess.run(list(cmd)).returncode
+        return subprocess.run(list(cmd), timeout=timeout).returncode
+    except subprocess.TimeoutExpired:      # run() has already killed and reaped the child
+        return CLI_LOGIN_TIMEOUT
     except OSError:
         return None
+
+
+def find_unfinished_move(paths, current_app_account):
+    """(move_id, move_dir, source) of the newest unfinished move whose source
+    account differs from the account the app has now, else None.
+
+    Unfinished: a usable ready snapshot without a finish report that ended ok.
+    Only the newest unfinished move is looked at: it is the one the owner left.
+    """
+    root = snap.moves_dir(paths)
+    if os.path.islink(root) or not os.path.isdir(root):
+        return None
+    for name in sorted(os.listdir(root), reverse=True):
+        if not snap.MOVE_ID_RE.match(name):
+            continue                              # also skips *.partial
+        before, _man, move_id, problem = snap.load_baseline(paths, name)
+        if problem:
+            continue
+        mdir = os.path.join(root, name)
+        rep, err = common.read_json(os.path.join(mdir, "report-finish.json"))
+        if not err and isinstance(rep, dict) and rep.get("exit_code") == EXIT_OK:
+            continue                              # finished: look at older ones no more
+        source = (before.get("identity") or {}).get("app_account")
+        if source and source != current_app_account:
+            return move_id, mdir, source
+        return None
+    return None
 
 
 # Store counters that must be zero for a missing-names failure to be repairable
@@ -335,67 +369,80 @@ def cmd_auto(args, cli):
             return stop(EXIT_FAIL, "app_running", ru.APP_TIMEOUT)
         step("app_closed", True)
 
-        # 2. prepare
-        out.say(ru.PREPARE_START)
-        code, rep = run_step(cli.cmd_prepare, _ns(args, wait_sync=0.0, full_copy=False))
-        if rep and rep.get("move_id"):
-            ctx["move_id"] = rep["move_id"]
-            ctx["move_dir"] = os.path.join(snap.moves_dir(paths), rep["move_id"])
-        if code != EXIT_OK or not rep or not rep.get("ready"):
-            step("prepare", False, exit_code=code)
-            lines = [ru.PREPARE_FAIL]
-            if rep and rep.get("checks"):
-                for c in rep["checks"]:
-                    if not c["ok"]:
-                        lines.append("  - %s (%s)" % (ru.PREPARE_CHECKS.get(c["id"], c["id"]),
-                                                      c["detail"]))
-            elif rep:
-                lines.append("  - %s" % rep.get("reason", rep.get("verdict")))
-            lines.append(ru.PREPARE_FAIL_END)
-            return stop(code if code != EXIT_OK else EXIT_FAIL,
-                        (rep or {}).get("verdict", "not_ready"), "\n".join(lines),
-                        checks=(rep or {}).get("checks"))
-        source = rep["accounts"]["app"]
-        step("prepare", True, move_id=ctx["move_id"])
-        out.say(ru.PREPARE_OK % ctx["move_dir"])
-
-        # 3. real write probe
-        out.say(ru.PROBE_START)
-        ident = read_identity(paths)
-        pair = st.live_pair(paths, account=ident["app"]["value"] if args.active_pair else None,
-                            override=args.active_pair)
-        target_dir = st.pair_dir(paths, pair[0], pair[1]) if pair else None
-        if not target_dir:
-            step("write_probe", False, status="no_dir")
-            return stop(EXIT_FAIL, "probe_failed", ru.PROBE_NO_DIR)
-        with write_lock(paths):
-            status, detail = probe_write(target_dir, os.path.realpath(paths.support))
-        step("write_probe", status == "ok", status=status, detail=detail)
-        if status == "outside":
-            return stop(EXIT_FAIL, "probe_failed", ru.PROBE_OUTSIDE % detail)
-        if status != "ok":
-            return stop(EXIT_FAIL, "probe_failed", ru.PROBE_FAIL % detail)
-        out.say(ru.PROBE_OK)
-
-        # 4. stamp
-        if args.no_stamp:
-            out.say(ru.STAMP_SKIPPED)
-            step("stamp", True, skipped=True)
+        # 2-4 are skipped when an earlier move was left unfinished (the app is
+        # already in the new account): its snapshot and stamp stay, and we go on
+        # to the login wait and finish with the same move_id.
+        try:
+            current = read_identity(paths)["app"]["value"]
+        except (KeyError, TypeError):
+            current = None
+        resumed = find_unfinished_move(paths, current) if current else None
+        if resumed:
+            ctx["move_id"], ctx["move_dir"], source = resumed
+            step("resume", True, move_id=ctx["move_id"])
+            out.say(ru.RESUME_MOVE % ctx["move_dir"])
         else:
-            out.say(ru.STAMP_START)
-            code, srep = run_step(cli.cmd_stamp, _ns(args, apply=True, undo=None))
-            ctx["stamp"] = srep
-            ctx["stamp_journal"] = (srep or {}).get("journal")
-            if code != EXIT_OK:
-                step("stamp", False, exit_code=code)
-                ctx["problem"] = ru.PROBLEM_STEP
-                why = (srep or {}).get("reason") or (srep or {}).get("verdict")
-                return stop(code, "stamp_failed",
-                            ru.STAMP_FAIL % (code, why, ctx["stamp_journal"] or ru.NONE_WORD),
-                            show_summary=True)
-            step("stamp", True, journal=ctx["stamp_journal"])
-            out.say(ru.STAMP_OK % ((srep.get("result") or {}).get("written", 0),
-                                   ctx["stamp_journal"]))
+            # 2. prepare
+            out.say(ru.PREPARE_START)
+            code, rep = run_step(cli.cmd_prepare, _ns(args, wait_sync=0.0, full_copy=False))
+            if rep and rep.get("move_id"):
+                ctx["move_id"] = rep["move_id"]
+                ctx["move_dir"] = os.path.join(snap.moves_dir(paths), rep["move_id"])
+            if code != EXIT_OK or not rep or not rep.get("ready"):
+                step("prepare", False, exit_code=code)
+                lines = [ru.PREPARE_FAIL]
+                if rep and rep.get("checks"):
+                    for c in rep["checks"]:
+                        if not c["ok"]:
+                            lines.append("  - %s (%s)" % (ru.PREPARE_CHECKS.get(c["id"], c["id"]),
+                                                          c["detail"]))
+                elif rep:
+                    lines.append("  - %s" % rep.get("reason", rep.get("verdict")))
+                lines.append(ru.PREPARE_FAIL_END)
+                return stop(code if code != EXIT_OK else EXIT_FAIL,
+                            (rep or {}).get("verdict", "not_ready"), "\n".join(lines),
+                            checks=(rep or {}).get("checks"))
+            source = rep["accounts"]["app"]
+            step("prepare", True, move_id=ctx["move_id"])
+            out.say(ru.PREPARE_OK % ctx["move_dir"])
+
+            # 3. real write probe
+            out.say(ru.PROBE_START)
+            ident = read_identity(paths)
+            pair = st.live_pair(paths, account=ident["app"]["value"] if args.active_pair else None,
+                                override=args.active_pair)
+            target_dir = st.pair_dir(paths, pair[0], pair[1]) if pair else None
+            if not target_dir:
+                step("write_probe", False, status="no_dir")
+                return stop(EXIT_FAIL, "probe_failed", ru.PROBE_NO_DIR)
+            with write_lock(paths):
+                status, detail = probe_write(target_dir, os.path.realpath(paths.support))
+            step("write_probe", status == "ok", status=status, detail=detail)
+            if status == "outside":
+                return stop(EXIT_FAIL, "probe_failed", ru.PROBE_OUTSIDE % detail)
+            if status != "ok":
+                return stop(EXIT_FAIL, "probe_failed", ru.PROBE_FAIL % detail)
+            out.say(ru.PROBE_OK)
+
+            # 4. stamp
+            if args.no_stamp:
+                out.say(ru.STAMP_SKIPPED)
+                step("stamp", True, skipped=True)
+            else:
+                out.say(ru.STAMP_START)
+                code, srep = run_step(cli.cmd_stamp, _ns(args, apply=True, undo=None))
+                ctx["stamp"] = srep
+                ctx["stamp_journal"] = (srep or {}).get("journal")
+                if code != EXIT_OK:
+                    step("stamp", False, exit_code=code)
+                    ctx["problem"] = ru.PROBLEM_STEP
+                    why = (srep or {}).get("reason") or (srep or {}).get("verdict")
+                    return stop(code, "stamp_failed",
+                                ru.STAMP_FAIL % (code, why, ctx["stamp_journal"] or ru.NONE_WORD),
+                                show_summary=True)
+                step("stamp", True, journal=ctx["stamp_journal"])
+                out.say(ru.STAMP_OK % ((srep.get("result") or {}).get("written", 0),
+                                       ctx["stamp_journal"]))
 
         # 5. wait for the new login
         out.say(ru.LOGIN_START)
@@ -413,7 +460,13 @@ def cmd_auto(args, cli):
             hard_deadline = deadline + CLI_SETTLE_MIN_S
             for cmd in LOGIN_COMMANDS:
                 out.say(ru.LOGIN_CLI)
-                rc = run_cli_login(cmd)
+                # Bounded by what is left of the login budget; never below a floor,
+                # so a spent budget still gives the command a short bounded try.
+                budget = max(CLI_LOGIN_FLOOR_S, hard_deadline - time.monotonic())
+                rc = run_cli_login(cmd, timeout=budget)
+                if rc == CLI_LOGIN_TIMEOUT:
+                    reason = "cli_login_timeout"
+                    break
                 if rc is None:
                     out.say(ru.LOGIN_NO_CLAUDE)
                     continue
