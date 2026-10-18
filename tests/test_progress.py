@@ -185,6 +185,62 @@ class ProgressTest(unittest.TestCase):
                   or line.startswith("[") and "step " in line)
             self.assertTrue(ok, repr(line))
 
+    def _frames(self, cols):
+        import re
+        from unittest import mock
+        buf = FakeTty()
+        with mock.patch.object(prog.shutil, "get_terminal_size",
+                               return_value=os.terminal_size((cols, 24))):
+            pg = prog.Progress(out_with(buf), 6, tick=0.01)
+            pg.step("scanning storage of the long named account")
+            time.sleep(0.1)
+            pg.wait("waiting for login", 725, 900)
+            time.sleep(0.1)
+            pg.close()
+        return re.findall(r"\r(.*?)\x1b\[K", buf.getvalue())
+
+    def test_tty_frames_fit_the_width(self):
+        for cols in (50, 40, 20):
+            frames = self._frames(cols)
+            self.assertGreater(len(frames), 5)
+            for f in frames:
+                self.assertLessEqual(len(f), cols - 1, (cols, f))
+
+    def test_wide_terminal_keeps_full_text(self):
+        frames = self._frames(120)
+        self.assertTrue(any("scanning storage of the long named account" in f
+                            for f in frames))
+        self.assertTrue(any("limit 900s" in f for f in frames))
+        self.assertIn("[########################]", prog.fit(100, "h", "t", 1, "", 120))
+
+    def test_width_is_measured_on_the_written_stream(self):
+        import re
+        from unittest import mock
+
+        class Sized(FakeTty):
+            def fileno(self):
+                return 99
+
+        buf = Sized()
+        with mock.patch.object(prog.os, "get_terminal_size",
+                               return_value=os.terminal_size((50, 24))), \
+                mock.patch.object(prog.shutil, "get_terminal_size",
+                                  return_value=os.terminal_size((80, 24))):
+            pg = prog.Progress(out_with(buf), 6, tick=0.01)
+            pg.step("scanning storage of the long named account")
+            time.sleep(0.1)
+            pg.close()
+        frames = re.findall(r"\r(.*?)\x1b\[K", buf.getvalue())
+        self.assertGreater(len(frames), 3)
+        self.assertTrue(all(len(f) <= 49 for f in frames))
+        self.assertTrue(any(len(f) > 40 for f in frames))   # not the 20-col case
+
+    def test_tiny_widths_never_overflow(self):
+        for w, cap in ((0, 0), (1, 0), (2, 1)):
+            f = prog.fit(50, "step 2/8", "scanning", 7, "|", w)
+            self.assertLessEqual(len(f), cap, (w, f))
+        self.assertEqual(prog.fit(50, "step 2/8", "scanning", 7, "|", 1), "")
+
 
 if __name__ == "__main__":
     unittest.main()
