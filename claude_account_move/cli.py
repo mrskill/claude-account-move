@@ -219,14 +219,14 @@ def _cmd_prepare(args, out):
     deadline = t_wait + max(0.0, args.wait_sync)
     while True:
         pg.step("scanning storage")
-        index = st.scan(paths)
+        index = st.scan(paths, pg.update)
         if not index.any_pairs():
             pg.close()
             return fail(args, out, "prepare", started, EXIT_NO_STORE, "no_store",
                         "no account/organization pair found under %s"
                         % paths.support)
         pg.step("reading transcripts")
-        tmap = st.transcripts(paths)
+        tmap = st.transcripts(paths, pg.update)
         pg.step("reading accounts")
         identity = read_identity(paths)
         pg.step("building the snapshot")
@@ -389,14 +389,14 @@ def _cmd_finish(args, out):
     while True:
         pg.n = 2
         pg.step("scanning storage")
-        index = st.scan(paths)
+        index = st.scan(paths, pg.update)
         if not index.any_pairs():
             pg.close()
             return fail(args, out, "finish", started, EXIT_NO_STORE, "no_store",
                         "no account/organization pair found under %s"
                         % paths.support, move_id=move_id)
         pg.step("reading transcripts")
-        tmap = st.transcripts(paths)
+        tmap = st.transcripts(paths, pg.update)
         pg.step("comparing with the snapshot")
         alive = bool(args.heartbeat) and pre.check_sync_agent(
             args.heartbeat, args.sync_max_age_min)[0]

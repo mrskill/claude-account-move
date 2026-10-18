@@ -188,7 +188,7 @@ def read_tasks_file(path):
     return out
 
 
-def _read_dir(real, obs):
+def _read_dir(real, obs, tick=None):
     info = {"cards": {}, "tombs": set(), "tasks": False, "task_map": {},
             "task_problems": []}
     try:
@@ -199,6 +199,8 @@ def _read_dir(real, obs):
     for n in names:
         p = os.path.join(real, n)
         if n.startswith(CARD_PREFIX) and n.endswith(".json"):
+            if tick:
+                tick()
             try:
                 info["cards"][n] = read_card(p)
             except Exception:
@@ -217,9 +219,88 @@ def _read_dir(real, obs):
     return info
 
 
-def scan(paths):
+def _candidate_dirs(base, base_real, obs=None):
+    """Yield (acc, org, path, real, kind) for each org dir of one store.
+
+    The single walk shared by scan() and _count_cards(), so the two cannot
+    diverge. obs, when given, records errors and exclusions; OSError is
+    handled per listing, never around the whole walk.
+    """
+    try:
+        accs = sorted(os.listdir(base))
+    except OSError as exc:
+        if obs is not None:
+            obs.errors.append("listdir %s: %s" % (base, exc))
+        return
+    for acc in accs:
+        if not UUID_RE.match(acc):
+            continue
+        pa = os.path.join(base, acc)
+        if os.path.islink(pa) and not os.path.exists(pa):
+            if obs is not None:
+                obs.excluded_dangling += 1
+            continue
+        if not os.path.isdir(pa):
+            continue
+        try:
+            orgs = sorted(os.listdir(pa))
+        except OSError as exc:
+            if obs is not None:
+                obs.errors.append("listdir %s: %s" % (pa, exc))
+            continue
+        for org in orgs:
+            if not UUID_RE.match(org):
+                continue
+            po = os.path.join(pa, org)
+            if os.path.islink(po) and not os.path.exists(po):
+                if obs is not None:
+                    obs.excluded_dangling += 1
+                continue
+            if not os.path.isdir(po):
+                continue
+            real = os.path.realpath(po)
+            if not inside(real, base_real):
+                if obs is not None:
+                    obs.excluded_outside += 1
+                continue
+            kind = "link" if (os.path.islink(po) or os.path.islink(pa)) \
+                else "dir"
+            yield acc, org, po, real, kind
+
+
+def _count_cards(paths):
+    """Cheap pre-count of card files for the progress bar (listdir only)."""
+    total = 0
+    support_real = os.path.realpath(paths.support)
+    for store in STORES:
+        base = os.path.join(paths.support, store)
+        base_real = os.path.realpath(base)
+        if not os.path.isdir(base) or not inside(base_real, support_real):
+            continue
+        seen = set()
+        for _acc, _org, _po, real, _kind in _candidate_dirs(base, base_real):
+            if real in seen:
+                continue
+            seen.add(real)
+            try:
+                total += sum(1 for n in os.listdir(real)
+                             if n.startswith(CARD_PREFIX) and n.endswith(".json"))
+            except OSError:
+                continue
+    return total
+
+
+def scan(paths, progress=None):
+    """progress(done, total): optional, counts the card files read."""
     idx = Index()
     obs = idx.obs
+    tick = None
+    if progress:
+        total, state = _count_cards(paths), [0]
+
+        def tick():
+            state[0] += 1
+            progress(state[0], max(total, state[0]))
     for store in STORES:
         base = os.path.join(paths.support, store)
         s = StoreInfo(store, base)
@@ -232,58 +313,28 @@ def scan(paths):
             obs.errors.append("store root resolves outside the support folder: "
                               "%s -> %s" % (base, base_real))
             continue
-        try:
-            accs = sorted(os.listdir(base))
-        except OSError as exc:
-            obs.errors.append("listdir %s: %s" % (base, exc))
-            continue
-        for acc in accs:
-            if not UUID_RE.match(acc):
-                continue
-            pa = os.path.join(base, acc)
-            if os.path.islink(pa) and not os.path.exists(pa):
-                obs.excluded_dangling += 1
-                continue
-            if not os.path.isdir(pa):
-                continue
-            try:
-                orgs = sorted(os.listdir(pa))
-            except OSError as exc:
-                obs.errors.append("listdir %s: %s" % (pa, exc))
-                continue
-            for org in orgs:
-                if not UUID_RE.match(org):
-                    continue
-                po = os.path.join(pa, org)
-                if os.path.islink(po) and not os.path.exists(po):
-                    obs.excluded_dangling += 1
-                    continue
-                if not os.path.isdir(po):
-                    continue
-                real = os.path.realpath(po)
-                if not inside(real, base_real):
-                    obs.excluded_outside += 1
-                    continue
-                kind = "link" if (os.path.islink(po) or os.path.islink(pa)) \
-                    else "dir"
-                s.aliases.append({"acc": acc.lower(), "org": org.lower(),
-                                  "kind": kind, "target": real})
-                if real not in s.dirs:
-                    s.dirs[real] = _read_dir(real, obs)
+        for acc, org, _po, real, kind in _candidate_dirs(base, base_real, obs):
+            s.aliases.append({"acc": acc.lower(), "org": org.lower(),
+                              "kind": kind, "target": real})
+            if real not in s.dirs:
+                s.dirs[real] = _read_dir(real, obs, tick)
     return idx
 
 
-def transcripts(paths):
-    """{session id (lower case): [transcript files]} from both known places."""
+def transcripts(paths, progress=None):
+    """{session id (lower case): [transcript files]} from both known places.
+    progress(done, total): optional, counts the files looked at."""
     out = {}
     pats = [os.path.join(paths.projects, "*", "*.jsonl"),
             os.path.join(paths.support, "*-sessions", "*", "*", "local_*",
                          ".claude", "projects", "*", "*.jsonl")]
-    for pat in pats:
-        for f in glob.glob(pat):
-            base = os.path.basename(f)
-            if TRANSCRIPT_RE.match(base):
-                out.setdefault(base[:-6], []).append(f)
+    found = [f for pat in pats for f in glob.glob(pat)]
+    for i, f in enumerate(found, 1):
+        if progress and (i % 50 == 0 or i == len(found)):
+            progress(i, len(found))
+        base = os.path.basename(f)
+        if TRANSCRIPT_RE.match(base):
+            out.setdefault(base[:-6], []).append(f)
     return out
 
 
