@@ -149,7 +149,18 @@ def evaluate(paths, before, index, tmap, identity, target, source,
         t_set = set(t_dirs)
         lag_wait = ({r: m for r, m in lag_eff.items() if r in t_set}
                     if sync_alive and not missing_anywhere else {})
-        lag_loss = {r: m for r, m in lag_eff.items() if r not in lag_wait}
+        # A NON-target directory that lacks names is normal: the app writes
+        # new sessions only into the active pair. Not loss when the target
+        # directories together hold every name of the union and nothing
+        # recorded is gone; reported as a note instead.
+        lag_noted = {}
+        if t_names is not None and not missing_in_target \
+                and not missing_anywhere and union <= t_names:
+            lag_noted = {r: m for r, m in lag_eff.items()
+                         if r not in t_set and r not in lag_wait}
+        lag_loss = {r: m for r, m in lag_eff.items()
+                    if r not in lag_wait and r not in lag_noted}
+        lag_noted_names = len({n for m in lag_noted.values() for n in m})
         empty_cid_target = 0
         for r in t_dirs:
             for n, c in s.dirs[r]["cards"].items():
@@ -159,7 +170,7 @@ def evaluate(paths, before, index, tmap, identity, target, source,
                     if sid in tmap or any(i in tmap for i in other):
                         empty_cid_target += 1
 
-        wrong_cid, regressed = [], []
+        wrong_cid, regressed, regressed_ok = [], [], []
         for n, rec in (exp.get("cards") or {}).items():
             # Every target copy must keep the recorded binding, not only the
             # best one: a second target folder with a wrong id still opens the
@@ -175,7 +186,16 @@ def evaluate(paths, before, index, tmap, identity, target, source,
             tc = max((c for _, c in copies),
                      key=lambda c: (1 if c["cid"] else 0, c["act"], c["turns"]))
             if tc["act"] < rec.get("act", 0) or tc["turns"] < rec.get("turns", 0):
-                regressed.append(n)
+                # Recoverable: another copy anywhere in the store is as fresh
+                # as recorded and bound to the recorded session.
+                if want and any(
+                        c["cid"].lower() == want
+                        and c["act"] >= rec.get("act", 0)
+                        and c["turns"] >= rec.get("turns", 0)
+                        for _, c in s.copies_of(n)):
+                    regressed_ok.append(n)
+                else:
+                    regressed.append(n)
 
         st_report = {
             "dirs": len(s.dirs), "physical_dirs": sorted(s.rel(r) for r in s.dirs),
@@ -194,6 +214,9 @@ def evaluate(paths, before, index, tmap, identity, target, source,
             "target_copy_empty_cid": empty_cid_target,
             "target_copy_wrong_cid": len(wrong_cid),
             "target_copy_regressed": len(regressed),
+            "target_copy_stale_recoverable": len(regressed_ok),
+            "lagging_other_dirs_noted": len(lag_noted),
+            "lagging_other_names_missing": lag_noted_names,
             "dead_cards": len(dead), "id_without_transcript": len(no_tr),
             "tombstone_missing_in_union": len(tomb_missing),
         }
@@ -215,6 +238,15 @@ def evaluate(paths, before, index, tmap, identity, target, source,
         if v != EXIT_OK or missing_anywhere or aliases_lost or tomb_missing \
                 or empty_cid_target or wrong_cid:
             lost = True
+        if regressed_ok:
+            notes.append("%s: %d target copies are older than recorded, but a "
+                         "fresh copy of each exists in another directory "
+                         "(not loss)" % (name, len(regressed_ok)))
+        if lag_noted:
+            notes.append("%s: %d other directories lack %d names that the "
+                         "target pair holds (the app writes new sessions only "
+                         "into the active pair; not loss)"
+                         % (name, len(lag_noted), lag_noted_names))
         if regressed:
             _check(checks, "%s:target_fresh" % name, False,
                    "%d target copies are older than recorded (stale copy): %s"
