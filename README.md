@@ -1,6 +1,6 @@
 # claude-account-move
 
-Version 0.1.2. Move Claude Code (the desktop app for Mac and the CLI) from one
+Version 0.1.3. Move Claude Code (the desktop app for Mac and the CLI) from one
 Claude account to another without losing your sessions, and prove afterwards
 that nothing was lost.
 
@@ -20,6 +20,7 @@ Russian version: [README.ru.md](README.ru.md)
 | `finish` | after you signed in to the app and ran `claude /login` | Waits until the CLI account equals the app account, then compares the storage with the snapshot of THIS move and prints a verdict. |
 | `sync` | optional repair | Copies session cards that are missing in the new account's folder. Dry run by default (it prints the files). `sync --apply` adds files and `sync --undo` removes exactly the files a journal proves were added. |
 | `stamp` | optional, see below | Puts the date and time of the last real message into the title of every session. Dry run by default (it lists "was -> will be"). `stamp --apply` writes, `stamp --undo` restores the cards byte for byte. |
+| `auto` | the whole move in one run | Quit-the-app wait, `prepare`, a write probe, `stamp --apply`, waits for the new login, `finish`, `sync --apply` only when needed, a plain-Russian summary. See "One-click move (auto)". |
 
 `sync --apply`, `sync --undo`, `stamp --apply` and `stamp --undo` are the only
 operations that write into the Claude storage.
@@ -60,7 +61,7 @@ is a failure, never a pass.
   logs or transmits anything else from them.
 - `prepare`, `finish` and the checks change nothing in the Claude storage or in
   your settings. Everything they write goes to the state directory (see below).
-  They do not even write a probe file into the storage. The only commands that
+  They do not even write a probe file into the storage (only `auto` does, one small file that it reads back and deletes at once). The only commands that
   touch the storage are `sync --apply` (adds card files), `sync --undo` (deletes
   the files that a journal proves `--apply` added), `stamp --apply` (rewrites the
   `title` field of cards) and `stamp --undo` (puts the old bytes back). The last
@@ -83,13 +84,55 @@ is a failure, never a pass.
 ```sh
 git clone https://github.com/mrskill/claude-account-move.git
 cd claude-account-move
-./claude-account-move --version      # claude-account-move 0.1.2
+./claude-account-move --version      # claude-account-move 0.1.3
 ```
 
 Or download a release archive, unpack it and run `./claude-account-move` from
 the unpacked directory. To call it from anywhere, link it into a directory on
 your `PATH`: `ln -s "$PWD/claude-account-move" /usr/local/bin/claude-account-move`.
 The entry script resolves the link, so the package next to it is found.
+
+## One-click move (auto)
+
+For an owner who does not use a terminal. One file, `Claude Move.command` in the
+repository folder. You can put an alias (or a symlink) to it on the Desktop: it
+finds its own folder. The state directory is
+`~/MEGAsync/Private/Work/claude-account-move-state` (the owner's default, kept
+in the launcher) unless the
+`CLAUDE_ACCOUNT_MOVE_HOME` variable names another one.
+
+1. Sign out of Claude in the app and quit it completely (Cmd+Q). If you forget,
+   the program asks you to quit and waits (up to 10 minutes, `--wait-close`).
+2. Double-click `Claude Move.command`. A Terminal window opens. Do not type anything.
+3. The program checks that everything is ready and takes the "before" snapshot.
+   If something is not ready it says so in plain Russian and stops; nothing is changed.
+4. It writes and deletes a small probe file in the folder the app writes
+   sessions into, then puts the last-message date into the session titles
+   (journal kept; `--no-stamp` skips this).
+5. When it says so, open Claude and sign in with the NEW account, then come back to
+   the window. If the terminal Claude still names the old account, the program
+   starts the CLI sign-in in the same window (`claude auth login`, then
+   `claude /login` as a fallback); choose the same new account.
+6. The program compares everything with the snapshot. If only cards missing in
+   the new account's folder are wrong, it adds them (`sync --apply`, adds only)
+   and compares once more.
+7. It prints a summary with numbers and denominators, where the snapshot and the
+   journals are, the exact undo commands, and one verdict line in Russian, either
+   "everything is in place" or "there is a problem: ...". Then press Enter to
+   close the window. If sync
+   added cards, restart the Claude app once.
+
+From a terminal: `./claude-account-move auto [--state-dir DIR] [--home DIR]
+[--json] [--no-stamp] [--wait-login SECONDS] [--wait-close SECONDS]
+[--allow-same-account] [--active-pair ACCOUNT/ORG] [--pause]`. It stops at the first
+failure with a non-zero exit code: `3` for a failed step or a check that is not
+green, `6` when the login did not complete in time, `2` for input errors, `4`
+when the storage is missing. It writes only into the state directory, plus what
+`stamp --apply` and `sync --apply` write and the probe file, which is removed
+at once (its name, `.claude-account-move-write-probe`, is not a session card).
+The probe runs in the folder of the pair the app writes into now (the old
+account's), because the new account's folder may not exist before its first
+sign-in.
 
 ## A move, step by step
 
@@ -309,7 +352,7 @@ prevent that too.)
 - The active folder is taken from the last mention in the app log
   (`~/Library/Logs/Claude/main.log`), because the organization is not always the
   one in `~/.claude.json`. If the log is missing, pass `--active-pair`.
-- Permissions are checked by permission bits; writing is not attempted, so a
+- Permissions are checked by permission bits; only `auto` tries a write (the probe file), so a
   read-only mount that still reports write permission is not detected.
 - The storage layout was derived from observation of the desktop app, not from
   documentation. Newer app versions may move things.

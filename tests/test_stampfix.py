@@ -323,15 +323,19 @@ class ObservationsAfterPlanning(Base):
         with open(ok) as fh:
             self.assertEqual(json.load(fh)["title"], "Fine")      # nothing written
 
-    def test_conflicting_session_ids_behind_one_name_are_refused(self):
+    def test_same_name_in_two_accounts_uses_each_documents_session_id(self):
         a = self.card(11, "Shared")
+        self.h.transcript(uid(11), last_ms=1_700_000_000_000)
         other = self.h.pair(CC, uid(5), uid(6))
-        self.h.card(other, 11, uid(99), title="Shared")          # same name, other session
+        name = self.h.card(other, 11, uid(99), title="Shared")
+        b = os.path.join(other, name)
         self.h.transcript(uid(99), last_ms=1_900_000_000_000)
-        before = self.read(a)
         r = self.h.run("stamp", "--apply", "--json")
-        self.assertEqual(r.returncode, 3, r.stdout)
-        self.assertEqual(self.read(a), before)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        first, second = json.loads(self.read(a)), json.loads(self.read(b))
+        self.assertEqual(first["cliSessionId"], uid(11))
+        self.assertEqual(second["cliSessionId"], uid(99))
+        self.assertNotEqual(first["title"], second["title"])
 
     def test_card_that_becomes_unreadable_while_planning_is_reported(self):
         p = self.card(11, "x")
