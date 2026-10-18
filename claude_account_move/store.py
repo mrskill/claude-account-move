@@ -106,6 +106,53 @@ def read_card(path):
             "title": title if isinstance(title, str) else ""}
 
 
+# Timestamp fields the app validates as numbers (a digit string makes it reject
+# the WHOLE file). Measured 16.10.2026: createdAt "1787838292655" -> ZodError.
+TASK_INT_FIELDS = ("createdAt",)
+
+
+def task_type_issues(entry):
+    """[(field, expected)] for fields of a task entry with the wrong type.
+
+    The ONE validator: `finish` reports its result, `sync` coerces what it can.
+    """
+    out = []
+    for f in TASK_INT_FIELDS:
+        if f in entry and (isinstance(entry[f], bool)
+                           or not isinstance(entry[f], (int, float))):
+            out.append((f, "a number"))
+    if "enabled" in entry and not isinstance(entry["enabled"], bool):
+        out.append(("enabled", "a boolean"))
+    return out
+
+
+def coerce_task(entry):
+    """Digit strings in number fields become int. True if anything changed."""
+    changed = False
+    for f, expected in task_type_issues(entry):
+        v = entry.get(f)
+        if expected == "a number" and isinstance(v, str) and v.isdigit():
+            entry[f] = int(v)
+            changed = True
+    return changed
+
+
+def task_problems(path):
+    """["<id>: <field> is <type>, expected ...", ...] for wrongly typed fields.
+
+    Tolerant: an unreadable or differently shaped file gives [] here because
+    read_tasks_file reports that case.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            tasks = json.load(fh)["scheduledTasks"]
+        return ["%s: %s is %s, expected %s"
+                % (t.get("id"), f, type(t[f]).__name__, expected)
+                for t in tasks for f, expected in task_type_issues(t)]
+    except Exception:
+        return []
+
+
 def read_tasks_file(path):
     """{task id: {"enabled", "approved"}}; raises when the file is damaged.
 
@@ -142,7 +189,8 @@ def read_tasks_file(path):
 
 
 def _read_dir(real, obs):
-    info = {"cards": {}, "tombs": set(), "tasks": False, "task_map": {}}
+    info = {"cards": {}, "tombs": set(), "tasks": False, "task_map": {},
+            "task_problems": []}
     try:
         names = sorted(os.listdir(real))
     except OSError as exc:
@@ -161,6 +209,7 @@ def _read_dir(real, obs):
             info["tombs"].add(n[len(TOMB_PREFIX):])
         elif n == "scheduled-tasks.json":
             info["tasks"] = True
+            info["task_problems"] = task_problems(p)
             try:
                 info["task_map"] = read_tasks_file(p)
             except Exception:

@@ -34,13 +34,17 @@ def target_dirs(index, store_name, account, active_dir=None):
 
 
 def compare_tasks(before, index, account, active_dir):
-    """Scheduled tasks recorded before that are absent in the target directories."""
+    """Scheduled tasks recorded before that are absent in the target directories,
+    plus entries there whose field types the app would reject."""
     missing, total = [], 0
     for name in STORES:
+        s = index.stores[name]
+        for real in target_dirs(index, name, account, active_dir):
+            for prob in s.dirs[real].get("task_problems", []):
+                missing.append("%s:%s" % (name, prob))
         want = ((before.get("stores") or {}).get(name) or {}).get("tasks") or {}
         if not want:
             continue
-        s = index.stores[name]
         have = {}
         for real in target_dirs(index, name, account, active_dir):
             have.update(s.dirs[real]["task_map"])

@@ -342,6 +342,10 @@ def cmd_sync(args):
     if args.active_pair:
         st.parse_override(args.active_pair)      # PairError -> exit 2, before any storage check
     if args.undo:
+        if common.claude_app_running():
+            return fail(args, out, "sync", started, EXIT_FAIL, "app_running",
+                        "Quit the Claude app first (Cmd+Q), then run this command "
+                        "again: undo rewrites files the app keeps open.")
         try:
             with write_lock(paths):
                 res = sync_cards.undo(args.undo, snap.path_id(paths.home),
@@ -353,6 +357,8 @@ def cmd_sync(args):
                 "%(ambiguous)d (same name, not proven to be ours: kept), invalid "
                 "%(invalid)d (outside this operation's targets); journal "
                 "status: %(status)s" % res)
+        out.say("scheduled-tasks files restored: %(tasks_restored)d, created "
+                "files removed: %(tasks_removed)d" % res)
         code = EXIT_OK if (res["status"] == "ok" and not res["ambiguous"]
                            and not res["invalid"]) else EXIT_FAIL
         emit(args, out, _report("sync", code, "undo", started, undo=res,
@@ -395,6 +401,26 @@ def cmd_sync(args):
                         "pass --active-pair): not reporting success" % store_name)
     plan, conflicts = sync_cards.plan_sync(index, target, active, pair)
     out.say("cards missing in the target pair(s): %d" % len(plan))
+    sids, source_acc = {}, None
+    before, _man, _mid, problem = snap.load_baseline(paths, None, True, 24 * 365)
+    if problem:
+        out.say("no usable snapshot (%s): scheduled tasks are not migrated" % problem)
+    else:
+        source_acc = (before.get("identity") or {}).get("app_account")
+        sids = {n: set((((before.get("stores") or {}).get(n) or {}).get("tasks")
+                        or {}).keys()) for n in st.STORES}
+    try:
+        tplan = sync_cards.plan_tasks(index, target, active, sids, source_acc,
+                                      pair, plan)
+    except (OSError, ValueError) as exc:
+        return fail(args, out, "sync", started, EXIT_FAIL, "incomplete_observation",
+                    "scheduled-tasks.json could not be planned: %s" % exc)
+    out.say("scheduled tasks missing in the target: %d (files to write: %d)"
+            % (sum(len(i["add"]) for i in tplan), len(tplan)))
+    for i in tplan:
+        out.say("  would merge %d task(s), fix %d type(s) in %s"
+                % (len(i["add"]), i["coerce"],
+                   os.path.join(i["dst_dir"], sync_cards.TASKS_NAME)))
     for item in plan[:50]:
         out.say("  would copy %s -> %s" % (item["name"], item["dst_dir"]))
     if len(plan) > 50:
@@ -403,22 +429,30 @@ def cmd_sync(args):
         out.say("  conflict, not copied: %s %s has session ids %s"
                 % (c["store"], c["name"], ", ".join(c["session_ids"])))
     base = dict(planned=len(plan), conflicts=conflicts, dry_run=not args.apply,
-                write_verified=False)
+                write_verified=False,
+                tasks_planned=sum(len(i["add"]) for i in tplan))
     if not args.apply:
         out.say("dry run: nothing written. Add --apply to copy.")
         code = EXIT_FAIL if conflicts else EXIT_OK
         emit(args, out, _report("sync", code, "dry_run", started, **base))
         return code
+    if tplan and common.claude_app_running():
+        return fail(args, out, "sync", started, EXIT_FAIL, "app_running",
+                    "Quit the Claude app first (Cmd+Q), then run this command "
+                    "again: the app rewrites scheduled-tasks.json while it runs.")
     try:
         with write_lock(paths):
             jdir = safe_subdir(paths)
             journal = sync_cards.new_journal_path(jdir)
-            copied, failed = sync_cards.apply_plan(plan, journal,
-                                                   snap.path_id(paths.home))
+            copied, failed, tw, tf = sync_cards.apply_all(
+                plan, tplan, journal, snap.path_id(paths.home))
+            failed += tf
     except OSError as exc:
         return fail(args, out, "sync", started, EXIT_INTERNAL, "internal_error",
                     "cannot write the journal or copy: %s" % exc)
     out.say("copied %d, failed %d; journal: %s" % (copied, failed, journal))
+    out.say("scheduled-tasks files written: %d (old file kept as "
+            "scheduled-tasks.json.bak-move-*; `sync --undo` restores it)" % tw)
     out.say("Restart the Claude app so the panel re-reads the cards "
             "(this ends running sessions: save your work first).")
     code = EXIT_FAIL if (failed or conflicts) else EXIT_OK
