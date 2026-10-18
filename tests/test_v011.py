@@ -161,10 +161,15 @@ class C2TargetBinding(Base):
         self.assertEqual(parse(r)["stores"][CC]["target_copy_wrong_cid"], 1)
 
     def test_stale_target_copy_fails_or_waits(self):
-        _, target = self.moved()
+        # Changed for CAM-FINISH-NOTLOSS: a stale target copy is a failure only
+        # when no other copy is as fresh as recorded, so the source copy is
+        # made stale too (the recoverable case lives in test_finish_notloss).
+        src, target = self.moved()
         path = os.path.join(target, "local_%s.json" % uid(11, 9))
         os.unlink(path)
         self.h.card(target, 11, uid(11), act=1, turns=0)
+        os.unlink(os.path.join(src, "local_%s.json" % uid(11, 9)))
+        self.h.card(src, 11, uid(11), act=1, turns=0)
         r = self.finish()
         self.assertEqual(r.returncode, 3)
         self.assertEqual(parse(r)["stores"][CC]["target_copy_regressed"], 1)
