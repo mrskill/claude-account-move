@@ -22,6 +22,7 @@ from . import pre_move_check as pre
 from . import store as st
 from . import common
 from . import post_move_verify as verify
+from . import progress as prog
 from . import stamp_titles
 from . import sync_cards
 from .common import (EXIT_FAIL, EXIT_INPUT, EXIT_INTERNAL, EXIT_LOGIN_TIMEOUT,
@@ -45,6 +46,7 @@ class Out(object):
 
     def __init__(self, as_json, quiet=False):
         self.stream = None if quiet else (sys.stderr if as_json else sys.stdout)
+        self.progress = None
 
     @classmethod
     def of(cls, args):
@@ -52,8 +54,15 @@ class Out(object):
         return cls(args.json, getattr(args, "quiet", False))
 
     def say(self, msg=""):
-        if self.stream is not None:
-            print(msg, file=self.stream)
+        pg = self.progress
+        if pg is None:
+            if self.stream is not None:
+                print(msg, file=self.stream)
+            return
+        with pg.lock:                  # no ticker line between end_line and print
+            pg.end_line()
+            if self.stream is not None:
+                print(msg, file=self.stream)
 
 
 def add_common(ap):
@@ -183,8 +192,16 @@ def print_checks(out, checks):
 
 
 def cmd_prepare(args):
-    started = time.monotonic()
     out = Out.of(args)
+    try:
+        return _cmd_prepare(args, out)
+    finally:                    # return, exception and Ctrl-C all end the bar line
+        if out.progress is not None:
+            out.progress.close()
+
+
+def _cmd_prepare(args, out):
+    started = time.monotonic()
     paths = make_paths(args)
     prob = state_dir_problem(paths)
     if prob:
@@ -195,33 +212,49 @@ def cmd_prepare(args):
     if not os.path.isdir(paths.support):
         return fail(args, out, "prepare", started, EXIT_NO_STORE, "no_store",
                     "storage not found: %s" % paths.support)
+    pg = prog.Progress(out, 8)
+    pg.step("state directory checked")
     poll = _poll(SYNC_POLL_S, "CLAUDE_ACCOUNT_MOVE_POLL_S")
-    deadline = time.monotonic() + max(0.0, args.wait_sync)
+    t_wait = time.monotonic()
+    deadline = t_wait + max(0.0, args.wait_sync)
     while True:
+        pg.step("scanning storage")
         index = st.scan(paths)
         if not index.any_pairs():
+            pg.close()
             return fail(args, out, "prepare", started, EXIT_NO_STORE, "no_store",
                         "no account/organization pair found under %s"
                         % paths.support)
+        pg.step("reading transcripts")
         tmap = st.transcripts(paths)
+        pg.step("reading accounts")
         identity = read_identity(paths)
+        pg.step("building the snapshot")
         before = snap.build_before(paths, index, tmap, identity)
+        pg.step("running checks")
         checks, active = pre.run_checks(paths, index, tmap, args.heartbeat,
                                         args.sync_max_age_min, args.active_pair,
                                         identity=identity)
         failed = [c["id"] for c in checks if not c["ok"]]
         if failed and set(failed) <= {"sync_agent"} and time.monotonic() < deadline:
             out.say("waiting for the sync job heartbeat ...")
+            pg.n = 1                       # the next pass starts at the scan
+            pg.wait("sync heartbeat", time.monotonic() - t_wait, args.wait_sync,
+                    plain=True)
             time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
             continue
         break
+    pg.step("writing the snapshot")
     ready = not failed
     try:
         move_id, mdir, copied = snap.write_snapshot(paths, before, ready, index,
                                                     args.full_copy)
     except OSError as exc:
+        pg.close()
         return fail(args, out, "prepare", started, EXIT_INTERNAL, "internal_error",
                     "cannot write the snapshot: %s" % exc)
+    pg.step("done")
+    pg.close()
     code = EXIT_OK if ready else EXIT_FAIL
     out.say("checks:")
     print_checks(out, checks)
@@ -262,7 +295,19 @@ def wait_for_login(paths, source, allow_same, limit_s, poll_s, out):
     """(identity, reason, waited seconds). reason None means success."""
     t0 = time.monotonic()
     deadline = t0 + max(0.0, limit_s)
+    own = out.progress is None
+    pg = out.progress or prog.Progress(out)
+    try:
+        return _wait_loop(paths, source, allow_same, limit_s, poll_s, out, pg,
+                          t0, deadline)
+    finally:
+        if own:
+            pg.close()
+
+
+def _wait_loop(paths, source, allow_same, limit_s, poll_s, out, pg, t0, deadline):
     last_say = -1
+    hinted = None
     while True:
         ident = read_identity(paths)
         reason = login_reason(ident, source, allow_same)
@@ -274,15 +319,29 @@ def wait_for_login(paths, source, allow_same, limit_s, poll_s, out):
         if time.monotonic() >= deadline:
             return ident, reason, time.monotonic() - t0
         tick = int((time.monotonic() - t0) // 30)
-        if tick != last_say:
+        said = False
+        if reason != hinted:
+            hinted = reason
+            out.say("waiting for login (%s): %s" % (reason, prog.HINTS[reason]))
+            last_say, said = tick, True
+        elif tick != last_say:
             out.say("waiting for login (%s) ..." % reason)
-            last_say = tick
+            last_say, said = tick, True
+        pg.wait("waiting for login", time.monotonic() - t0, limit_s, plain=said)
         time.sleep(min(poll_s, max(0.05, deadline - time.monotonic())))
 
 
 def cmd_finish(args):
-    started = time.monotonic()
     out = Out.of(args)
+    try:
+        return _cmd_finish(args, out)
+    finally:                    # return, exception and Ctrl-C all end the bar line
+        if out.progress is not None:
+            out.progress.close()
+
+
+def _cmd_finish(args, out):
+    started = time.monotonic()
     paths = make_paths(args)
     prob = state_dir_problem(paths)
     if prob:
@@ -294,13 +353,17 @@ def cmd_finish(args):
         return fail(args, out, "finish", started, EXIT_NO_STORE, "no_store",
                     "storage or account/organization pair not found under %s"
                     % paths.support)
+    pg = prog.Progress(out, 6)
+    pg.step("loading the snapshot")
     before, man, move_id, problem = snap.load_baseline(
         paths, args.move_id, args.allow_unready_baseline, args.max_age_hours)
     if problem:
+        pg.close()
         return fail(args, out, "finish", started, EXIT_NO_BASELINE, "no_baseline",
                     "no usable 'before' snapshot: %s" % problem, move_id=move_id)
     source = (before.get("identity") or {}).get("app_account")
     mdir = os.path.join(snap.moves_dir(paths), move_id)
+    pg.step("waiting for login")
     ident, reason, waited = wait_for_login(
         paths, source, args.allow_same_account, args.wait_login,
         _poll(LOGIN_POLL_S, "CLAUDE_ACCOUNT_MOVE_LOGIN_POLL_S"), out)
@@ -309,6 +372,7 @@ def cmd_finish(args):
     accounts = {"cli": ident["cli"]["value"], "app": ident["app"]["value"],
                 "target": ident["app"]["value"], "source_from_snapshot": source}
     if reason:
+        pg.close()
         out.say("login not complete after %.0f s: %s" % (waited, reason))
         out.say({"identity_invalid": "an account file is missing or unreadable",
                  "app_not_switched": "sign in to the app with the new account",
@@ -320,14 +384,20 @@ def cmd_finish(args):
         return EXIT_LOGIN_TIMEOUT
     target = accounts["target"]
     poll = _poll(SYNC_POLL_S, "CLAUDE_ACCOUNT_MOVE_POLL_S")
-    deadline = time.monotonic() + max(0.0, args.wait_sync)
+    t_wait = time.monotonic()
+    deadline = t_wait + max(0.0, args.wait_sync)
     while True:
+        pg.n = 2
+        pg.step("scanning storage")
         index = st.scan(paths)
         if not index.any_pairs():
+            pg.close()
             return fail(args, out, "finish", started, EXIT_NO_STORE, "no_store",
                         "no account/organization pair found under %s"
                         % paths.support, move_id=move_id)
+        pg.step("reading transcripts")
         tmap = st.transcripts(paths)
+        pg.step("comparing with the snapshot")
         alive = bool(args.heartbeat) and pre.check_sync_agent(
             args.heartbeat, args.sync_max_age_min)[0]
         report, code = post.evaluate(paths, before, index, tmap,
@@ -335,9 +405,13 @@ def cmd_finish(args):
                                      args.active_pair, args.allow_same_account)
         if code == EXIT_WAIT and time.monotonic() < deadline:
             out.say("waiting for the sync job to deliver ...")
+            pg.wait("sync delivery", time.monotonic() - t_wait, args.wait_sync,
+                    plain=True)
             time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
             continue
         break
+    pg.step("done")
+    pg.close()
     if args.allow_unready_baseline and code == EXIT_OK and not man.get("ready"):
         code = EXIT_FAIL
     out.say("checks:")
