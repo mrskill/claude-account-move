@@ -425,7 +425,8 @@ def cmd_auto(args, cli):
             pair_notes = []
             pair = st.live_pair(paths, account=ident["app"]["value"] if args.active_pair else None,
                                 override=args.active_pair, index=st.scan(paths),
-                                notes=pair_notes, auto_account=ident["app"]["value"])
+                                notes=pair_notes, auto_account=ident["app"]["value"],
+                                command="auto")
             for n in pair_notes:
                 out.say(n)
             target_dir = st.pair_dir(paths, pair[0], pair[1]) if pair else None

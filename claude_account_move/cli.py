@@ -484,7 +484,7 @@ def cmd_sync(args):
                     "the app account is not readable: nothing to sync to")
     pair_notes = []
     pair = st.live_pair(paths, account=target, override=args.active_pair,
-                        index=index, notes=pair_notes)
+                        index=index, notes=pair_notes, command="sync")
     for n in pair_notes:
         out.say(n)
     active = st.pair_dir(paths, pair[0], pair[1]) if pair else None

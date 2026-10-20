@@ -101,7 +101,7 @@ def evaluate(paths, before, index, tmap, identity, target, source,
 
     pair_notes = []
     pair = st.live_pair(paths, account=target, override=active_override,
-                        index=index, notes=pair_notes)
+                        index=index, notes=pair_notes, command="finish")
     active_dir = st.pair_dir(paths, pair[0], pair[1]) if pair else None
     cc = index.stores[STORES[0]]
     if active_dir and active_dir not in cc.dirs:
