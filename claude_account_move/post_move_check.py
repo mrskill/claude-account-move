@@ -99,14 +99,19 @@ def evaluate(paths, before, index, tmap, identity, target, source,
            "%d unreadable cards, %d errors" % (o.unreadable_cards, len(o.errors)))
     lost |= not o.complete()
 
-    pair = st.live_pair(paths, account=target, override=active_override)
+    pair_notes = []
+    pair = st.live_pair(paths, account=target, override=active_override,
+                        index=index, notes=pair_notes, command="finish")
     active_dir = st.pair_dir(paths, pair[0], pair[1]) if pair else None
     cc = index.stores[STORES[0]]
     if active_dir and active_dir not in cc.dirs:
         active_dir = None
     active_present = active_dir is not None
     if not active_present:
-        notes.append("the app log names no pair for the target account yet")
+        notes.append("the app log names no pair for the target account yet"
+                     + ("; " + " ".join(pair_notes) if pair_notes else ""))
+    elif pair_notes:
+        notes.append(pair_notes[0])
     report = {"stores": {}, "active_pair": {"present": active_present,
                                             "path": active_dir}}
 

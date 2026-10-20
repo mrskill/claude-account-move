@@ -84,17 +84,19 @@ def check_sync_agent(heartbeat, max_age_min=SYNC_MAX_AGE_MIN, now=None):
     return ok, "heartbeat %.1f min old (limit %.1f min)" % (age, max_age_min)
 
 
-def check_static_access(index, active_dir):
+def check_static_access(index, active_dir, pair_notes=None):
+    extra = " ".join(n for n in (pair_notes or []) if n)
     if not active_dir:
-        return False, ("active pair NOT MEASURED: the app log names no pair "
-                       "(use --active-pair ACCOUNT/ORG)")
+        return False, ("active pair NOT MEASURED: the app log names no pair%s "
+                       "(use --active-pair ACCOUNT/ORG)" % (": " + extra if extra else ""))
     s = index.stores[STORES[0]]
     if active_dir not in s.dirs:
         return False, "active pair is not a directory inside the store"
     if not os.access(active_dir, os.W_OK | os.X_OK):
         return False, "active pair is not writable by permission bits"
     return True, ("active pair exists, inside the store, writable by "
-                  "permission bits (write not attempted)")
+                  "permission bits (write not attempted)"
+                  + ("; " + extra if extra else ""))
 
 
 def check_cards_fresh(index, tmap, active_dir, now_ms=None):
@@ -210,8 +212,10 @@ def run_checks(paths, index, tmap, heartbeat=None, sync_max_age_min=SYNC_MAX_AGE
                active_override=None, now_ms=None, identity=None):
     """List of {"id","name","ok","detail"} plus the active directory used."""
     expected = identity["app"]["value"] if identity else None
+    pair_notes = []
     pair = st.live_pair(paths, account=expected if active_override else None,
-                        override=active_override)
+                        override=active_override, index=index, notes=pair_notes,
+                        auto_account=expected)
     active_dir = st.pair_dir(paths, pair[0], pair[1]) if pair else None
     stale, empty = check_stale_and_empty(index, tmap, active_dir)
     plan = [
@@ -222,7 +226,7 @@ def run_checks(paths, index, tmap, heartbeat=None, sync_max_age_min=SYNC_MAX_AGE
         ("sync_agent", "sync job heartbeat",
          check_sync_agent(heartbeat, sync_max_age_min)),
         ("static_accessibility", "active pair accessible",
-         check_static_access(index, active_dir)),
+         check_static_access(index, active_dir, pair_notes)),
         ("cards_fresh", "app keeps cards fresh",
          check_cards_fresh(index, tmap, active_dir, now_ms)),
         ("zombies", "no deleted-but-alive sessions", check_zombies(index)),

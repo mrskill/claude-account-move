@@ -482,7 +482,11 @@ def cmd_sync(args):
     if not target:
         return fail(args, out, "sync", started, EXIT_FAIL, "no_target",
                     "the app account is not readable: nothing to sync to")
-    pair = st.live_pair(paths, account=target, override=args.active_pair)
+    pair_notes = []
+    pair = st.live_pair(paths, account=target, override=args.active_pair,
+                        index=index, notes=pair_notes, command="sync")
+    for n in pair_notes:
+        out.say(n)
     active = st.pair_dir(paths, pair[0], pair[1]) if pair else None
     if active and active not in index.stores[st.STORES[0]].dirs:
         active = None

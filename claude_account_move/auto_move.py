@@ -422,8 +422,13 @@ def cmd_auto(args, cli):
             # 3. real write probe
             out.say(ru.PROBE_START)
             ident = read_identity(paths)
+            pair_notes = []
             pair = st.live_pair(paths, account=ident["app"]["value"] if args.active_pair else None,
-                                override=args.active_pair)
+                                override=args.active_pair, index=st.scan(paths),
+                                notes=pair_notes, auto_account=ident["app"]["value"],
+                                command="auto")
+            for n in pair_notes:
+                out.say(n)
             target_dir = st.pair_dir(paths, pair[0], pair[1]) if pair else None
             if not target_dir:
                 step("write_probe", False, status="no_dir")

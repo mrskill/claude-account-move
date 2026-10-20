@@ -12,6 +12,8 @@ recorded in `Index.obs` and never turned into silent zeros.
 import glob
 import json
 import os
+import time
+import sys
 import re
 
 from .common import (CARD_PREFIX, STORES, TOMB_PREFIX, TRANSCRIPT_RE, UUID_RE,
@@ -366,14 +368,72 @@ def parse_override(override):
     return parts[0], parts[1]
 
 
-def live_pair(paths, account=None, override=None):
-    """(acc, org) the app writes into, or None when it cannot be determined.
+AMBIGUOUS_WINDOW_MS = 60 * 1000
+FUTURE_SLACK_MS = 5 * 60 * 1000
 
-    The last mention in the app log wins. With `account`, only mentions of that
-    account count; the organization is never taken from the CLI config. An
-    explicit override must be well formed and, when an account is expected,
-    must belong to that account: a typo must not turn the old account into the
-    target.
+
+def tool_command(command, pair):
+    """One full ready-to-run line: absolute tool path, subcommand, the pair."""
+    exe = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else "claude-account-move"
+    return "%s %s --active-pair %s/%s" % (exe, command, pair[0], pair[1])
+
+
+def auto_pair(index, account, command="prepare", now_ms=None):
+    """PROPOSE (never confirm) the active pair when the app log names none.
+
+    Returns (proposal, note, candidates). The proposal is (acc, org) or None;
+    it is a guess and no caller may write to it or report success on it. Only
+    the app log or --active-pair confirm a pair. Cards dated more than 5 min in
+    the future are ignored. The proposal is refused when the two newest org
+    folders are within 60 s (inclusive) or when there are no usable cards.
+    """
+    if not account:
+        return None, "the app account is not readable, so no pair can be proposed", []
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    account = account.lower()
+    s = index.stores[STORES[0]]
+    best, future = {}, 0
+    for al in s.aliases:
+        if al["acc"] != account:
+            continue
+        d = s.dirs.get(al["target"]) or {"cards": {}}
+        acts = [c["act"] for c in d["cards"].values()]
+        ok = [x for x in acts if x <= now_ms + FUTURE_SLACK_MS]
+        future += len(acts) - len(ok)
+        key = (al["acc"], al["org"])
+        best[key] = max(best.get(key, 0), max(ok or [0]))
+    cands = sorted(((a, o, ms) for (a, o), ms in best.items()),
+                   key=lambda x: -x[2])
+    fut = (" (%d card(s) dated in the future were ignored)" % future) if future else ""
+    if not cands:
+        return None, "no organization folder of account %s was found" % account[:8], []
+    with_cards = [c for c in cands if c[2] > 0]
+    if not with_cards:
+        return None, ("organization folders of account %s hold no usable session "
+                      "cards%s, so none can be proposed" % (account[:8], fut)), cands
+    if len(with_cards) > 1 and with_cards[0][2] - with_cards[1][2] <= AMBIGUOUS_WINDOW_MS:
+        lines = " ; ".join(tool_command(command, (a, o)) for a, o, _ms in with_cards)
+        return None, ("two organization folders of account %s have cards within "
+                      "60 s of each other%s; not guessing. NOT ready. Run one of: %s"
+                      % (account[:8], fut, lines)), cands
+    a, o, _ms = with_cards[0]
+    return (a, o), ("NOT ready: the app log names no pair. Proposal only (not "
+                    "confirmed, may be a stale folder): %s/%s, the folder with the "
+                    "most recent session card%s. To confirm, run: %s"
+                    % (a[:8], o[:8], fut, tool_command(command, (a, o)))), cands
+
+
+def live_pair(paths, account=None, override=None, index=None, notes=None,
+              auto_account=None, command="prepare"):
+    """CONFIRMED (acc, org) the app writes into, or None.
+
+    Confirmed means: named by the app log (the last mention wins; with
+    `account`, only that account's mentions count) or given as an explicit
+    override, which must be well formed and, when an account is expected, must
+    belong to it. When neither exists, and `index` is given, a proposal from
+    auto_pair is described in plain words in `notes` (a list) but None is
+    returned: a guess never enables a write and never lets a move be reported
+    as successful.
     """
     if override:
         parts = parse_override(override)
@@ -383,6 +443,8 @@ def live_pair(paths, account=None, override=None):
         return parts
     hits = app_pairs(paths, account)
     if not hits:
+        if index is not None and notes is not None:
+            notes.append(auto_pair(index, account or auto_account, command)[1])
         return None
     return hits[-1]
 
