@@ -234,6 +234,17 @@ class ProgressTest(unittest.TestCase):
         self.assertTrue(all(len(f) <= 49 for f in frames))
         self.assertTrue(any(len(f) > 40 for f in frames))   # not the 20-col case
 
+    def test_label_whole_and_no_last_column(self):
+        for cols, whole in ((52, True), (40, True), (20, False), (80, True)):
+            f = prog.fit(38, "3/6", "scanning", 12, "|", cols)
+            self.assertLess(len(f), cols, (cols, f))
+            if whole:
+                self.assertIn("3/6 scanning", f, (cols, f))
+        self.assertIn("[", prog.fit(38, "3/6", "scanning", 12, "|", 52))
+        narrow = prog.fit(38, "3/6", "scanning", 12, "|", 20)
+        self.assertNotIn("[", narrow)
+        self.assertNotIn("%", narrow)
+
     def test_tiny_widths_never_overflow(self):
         for w, cap in ((0, 0), (1, 0), (2, 1)):
             f = prog.fit(50, "step 2/8", "scanning", 7, "|", w)

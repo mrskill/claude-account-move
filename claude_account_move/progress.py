@@ -36,29 +36,35 @@ def _bar(cells, pct, pos):
 def fit(pct, head, tail, elapsed, spin, width, pos=0):
     """One compact TTY frame, `[bar] 38% 2/8 name 12s |`, at most
     max(0, width-1) characters, spinner included.
-    Shrink order (intended): keep the step name, because it tells the reader
-    what is going on, and shrink the bar first, down to 10 cells; only then
-    cut the tail (step name or limit) short, then drop it, and last truncate
-    hard."""
+    Shrink order: the bar first (down to 4 cells), then no bar, then no
+    percent; the label (step number and name) stays whole while it fits, then
+    the clock goes, and only last is the label cut, never wrapping."""
     room = max(0, width - 1)
     if pct is not None:
         pct = max(0, min(100, int(pct)))
     shown = "--%" if pct is None else "%d%%" % pct
     sp = (" " + spin) if spin else ""
+    label = head + " " + tail if tail else head
+    clock = "%ds%s" % (int(elapsed), sp)
 
-    def build(cells, text):
-        return "[%s] %s %s %ds%s" % (_bar(cells, pct, pos), shown, text,
-                                     int(elapsed), sp)
-    for use_tail in (True, False):
-        for cells in range(WIDTH, 9, -1):
-            line = build(cells, head + " " + tail if (use_tail and tail) else head)
-            if len(line) <= room:
-                return line
-        if use_tail and tail:
-            avail = room - len(build(10, head + " "))
-            if avail >= 6:
-                return build(10, head + " " + tail[:avail])
-    return line[:room]
+    def build(cells, with_pct, text):
+        parts = []
+        if cells:
+            parts.append("[%s]" % _bar(cells, pct, pos))
+        if with_pct:
+            parts.append(shown)
+        parts.append(text)
+        parts.append(clock)
+        return " ".join(parts)
+    for cells, with_pct in [(c, True) for c in range(WIDTH, 3, -1)] + \
+            [(0, True), (0, False)]:
+        line = build(cells, with_pct, label)
+        if len(line) <= room:
+            return line
+    # label still too long: drop the clock, then cut the label, never wrap
+    if len(label) <= room:
+        return label
+    return label[:room]
 
 
 class Progress(object):
