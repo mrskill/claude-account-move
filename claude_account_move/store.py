@@ -366,14 +366,67 @@ def parse_override(override):
     return parts[0], parts[1]
 
 
-def live_pair(paths, account=None, override=None):
+AMBIGUOUS_WINDOW_MS = 60 * 1000
+
+
+def auto_pair(index, account):
+    """Choose the active pair from storage when the app log names none.
+
+    Returns (pair, note, candidates). pair is (acc, org) or None. note is one
+    plain sentence. candidates is [(acc, org, newest_card_ms)] for the account,
+    newest first. The choice is the org dir of the app account whose newest
+    session card is the most recent; it is refused (pair None) when the account
+    is unknown, has no cards, or the two newest org dirs are within 60 s.
+    """
+    if not account:
+        return None, "the app account is not readable, so no pair can be chosen", []
+    account = account.lower()
+    s = index.stores[STORES[0]]
+    best = {}
+    for al in s.aliases:
+        if al["acc"] != account:
+            continue
+        d = s.dirs.get(al["target"]) or {"cards": {}}
+        newest = max([c["act"] for c in d["cards"].values()] or [0])
+        key = (al["acc"], al["org"])
+        best[key] = max(best.get(key, 0), newest)
+    cands = sorted(((a, o, ms) for (a, o), ms in best.items()),
+                   key=lambda x: -x[2])
+    if not cands:
+        return None, "no organization folder of account %s was found" % account[:8], []
+    with_cards = [c for c in cands if c[2] > 0]
+    if not with_cards:
+        return None, ("organization folders of account %s hold no session "
+                      "cards, so none can be chosen" % account[:8]), cands
+    if len(with_cards) > 1 and with_cards[0][2] - with_cards[1][2] < AMBIGUOUS_WINDOW_MS:
+        return None, ("two organization folders of account %s have cards within "
+                      "60 s of each other; not guessing" % account[:8]), cands
+    a, o, ms = with_cards[0]
+    return (a, o), ("chose pair %s/%s: account matches the app account and this "
+                    "folder holds the most recent session card"
+                    % (a[:8], o[:8])), cands
+
+
+def candidates_line(cands):
+    """Plain list of candidates plus one ready-to-paste command line."""
+    if not cands:
+        return "no candidates"
+    shown = ", ".join("%s/%s" % (a[:8], o[:8]) for a, o, _ms in cands)
+    a, o, _ms = cands[0]
+    return "candidates: %s. Paste one: --active-pair %s/%s" % (shown, a, o)
+
+
+def live_pair(paths, account=None, override=None, index=None, notes=None,
+              auto_account=None):
     """(acc, org) the app writes into, or None when it cannot be determined.
 
     The last mention in the app log wins. With `account`, only mentions of that
     account count; the organization is never taken from the CLI config. An
     explicit override must be well formed and, when an account is expected,
     must belong to that account: a typo must not turn the old account into the
-    target.
+    target. When the log names no pair and `index` is given, the pair is chosen
+    from storage by auto_pair; the plain-words explanation is appended to
+    `notes` (a list) whether the choice was made or refused.
     """
     if override:
         parts = parse_override(override)
@@ -383,6 +436,11 @@ def live_pair(paths, account=None, override=None):
         return parts
     hits = app_pairs(paths, account)
     if not hits:
+        if index is not None:
+            pair, note, cands = auto_pair(index, account or auto_account)
+            if notes is not None:
+                notes.append(note if pair else "%s. %s" % (note, candidates_line(cands)))
+            return pair
         return None
     return hits[-1]
 
