@@ -76,12 +76,65 @@ def store_verdict(lagging, empty_live, dead, union_len, expect, *, missing,
     return EXIT_OK
 
 
+WRONG_ID_LINES_MAX = 20
+
+
+def _cid8(cid):
+    return (cid or "")[:8] or "(empty)"
+
+
+def rebound_to_live(copies, want, tmap, snapshot_ms):
+    """True when every target copy bound away from the recorded session points
+    to a session that has a transcript and was active after the snapshot.
+
+    The app rebinds a card to a new CLI session id when a session is resumed
+    after context compaction; such a card still opens a live session, so it is
+    a note and not loss. Uses only what is already read: the transcript index
+    and the card fields. snapshot_ms None (time unknown) never qualifies.
+    """
+    if snapshot_ms is None:
+        return False
+    diff = [c for _, c in copies if c["cid"].lower() != want]
+    if not diff:
+        return False
+    for c in diff:
+        new = c["cid"].lower()
+        if not new or new not in tmap:
+            return False
+        last = max((st.last_message_ms(f) or 0 for f in tmap[new]), default=0)
+        if max(last, c["act"]) <= snapshot_ms:
+            return False
+    return True
+
+
+def wrong_id_entry(name, want, copies, kind):
+    c = next(x for _, x in copies if x["cid"].lower() != want)
+    return {"card": name, "recorded": (want or ""), "now": c["cid"],
+            "title": c.get("title") or "", "kind": kind}
+
+
+def wrong_id_line(e):
+    line = "wrong id: %s recorded %s now %s" % (e["card"], _cid8(e["recorded"]),
+                                                _cid8(e["now"]))
+    return line + (" title \u00ab%s\u00bb" % e["title"] if e["title"] else "")
+
+
+def cap_lines(lines, limit=WRONG_ID_LINES_MAX):
+    """At most `limit` lines; the rest becomes one line that says how many."""
+    if len(lines) <= limit:
+        return list(lines)
+    return list(lines[:limit]) + [
+        "... and %d more wrong id lines (full list: target_copy_wrong_cid_list "
+        "in the report)" % (len(lines) - limit)]
+
+
 def _check(out, cid, ok, detail):
     out.append({"id": cid, "ok": bool(ok), "detail": detail})
 
 
 def evaluate(paths, before, index, tmap, identity, target, source,
-             sync_alive=False, active_override=None, allow_same_account=False):
+             sync_alive=False, active_override=None, allow_same_account=False,
+             snapshot_ms=None):
     """Compare the present state with the snapshot. Returns (report, exit code)."""
     checks, notes = [], []
     code = EXIT_OK
@@ -113,7 +166,8 @@ def evaluate(paths, before, index, tmap, identity, target, source,
     elif pair_notes:
         notes.append(pair_notes[0])
     report = {"stores": {}, "active_pair": {"present": active_present,
-                                            "path": active_dir}}
+                                            "path": active_dir},
+              "wrong_id_lines": []}
 
     for name in STORES:
         s = index.stores[name]
@@ -176,6 +230,7 @@ def evaluate(paths, before, index, tmap, identity, target, source,
                         empty_cid_target += 1
 
         wrong_cid, regressed, regressed_ok = [], [], []
+        rebound_live, wrong_list = [], []
         for n, rec in (exp.get("cards") or {}).items():
             # Every target copy must keep the recorded binding, not only the
             # best one: a second target folder with a wrong id still opens the
@@ -186,7 +241,14 @@ def evaluate(paths, before, index, tmap, identity, target, source,
                 continue
             want = (rec.get("cid") or "").lower()
             if want and any(c["cid"].lower() != want for _, c in copies):
-                wrong_cid.append(n)
+                if rebound_to_live(copies, want, tmap, snapshot_ms):
+                    rebound_live.append(n)
+                    wrong_list.append(wrong_id_entry(n, want, copies,
+                                                     "rebound_live"))
+                else:
+                    wrong_cid.append(n)
+                    wrong_list.append(wrong_id_entry(n, want, copies,
+                                                     "wrong_cid"))
                 continue
             tc = max((c for _, c in copies),
                      key=lambda c: (1 if c["cid"] else 0, c["act"], c["turns"]))
@@ -218,6 +280,9 @@ def evaluate(paths, before, index, tmap, identity, target, source,
             "empty_cliSessionId_with_transcript": len(empty_live),
             "target_copy_empty_cid": empty_cid_target,
             "target_copy_wrong_cid": len(wrong_cid),
+            "target_copy_rebound_live": len(rebound_live),
+            "target_copy_wrong_cid_list": sorted(wrong_list,
+                                                 key=lambda e: e["card"]),
             "target_copy_regressed": len(regressed),
             "target_copy_stale_recoverable": len(regressed_ok),
             "lagging_other_dirs_noted": len(lag_noted),
@@ -243,6 +308,13 @@ def evaluate(paths, before, index, tmap, identity, target, source,
         if v != EXIT_OK or missing_anywhere or aliases_lost or tomb_missing \
                 or empty_cid_target or wrong_cid:
             lost = True
+        report["wrong_id_lines"] += [
+            wrong_id_line(e) for e in st_report["target_copy_wrong_cid_list"]
+            if e["kind"] == "wrong_cid"]
+        if rebound_live:
+            notes.append("%s: %d target copies are bound to a newer live "
+                         "session than recorded (resumed after the snapshot; "
+                         "not loss)" % (name, len(rebound_live)))
         if regressed_ok:
             notes.append("%s: %d target copies are older than recorded, but a "
                          "fresh copy of each exists in another directory "
@@ -364,6 +436,7 @@ def evaluate(paths, before, index, tmap, identity, target, source,
                "newest message before %d, now %d (ms)" % (newest_before, newest_now))
         lost |= newest_now < newest_before
 
+    report["wrong_id_lines"] = cap_lines(report["wrong_id_lines"])
     report["checks"] = checks
     report["notes"] = notes
     report["observation"] = o.as_dict()

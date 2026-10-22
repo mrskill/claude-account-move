@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 
 from . import __version__
 from . import panel_snapshot as snap
@@ -183,6 +184,18 @@ def fail(args, out, cmd, started, code, verdict, message, move_dir=None, **extra
     emit(args, out, _report(cmd, code, verdict, started, reason=message,
                             write_verified=False, **extra), move_dir)
     return code
+
+
+def _snapshot_ms(man):
+    """Snapshot time in ms from the manifest, None when it cannot be read.
+
+    created_at has whole seconds (truncated), so the end of that second is
+    used: an ambiguous activity never counts as newer than the snapshot.
+    """
+    try:
+        return int(datetime.fromisoformat(man["created_at"]).timestamp() * 1000) + 999
+    except Exception:
+        return None
 
 
 def print_checks(out, checks):
@@ -402,7 +415,8 @@ def _cmd_finish(args, out):
             args.heartbeat, args.sync_max_age_min)[0]
         report, code = post.evaluate(paths, before, index, tmap,
                                      read_identity(paths), target, source, alive,
-                                     args.active_pair, args.allow_same_account)
+                                     args.active_pair, args.allow_same_account,
+                                     snapshot_ms=_snapshot_ms(man))
         if code == EXIT_WAIT and time.monotonic() < deadline:
             out.say("waiting for the sync job to deliver ...")
             pg.wait("sync delivery", time.monotonic() - t_wait, args.wait_sync,
@@ -416,6 +430,8 @@ def _cmd_finish(args, out):
         code = EXIT_FAIL
     out.say("checks:")
     print_checks(out, report["checks"])
+    for n in report.get("wrong_id_lines") or []:
+        out.say("  " + n)
     for n in report["notes"]:
         out.say("  note: " + n)
     out.say("VERDICT: %s" % {EXIT_OK: "everything arrived",
