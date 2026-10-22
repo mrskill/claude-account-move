@@ -7,8 +7,8 @@ finish   after signing in to the app and running `claude /login`: waits until
          the CLI account equals the app account, then verifies against the
          snapshot of THIS move.
 sync     optional repair: copy missing cards into the target pair (writes).
-repair   optional repair: rebind target cards that point at an older session than
-         the freshest copy of the same card (dry run; writes with --apply).
+repair   optional repair: rebind target cards bound to a session other than the one
+         the move snapshot recorded (dry run; writes with --apply).
 stamp    optional: last-message time into every session title (writes with --apply).
 """
 import argparse
@@ -136,11 +136,13 @@ def build_parser():
     add_common(s)
     s.add_argument("--apply", action="store_true", help="really copy (default: dry run)")
     s.add_argument("--undo", metavar="JOURNAL", help="remove files a journal lists")
-    r = sub.add_parser("repair", help="rebind target cards whose session id is older than the "
-                       "freshest copy of the same card (dry run; writes with --apply)")
+    r = sub.add_parser("repair", help="rebind target cards to the session id the move snapshot recorded "
+                       "(dry run; writes with --apply)")
     add_common(r)
     r.add_argument("--apply", action="store_true", help="really replace (default: dry run)")
     r.add_argument("--undo", metavar="JOURNAL", help="restore the cards a journal replaced")
+    r.add_argument("--move-id", help="use this snapshot instead of the newest ready one")
+    r.add_argument("--max-age-hours", type=float, default=72.0)
     a = sub.add_parser("auto", help="the whole move in one run: prepare, stamp, wait for "
                        "login, finish, sync if needed (writes)")
     add_common(a)
@@ -635,8 +637,14 @@ def cmd_repair(args):
                     "cannot determine the %s folder of the target account (the "
                     "app log names none yet; sign in to the app first or pass "
                     "--active-pair): not reporting success" % st.STORES[0])
+    before, _man, move_id, problem = snap.load_baseline(
+        paths, args.move_id, False, args.max_age_hours)
+    if problem:
+        return fail(args, out, "repair", started, EXIT_NO_BASELINE, "no_baseline",
+                    "no usable 'before' snapshot: %s (the recorded session ids "
+                    "are the source of truth)" % problem, move_id=move_id)
     items, skipped = repair_cards.plan_repair(index, st.transcripts(paths), target,
-                                              active)
+                                              active, before)
     if not index.obs.complete():
         return fail(args, out, "repair", started, EXIT_FAIL, "incomplete_observation",
                     "problems while planning (%d unreadable cards): refusing to "
@@ -645,15 +653,16 @@ def cmd_repair(args):
     for it in items:
         out.say(repair_cards.describe(it))
     for it in skipped:
-        out.say("skipped, transcript of the freshest copy is missing: %s %s (%s)"
-                % (it["name"], it["new_cid"][:8], it["store"]))
+        out.say(repair_cards.describe_skip(it))
     out.say("total: %d card(s) to rebind, %d skipped" % (len(items), len(skipped)))
     base = dict(planned=len(items), skipped=len(skipped), dry_run=not args.apply,
-                write_verified=False,
+                write_verified=False, move_id=move_id,
                 cards=[{"store": i["store"], "name": i["name"], "title": i["title"],
-                        "old_session": i["old_cid"], "new_session": i["new_cid"],
-                        "old_act": i["old_act"], "new_act": i["new_act"]}
-                       for i in items])
+                        "now_session": i["old_cid"], "recorded_session": i["new_cid"],
+                        "now_last_ms": i["old_last"],
+                        "recorded_last_ms": i["recorded_last"]} for i in items],
+                skipped_cards=[{"store": i["store"], "name": i["name"],
+                                "reason": i["reason"]} for i in skipped])
     if not args.apply:
         out.say("dry run: nothing written. Add --apply to rebind.")
         emit(args, out, _report("repair", EXIT_OK, "dry_run", started, **base))
@@ -669,10 +678,13 @@ def cmd_repair(args):
         return fail(args, out, "repair", started, EXIT_INTERNAL, "internal_error",
                     "cannot write the journal or the cards: %s" % exc)
     out.say("replaced %(replaced)d, changed while writing (not touched) %(changed)d, "
-            "skipped %(skipped)d, failed %(failed)d; journal: " % res + journal)
+            "skipped %(skipped)d, failed %(failed)d, replaced but not acknowledged "
+            "in the journal %(unacknowledged)d (undo still restores them); journal: "
+            % res + journal)
     out.say("Backups are in the state directory; `repair --undo JOURNAL` restores "
             "them. Restart the Claude app so the panel re-reads the cards.")
-    code = EXIT_FAIL if (res["changed"] or res["failed"]) else EXIT_OK
+    code = EXIT_FAIL if (res["changed"] or res["failed"]
+                         or res["unacknowledged"]) else EXIT_OK
     emit(args, out, _report("repair", code, "applied", started, result=res,
                             journal=journal, **base))
     return code
