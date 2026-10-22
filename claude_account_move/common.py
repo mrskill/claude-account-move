@@ -245,25 +245,72 @@ def write_lock(paths):
         os.close(fd)
 
 
-APP_PATTERNS = (("-x", "Claude"), ("-f", "/Applications/Claude.app/Contents/"))
+APP_BUNDLE = "/Applications/Claude.app/Contents/"
+# Helpers of the bundle that can outlive the app: the Chrome extension starts
+# chrome-native-host by itself, and the crash handler may linger after a quit.
+# Neither one holds the storage, so neither blocks a write.
+NATIVE_HOST = APP_BUNDLE + "Helpers/chrome-native-host"
+CRASHPAD_SUFFIX = "/chrome_crashpad_handler"
+_ARGS_SPLIT_RE = re.compile(r"\s--")
+
+
+def _lingering_helper(command):
+    """True for a process of the bundle that may outlive the app (see above)."""
+    exe = _ARGS_SPLIT_RE.split(command.strip(), 1)[0].strip()
+    if exe == NATIVE_HOST or exe.startswith(NATIVE_HOST + " "):
+        return True
+    return exe.startswith(APP_BUNDLE) and exe.endswith(CRASHPAD_SUFFIX)
+
+
+def _short(text, limit=120):
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def claude_app_blockers():
+    """Descriptions of what says the Claude app is running; [] when it is not.
+
+    Two checks: a process named exactly Claude, and any process started from
+    the app bundle (its helpers), except the helpers that outlive the app
+    (_lingering_helper). A failure to run the check, or an answer that cannot
+    be read, counts as "running": the answer must be known before the storage
+    is written. The process-lookup command can be replaced with
+    CLAUDE_ACCOUNT_MOVE_PGREP (tests).
+    """
+    cmd = os.environ.get("CLAUDE_ACCOUNT_MOVE_PGREP", "pgrep")
+    found = []
+    for args in (["-x", "Claude"], ["-fl", APP_BUNDLE]):
+        try:
+            r = subprocess.run([cmd] + args, capture_output=True)
+        except OSError as exc:
+            return ["cannot run %s: %s" % (cmd, exc)]
+        if r.returncode == 1:
+            continue
+        if r.returncode != 0:
+            return ["%s failed with exit code %d" % (cmd, r.returncode)]
+        lines = [ln.strip() for ln in
+                 r.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
+        if args[0] == "-x":
+            found.append(_short(lines[0]) if lines else "a process named Claude")
+            continue
+        if not lines:
+            found.append("a process of " + APP_BUNDLE)
+        for ln in lines:
+            parts = ln.split(None, 1)
+            command = parts[1] if len(parts) == 2 else ln
+            if not _lingering_helper(command):
+                found.append(_short(ln))
+    return found
 
 
 def claude_app_running():
-    """True when the Claude desktop app is running, or when that cannot be told.
+    """True when the Claude desktop app is running, or when that cannot be told."""
+    return bool(claude_app_blockers())
 
-    Two checks: a process named exactly Claude, and any process started from
-    the app bundle (its helpers). A failure to run the check counts as
-    "running": the answer must be known before the storage is written.
-    The pgrep command can be replaced with CLAUDE_ACCOUNT_MOVE_PGREP (tests).
-    """
-    cmd = os.environ.get("CLAUDE_ACCOUNT_MOVE_PGREP", "pgrep")
-    for args in APP_PATTERNS:
-        try:
-            r = subprocess.run([cmd] + list(args), capture_output=True)
-        except OSError:
-            return True
-        if r.returncode == 0:
-            return True
-        if r.returncode not in (0, 1):
-            return True
-    return False
+
+def app_blockers_note():
+    """Sentence for a refusal message: what exactly blocks. May be empty."""
+    found = claude_app_blockers()
+    if not found:
+        return ""
+    more = " (+%d more)" % (len(found) - 3) if len(found) > 3 else ""
+    return " Blocking process: " + "; ".join(found[:3]) + more + "."

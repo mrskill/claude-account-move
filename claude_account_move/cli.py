@@ -455,7 +455,7 @@ def cmd_sync(args):
         if common.claude_app_running():
             return fail(args, out, "sync", started, EXIT_FAIL, "app_running",
                         "Quit the Claude app first (Cmd+Q), then run this command "
-                        "again: undo rewrites files the app keeps open.")
+                        "again: undo rewrites files the app keeps open." + common.app_blockers_note())
         try:
             with write_lock(paths):
                 res = sync_cards.undo(args.undo, snap.path_id(paths.home),
@@ -553,7 +553,7 @@ def cmd_sync(args):
     if tplan and common.claude_app_running():
         return fail(args, out, "sync", started, EXIT_FAIL, "app_running",
                     "Quit the Claude app first (Cmd+Q), then run this command "
-                    "again: the app rewrites scheduled-tasks.json while it runs.")
+                    "again: the app rewrites scheduled-tasks.json while it runs." + common.app_blockers_note())
     try:
         with write_lock(paths):
             jdir = safe_subdir(paths)
@@ -589,7 +589,7 @@ def cmd_repair(args):
         if common.claude_app_running():
             return fail(args, out, "repair", started, EXIT_FAIL, "app_running",
                         "Quit the Claude app first (Cmd+Q), then run this command "
-                        "again: repair rewrites cards the app keeps open.")
+                        "again: repair rewrites cards the app keeps open." + common.app_blockers_note())
     if args.undo:
         try:
             with write_lock(paths):
@@ -702,7 +702,7 @@ def cmd_stamp(args):
         if common.claude_app_running():
             return fail(args, out, "stamp", started, EXIT_FAIL, "app_running",
                         "Quit the Claude app first (Cmd+Q), then run this command "
-                        "again: stamping changes the cards the app keeps open.")
+                        "again: stamping changes the cards the app keeps open." + common.app_blockers_note())
     if args.undo:
         try:
             with write_lock(paths):
