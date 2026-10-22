@@ -9,6 +9,7 @@ Verdict per store: 3 on a real loss, 5 when everything exists somewhere but
 not yet in the target pair and a sync job is alive, 0 otherwise.
 """
 import os
+from datetime import datetime
 
 from . import panel_snapshot as snap
 from . import post_move_verify as verify
@@ -76,6 +77,54 @@ def store_verdict(lagging, empty_live, dead, union_len, expect, *, missing,
     return EXIT_OK
 
 
+WRONG_ID_LINES_MAX = 20
+
+
+def _cid8(cid):
+    return (cid or "")[:8] or "(empty)"
+
+
+def transcript_last_ms(tmap, cid):
+    """Last message time (ms) over the transcripts of a session, None if none."""
+    if not cid:
+        return None
+    vals = [st.last_message_ms(f) for f in tmap.get((cid or "").lower()) or []]
+    vals = [v for v in vals if v]
+    return max(vals) if vals else None
+
+
+def _stamp(ms):
+    if not ms:
+        return "none"
+    return datetime.fromtimestamp(ms / 1000).strftime("%d.%m %H:%M")
+
+
+def wrong_id_entry(name, want, copies, tmap):
+    c = next(x for _, x in copies if x["cid"].lower() != want)
+    rec_ms = transcript_last_ms(tmap, want)
+    new_ms = transcript_last_ms(tmap, c["cid"])
+    return {"card": name, "recorded": (want or ""), "now": c["cid"],
+            "title": c.get("title") or "",
+            "recorded_last_ms": rec_ms, "now_last_ms": new_ms,
+            "direction": "newer" if (new_ms or 0) > (rec_ms or 0) else "OLDER"}
+
+
+def wrong_id_line(e):
+    line = "wrong id: %s recorded %s (last %s) now %s (last %s) %s" % (
+        e["card"], _cid8(e["recorded"]), _stamp(e["recorded_last_ms"]),
+        _cid8(e["now"]), _stamp(e["now_last_ms"]), e["direction"])
+    return line + (" title \u00ab%s\u00bb" % e["title"] if e["title"] else "")
+
+
+def cap_lines(lines, limit=WRONG_ID_LINES_MAX):
+    """At most `limit` lines; the rest becomes one line that says how many."""
+    if len(lines) <= limit:
+        return list(lines)
+    return list(lines[:limit]) + [
+        "... and %d more wrong id lines (full list: target_copy_wrong_cid_list "
+        "in the report)" % (len(lines) - limit)]
+
+
 def _check(out, cid, ok, detail):
     out.append({"id": cid, "ok": bool(ok), "detail": detail})
 
@@ -113,7 +162,8 @@ def evaluate(paths, before, index, tmap, identity, target, source,
     elif pair_notes:
         notes.append(pair_notes[0])
     report = {"stores": {}, "active_pair": {"present": active_present,
-                                            "path": active_dir}}
+                                            "path": active_dir},
+              "wrong_id_lines": []}
 
     for name in STORES:
         s = index.stores[name]
@@ -176,6 +226,7 @@ def evaluate(paths, before, index, tmap, identity, target, source,
                         empty_cid_target += 1
 
         wrong_cid, regressed, regressed_ok = [], [], []
+        wrong_list = []
         for n, rec in (exp.get("cards") or {}).items():
             # Every target copy must keep the recorded binding, not only the
             # best one: a second target folder with a wrong id still opens the
@@ -187,6 +238,7 @@ def evaluate(paths, before, index, tmap, identity, target, source,
             want = (rec.get("cid") or "").lower()
             if want and any(c["cid"].lower() != want for _, c in copies):
                 wrong_cid.append(n)
+                wrong_list.append(wrong_id_entry(n, want, copies, tmap))
                 continue
             tc = max((c for _, c in copies),
                      key=lambda c: (1 if c["cid"] else 0, c["act"], c["turns"]))
@@ -218,6 +270,8 @@ def evaluate(paths, before, index, tmap, identity, target, source,
             "empty_cliSessionId_with_transcript": len(empty_live),
             "target_copy_empty_cid": empty_cid_target,
             "target_copy_wrong_cid": len(wrong_cid),
+            "target_copy_wrong_cid_list": sorted(wrong_list,
+                                                 key=lambda e: e["card"]),
             "target_copy_regressed": len(regressed),
             "target_copy_stale_recoverable": len(regressed_ok),
             "lagging_other_dirs_noted": len(lag_noted),
@@ -243,6 +297,8 @@ def evaluate(paths, before, index, tmap, identity, target, source,
         if v != EXIT_OK or missing_anywhere or aliases_lost or tomb_missing \
                 or empty_cid_target or wrong_cid:
             lost = True
+        report["wrong_id_lines"] += [
+            wrong_id_line(e) for e in st_report["target_copy_wrong_cid_list"]]
         if regressed_ok:
             notes.append("%s: %d target copies are older than recorded, but a "
                          "fresh copy of each exists in another directory "
@@ -364,6 +420,7 @@ def evaluate(paths, before, index, tmap, identity, target, source,
                "newest message before %d, now %d (ms)" % (newest_before, newest_now))
         lost |= newest_now < newest_before
 
+    report["wrong_id_lines"] = cap_lines(report["wrong_id_lines"])
     report["checks"] = checks
     report["notes"] = notes
     report["observation"] = o.as_dict()

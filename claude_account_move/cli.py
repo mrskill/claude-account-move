@@ -416,6 +416,8 @@ def _cmd_finish(args, out):
         code = EXIT_FAIL
     out.say("checks:")
     print_checks(out, report["checks"])
+    for n in report.get("wrong_id_lines") or []:
+        out.say("  " + n)
     for n in report["notes"]:
         out.say("  note: " + n)
     out.say("VERDICT: %s" % {EXIT_OK: "everything arrived",
