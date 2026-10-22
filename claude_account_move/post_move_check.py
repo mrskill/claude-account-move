@@ -9,6 +9,7 @@ Verdict per store: 3 on a real loss, 5 when everything exists somewhere but
 not yet in the target pair and a sync job is alive, 0 otherwise.
 """
 import os
+from datetime import datetime
 
 from . import panel_snapshot as snap
 from . import post_move_verify as verify
@@ -83,39 +84,35 @@ def _cid8(cid):
     return (cid or "")[:8] or "(empty)"
 
 
-def rebound_to_live(copies, want, tmap, snapshot_ms):
-    """True when every target copy bound away from the recorded session points
-    to a session that has a transcript and was active after the snapshot.
-
-    The app rebinds a card to a new CLI session id when a session is resumed
-    after context compaction; such a card still opens a live session, so it is
-    a note and not loss. Uses only what is already read: the transcript index
-    and the card fields. snapshot_ms None (time unknown) never qualifies.
-    """
-    if snapshot_ms is None:
-        return False
-    diff = [c for _, c in copies if c["cid"].lower() != want]
-    if not diff:
-        return False
-    for c in diff:
-        new = c["cid"].lower()
-        if not new or new not in tmap:
-            return False
-        last = max((st.last_message_ms(f) or 0 for f in tmap[new]), default=0)
-        if max(last, c["act"]) <= snapshot_ms:
-            return False
-    return True
+def transcript_last_ms(tmap, cid):
+    """Last message time (ms) over the transcripts of a session, None if none."""
+    if not cid:
+        return None
+    vals = [st.last_message_ms(f) for f in tmap.get((cid or "").lower()) or []]
+    vals = [v for v in vals if v]
+    return max(vals) if vals else None
 
 
-def wrong_id_entry(name, want, copies, kind):
+def _stamp(ms):
+    if not ms:
+        return "none"
+    return datetime.fromtimestamp(ms / 1000).strftime("%d.%m %H:%M")
+
+
+def wrong_id_entry(name, want, copies, tmap):
     c = next(x for _, x in copies if x["cid"].lower() != want)
+    rec_ms = transcript_last_ms(tmap, want)
+    new_ms = transcript_last_ms(tmap, c["cid"])
     return {"card": name, "recorded": (want or ""), "now": c["cid"],
-            "title": c.get("title") or "", "kind": kind}
+            "title": c.get("title") or "",
+            "recorded_last_ms": rec_ms, "now_last_ms": new_ms,
+            "direction": "newer" if (new_ms or 0) > (rec_ms or 0) else "OLDER"}
 
 
 def wrong_id_line(e):
-    line = "wrong id: %s recorded %s now %s" % (e["card"], _cid8(e["recorded"]),
-                                                _cid8(e["now"]))
+    line = "wrong id: %s recorded %s (last %s) now %s (last %s) %s" % (
+        e["card"], _cid8(e["recorded"]), _stamp(e["recorded_last_ms"]),
+        _cid8(e["now"]), _stamp(e["now_last_ms"]), e["direction"])
     return line + (" title \u00ab%s\u00bb" % e["title"] if e["title"] else "")
 
 
@@ -133,8 +130,7 @@ def _check(out, cid, ok, detail):
 
 
 def evaluate(paths, before, index, tmap, identity, target, source,
-             sync_alive=False, active_override=None, allow_same_account=False,
-             snapshot_ms=None):
+             sync_alive=False, active_override=None, allow_same_account=False):
     """Compare the present state with the snapshot. Returns (report, exit code)."""
     checks, notes = [], []
     code = EXIT_OK
@@ -230,7 +226,7 @@ def evaluate(paths, before, index, tmap, identity, target, source,
                         empty_cid_target += 1
 
         wrong_cid, regressed, regressed_ok = [], [], []
-        rebound_live, wrong_list = [], []
+        wrong_list = []
         for n, rec in (exp.get("cards") or {}).items():
             # Every target copy must keep the recorded binding, not only the
             # best one: a second target folder with a wrong id still opens the
@@ -241,14 +237,8 @@ def evaluate(paths, before, index, tmap, identity, target, source,
                 continue
             want = (rec.get("cid") or "").lower()
             if want and any(c["cid"].lower() != want for _, c in copies):
-                if rebound_to_live(copies, want, tmap, snapshot_ms):
-                    rebound_live.append(n)
-                    wrong_list.append(wrong_id_entry(n, want, copies,
-                                                     "rebound_live"))
-                else:
-                    wrong_cid.append(n)
-                    wrong_list.append(wrong_id_entry(n, want, copies,
-                                                     "wrong_cid"))
+                wrong_cid.append(n)
+                wrong_list.append(wrong_id_entry(n, want, copies, tmap))
                 continue
             tc = max((c for _, c in copies),
                      key=lambda c: (1 if c["cid"] else 0, c["act"], c["turns"]))
@@ -280,7 +270,6 @@ def evaluate(paths, before, index, tmap, identity, target, source,
             "empty_cliSessionId_with_transcript": len(empty_live),
             "target_copy_empty_cid": empty_cid_target,
             "target_copy_wrong_cid": len(wrong_cid),
-            "target_copy_rebound_live": len(rebound_live),
             "target_copy_wrong_cid_list": sorted(wrong_list,
                                                  key=lambda e: e["card"]),
             "target_copy_regressed": len(regressed),
@@ -309,12 +298,7 @@ def evaluate(paths, before, index, tmap, identity, target, source,
                 or empty_cid_target or wrong_cid:
             lost = True
         report["wrong_id_lines"] += [
-            wrong_id_line(e) for e in st_report["target_copy_wrong_cid_list"]
-            if e["kind"] == "wrong_cid"]
-        if rebound_live:
-            notes.append("%s: %d target copies are bound to a newer live "
-                         "session than recorded (resumed after the snapshot; "
-                         "not loss)" % (name, len(rebound_live)))
+            wrong_id_line(e) for e in st_report["target_copy_wrong_cid_list"]]
         if regressed_ok:
             notes.append("%s: %d target copies are older than recorded, but a "
                          "fresh copy of each exists in another directory "

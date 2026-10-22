@@ -1,9 +1,11 @@
-"""CAM-FINISH-WRONGCID: finish names the cards whose target copy is bound to
-another session; a rebind to a newer live session is a note, not loss."""
+"""CAM-FINISH-WRONGCID: finish names every card whose target copy is bound to
+another session, with the last message time of both transcripts and a
+direction tag. Every such card stays a failure."""
 import os
 import sys
 import time
 import unittest
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -12,92 +14,84 @@ from test_cli import parse  # noqa: E402
 from test_v011 import Base  # noqa: E402
 
 
-def future_ms(extra=3600000):
-    return int(time.time() * 1000) + extra
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def stamp(ms):
+    return datetime.fromtimestamp(ms / 1000).strftime("%d.%m %H:%M")
 
 
 class WrongCid(Base):
-    def rebind(self, target, n, cid, act, title="resumed title"):
+    def rebind(self, target, n, cid, title="resumed title"):
         os.unlink(os.path.join(target, "local_%s.json" % uid(n, 9)))
-        self.h.card(target, n, cid, act=act, title=title)
+        self.h.card(target, n, cid, title=title)
 
-    def test_rebound_to_newer_live_session_is_a_note_and_ok(self):
-        _, target = self.moved()
-        self.h.transcript(uid(60), last_ms=future_ms())      # resumed later
-        self.rebind(target, 11, uid(60), future_ms())
-        r = self.finish()
-        self.assertEqual(r.returncode, 0, r.stdout)
-        rep = parse(r)
-        store = rep["stores"][CC]
-        self.assertEqual(store["target_copy_wrong_cid"], 0)
-        self.assertEqual(store["target_copy_rebound_live"], 1)
-        loss = {c["id"]: c for c in rep["checks"]}[CC + ":loss"]
-        self.assertTrue(loss["ok"], loss)
-        self.assertTrue(any("newer live session" in n and n.startswith(CC + ": 1")
-                            for n in rep["notes"]), rep["notes"])
-        self.assertEqual(rep["wrong_id_lines"], [])
-        kinds = [e["kind"] for e in store["target_copy_wrong_cid_list"]]
-        self.assertEqual(kinds, ["rebound_live"])
+    def entry(self, rep):
+        return rep["stores"][CC]["target_copy_wrong_cid_list"][0]
 
-    def test_note_is_printed_for_a_human_run(self):
+    def test_fresh_foreign_cid_fails_and_is_tagged_newer(self):
         _, target = self.moved()
-        self.h.transcript(uid(60), last_ms=future_ms())
-        self.rebind(target, 11, uid(60), future_ms())
-        r = self.h.run("finish", "--wait-login", "0")
-        self.assertEqual(r.returncode, 0, r.stdout)
-        self.assertIn("note: " + CC + ": 1 target copies are bound to a newer "
-                      "live session", r.stdout)
-        self.assertNotIn("wrong id:", r.stdout)
-
-    def test_rebound_to_older_transcript_fails(self):
-        _, target = self.moved()
-        self.rebind(target, 11, uid(12), act=1)   # transcript older than snapshot
+        self.h.transcript(uid(60), last_ms=now_ms() + 3600000)
+        self.rebind(target, 11, uid(60))
         r = self.finish()
         self.assertEqual(r.returncode, 3, r.stdout)
         rep = parse(r)
         self.assertEqual(rep["stores"][CC]["target_copy_wrong_cid"], 1)
-        self.assertEqual(rep["stores"][CC]["target_copy_rebound_live"], 0)
         self.assertFalse({c["id"]: c for c in rep["checks"]}[CC + ":loss"]["ok"])
+        self.assertEqual(self.entry(rep)["direction"], "newer")
+        self.assertNotIn("rebound", r.stdout)
 
-    def test_rebound_to_missing_transcript_fails_even_when_card_is_new(self):
+    def test_older_cid_fails_and_is_tagged_older(self):
         _, target = self.moved()
-        self.rebind(target, 11, uid(77), future_ms())   # no transcript at all
+        self.h.transcript(uid(61), last_ms=now_ms() - 7 * 86400000)
+        self.rebind(target, 11, uid(61))
         r = self.finish()
         self.assertEqual(r.returncode, 3, r.stdout)
-        self.assertEqual(parse(r)["stores"][CC]["target_copy_wrong_cid"], 1)
+        rep = parse(r)
+        self.assertEqual(self.entry(rep)["direction"], "OLDER")
+        self.assertTrue(rep["wrong_id_lines"][0].endswith("OLDER title "
+                                                         "«resumed title»"),
+                        rep["wrong_id_lines"])
 
-    def test_rebound_to_empty_id_fails(self):
+    def test_missing_transcript_prints_none_and_fails(self):
         _, target = self.moved()
-        self.rebind(target, 11, "", future_ms())
+        self.rebind(target, 11, uid(77))
         r = self.finish()
         self.assertEqual(r.returncode, 3, r.stdout)
+        rep = parse(r)
+        e = self.entry(rep)
+        self.assertIsNone(e["now_last_ms"])
+        self.assertEqual(e["direction"], "OLDER")
+        self.assertIn("now %s (last none) OLDER" % uid(77)[:8],
+                      rep["wrong_id_lines"][0])
 
-    def test_newer_transcript_alone_is_enough_but_old_card_and_old_transcript_not(self):
+    def test_line_has_both_times_ids_and_title_on_screen(self):
         _, target = self.moved()
-        self.h.transcript(uid(60), last_ms=future_ms())
-        self.rebind(target, 11, uid(60), act=1)       # card old, transcript newer
-        self.assertEqual(self.finish().returncode, 0)
-
-    def test_list_is_printed_with_short_ids_and_title(self):
-        _, target = self.moved()
-        self.rebind(target, 11, uid(77), act=1, title="Quarterly plan")
+        new_ms = now_ms() + 3600000
+        self.h.transcript(uid(60), last_ms=new_ms)
+        self.rebind(target, 11, uid(60), title="Quarterly plan")
         r = self.h.run("finish", "--wait-login", "0")
         self.assertEqual(r.returncode, 3, r.stdout)
-        line = [x for x in r.stdout.splitlines() if "wrong id:" in x]
-        self.assertEqual(len(line), 1, r.stdout)
-        self.assertIn("wrong id: local_%s.json recorded %s now %s title "
-                      "«Quarterly plan»" % (uid(11, 9), uid(11)[:8],
-                                                      uid(77)[:8]), line[0])
+        lines = [x for x in r.stdout.splitlines() if "wrong id:" in x]
+        self.assertEqual(len(lines), 1, r.stdout)
+        rec_ms = parse(self.finish())["stores"][CC][
+            "target_copy_wrong_cid_list"][0]["recorded_last_ms"]
+        self.assertIsNotNone(rec_ms)
+        self.assertIn("wrong id: local_%s.json recorded %s (last %s) now %s "
+                      "(last %s) newer title «Quarterly plan»"
+                      % (uid(11, 9), uid(11)[:8], stamp(rec_ms), uid(60)[:8],
+                         stamp(new_ms)), lines[0])
 
-    def test_list_is_stored_in_the_report_and_capped_on_screen(self):
+    def test_list_is_stored_in_the_report(self):
         _, target = self.moved()
-        self.rebind(target, 11, uid(77), act=1, title="")
+        self.rebind(target, 11, uid(77), title="")
         rep = parse(self.finish())
-        entry = rep["stores"][CC]["target_copy_wrong_cid_list"][0]
-        self.assertEqual(entry["card"], "local_%s.json" % uid(11, 9))
-        self.assertEqual(entry["recorded"], uid(11))
-        self.assertEqual(entry["now"], uid(77))
-        self.assertEqual(entry["kind"], "wrong_cid")
+        e = self.entry(rep)
+        self.assertEqual(e["card"], "local_%s.json" % uid(11, 9))
+        self.assertEqual(e["recorded"], uid(11))
+        self.assertEqual(e["now"], uid(77))
+        self.assertIsNotNone(e["recorded_last_ms"])
         self.assertEqual(len(rep["wrong_id_lines"]), 1)
         self.assertNotIn("title", rep["wrong_id_lines"][0])
 

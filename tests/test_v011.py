@@ -144,9 +144,7 @@ class C2TargetBinding(Base):
     def rebind(self, target, n, cid):
         path = os.path.join(target, "local_%s.json" % uid(n, 9))
         os.unlink(path)
-        # Old activity: a card rebound to a session that was NOT active after
-        # the snapshot is a failure (CAM-FINISH-WRONGCID keeps newer ones apart).
-        self.h.card(target, n, cid, act=1)
+        self.h.card(target, n, cid)
 
     def test_wrong_nonempty_session_id_fails(self):
         _, target = self.moved()
