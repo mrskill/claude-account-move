@@ -7,6 +7,8 @@ finish   after signing in to the app and running `claude /login`: waits until
          the CLI account equals the app account, then verifies against the
          snapshot of THIS move.
 sync     optional repair: copy missing cards into the target pair (writes).
+repair   optional repair: rebind target cards that point at an older session than
+         the freshest copy of the same card (dry run; writes with --apply).
 stamp    optional: last-message time into every session title (writes with --apply).
 """
 import argparse
@@ -23,6 +25,7 @@ from . import store as st
 from . import common
 from . import post_move_verify as verify
 from . import progress as prog
+from . import repair_cards
 from . import stamp_titles
 from . import sync_cards
 from .common import (EXIT_FAIL, EXIT_INPUT, EXIT_INTERNAL, EXIT_LOGIN_TIMEOUT,
@@ -133,6 +136,11 @@ def build_parser():
     add_common(s)
     s.add_argument("--apply", action="store_true", help="really copy (default: dry run)")
     s.add_argument("--undo", metavar="JOURNAL", help="remove files a journal lists")
+    r = sub.add_parser("repair", help="rebind target cards whose session id is older than the "
+                       "freshest copy of the same card (dry run; writes with --apply)")
+    add_common(r)
+    r.add_argument("--apply", action="store_true", help="really replace (default: dry run)")
+    r.add_argument("--undo", metavar="JOURNAL", help="restore the cards a journal replaced")
     a = sub.add_parser("auto", help="the whole move in one run: prepare, stamp, wait for "
                        "login, finish, sync if needed (writes)")
     add_common(a)
@@ -565,6 +573,111 @@ def cmd_sync(args):
     return code
 
 
+def cmd_repair(args):
+    started = time.monotonic()
+    out = Out.of(args)
+    paths = make_paths(args)
+    prob = state_dir_problem(paths)
+    if prob:
+        return fail(args, out, "repair", started, EXIT_INPUT, "input_error",
+                    "error: " + prob)
+    if args.active_pair:
+        st.parse_override(args.active_pair)      # PairError -> exit 2, before any storage check
+    if args.undo or args.apply:
+        if common.claude_app_running():
+            return fail(args, out, "repair", started, EXIT_FAIL, "app_running",
+                        "Quit the Claude app first (Cmd+Q), then run this command "
+                        "again: repair rewrites cards the app keeps open.")
+    if args.undo:
+        try:
+            with write_lock(paths):
+                res = repair_cards.undo_repairs(args.undo, snap.path_id(paths.home),
+                                                os.path.realpath(paths.support))
+        except sync_cards.JournalError as exc:
+            return fail(args, out, "repair", started, EXIT_INPUT, "input_error",
+                        "journal rejected: %s" % exc)
+        out.say("restored %(restored)d cards byte for byte, skipped %(skipped)d, "
+                "ambiguous %(ambiguous)d (not proven to be ours, or backup gone: "
+                "kept), invalid %(invalid)d (outside this operation's targets); "
+                "journal status: %(status)s" % res)
+        code = EXIT_OK if (res["status"] == "ok" and not res["ambiguous"]
+                           and not res["invalid"]) else EXIT_FAIL
+        emit(args, out, _report("repair", code, "undo", started, undo=res,
+                                write_verified=False))
+        return code
+    if not os.path.isdir(paths.support):
+        return fail(args, out, "repair", started, EXIT_NO_STORE, "no_store",
+                    "storage not found: %s" % paths.support)
+    index = st.scan(paths)
+    if not index.any_pairs():
+        return fail(args, out, "repair", started, EXIT_NO_STORE, "no_store",
+                    "no account/organization pair found under %s" % paths.support)
+    if not index.obs.complete():
+        return fail(args, out, "repair", started, EXIT_FAIL, "incomplete_observation",
+                    "storage could not be read completely (%d unreadable cards, "
+                    "%d errors): refusing to plan a repair from partial input"
+                    % (index.obs.unreadable_cards, len(index.obs.errors)),
+                    observation=index.obs.as_dict())
+    target = read_identity(paths)["app"]["value"]
+    if not target:
+        return fail(args, out, "repair", started, EXIT_FAIL, "no_target",
+                    "the app account is not readable: nothing to repair")
+    pair_notes = []
+    pair = st.live_pair(paths, account=target, override=args.active_pair,
+                        index=index, notes=pair_notes, command="repair")
+    for n in pair_notes:
+        out.say(n)
+    active = st.pair_dir(paths, pair[0], pair[1]) if pair else None
+    if active and active not in index.stores[st.STORES[0]].dirs:
+        active = None
+    if index.stores[st.STORES[0]].union_names() and active is None:
+        return fail(args, out, "repair", started, EXIT_FAIL, "no_target",
+                    "cannot determine the %s folder of the target account (the "
+                    "app log names none yet; sign in to the app first or pass "
+                    "--active-pair): not reporting success" % st.STORES[0])
+    items, skipped = repair_cards.plan_repair(index, st.transcripts(paths), target,
+                                              active)
+    if not index.obs.complete():
+        return fail(args, out, "repair", started, EXIT_FAIL, "incomplete_observation",
+                    "problems while planning (%d unreadable cards): refusing to "
+                    "plan a repair from partial input" % index.obs.unreadable_cards,
+                    observation=index.obs.as_dict())
+    for it in items:
+        out.say(repair_cards.describe(it))
+    for it in skipped:
+        out.say("skipped, transcript of the freshest copy is missing: %s %s (%s)"
+                % (it["name"], it["new_cid"][:8], it["store"]))
+    out.say("total: %d card(s) to rebind, %d skipped" % (len(items), len(skipped)))
+    base = dict(planned=len(items), skipped=len(skipped), dry_run=not args.apply,
+                write_verified=False,
+                cards=[{"store": i["store"], "name": i["name"], "title": i["title"],
+                        "old_session": i["old_cid"], "new_session": i["new_cid"],
+                        "old_act": i["old_act"], "new_act": i["new_act"]}
+                       for i in items])
+    if not args.apply:
+        out.say("dry run: nothing written. Add --apply to rebind.")
+        emit(args, out, _report("repair", EXIT_OK, "dry_run", started, **base))
+        return EXIT_OK
+    try:
+        with write_lock(paths):
+            jdir = safe_subdir(paths)
+            journal = repair_cards.new_journal_path(jdir)
+            res = repair_cards.apply_repairs(
+                items, journal, jdir, snap.path_id(paths.home),
+                support_real=os.path.realpath(paths.support))
+    except OSError as exc:
+        return fail(args, out, "repair", started, EXIT_INTERNAL, "internal_error",
+                    "cannot write the journal or the cards: %s" % exc)
+    out.say("replaced %(replaced)d, changed while writing (not touched) %(changed)d, "
+            "skipped %(skipped)d, failed %(failed)d; journal: " % res + journal)
+    out.say("Backups are in the state directory; `repair --undo JOURNAL` restores "
+            "them. Restart the Claude app so the panel re-reads the cards.")
+    code = EXIT_FAIL if (res["changed"] or res["failed"]) else EXIT_OK
+    emit(args, out, _report("repair", code, "applied", started, result=res,
+                            journal=journal, **base))
+    return code
+
+
 def cmd_stamp(args):
     started = time.monotonic()
     out = Out.of(args)
@@ -683,7 +796,7 @@ def _run(args):
     started = time.monotonic()
     try:
         return {"prepare": cmd_prepare, "finish": cmd_finish,
-                "sync": cmd_sync, "stamp": cmd_stamp,
+                "sync": cmd_sync, "repair": cmd_repair, "stamp": cmd_stamp,
                 "auto": cmd_auto}[args.command](args)
     except st.PairError as exc:
         return fail(args, Out.of(args), args.command, started, EXIT_INPUT,
