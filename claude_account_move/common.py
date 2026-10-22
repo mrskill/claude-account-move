@@ -245,25 +245,88 @@ def write_lock(paths):
         os.close(fd)
 
 
-APP_PATTERNS = (("-x", "Claude"), ("-f", "/Applications/Claude.app/Contents/"))
+APP_BUNDLE = "/Applications/Claude.app/Contents/"
+# Helpers of the bundle that can outlive the app: the Chrome extension starts
+# chrome-native-host by itself, and the crash handler may linger after a quit.
+# Neither one holds the storage, so neither blocks a write.
+NATIVE_HOST = APP_BUNDLE + "Helpers/chrome-native-host"
+CRASHPAD = (APP_BUNDLE + "Frameworks/Electron Framework.framework/"
+            "Helpers/chrome_crashpad_handler")
+LINGERING_EXES = (NATIVE_HOST, CRASHPAD)
+
+
+def _ps_value(field, pid):
+    """(rc, text) of `ps -o <field>= -p <pid>`; rc None when ps cannot run."""
+    ps = os.environ.get("CLAUDE_ACCOUNT_MOVE_PS", "ps")
+    try:
+        r = subprocess.run([ps, "-o", field + "=", "-p", pid], capture_output=True)
+    except OSError:
+        return None, ""
+    return r.returncode, r.stdout.decode("utf-8", "replace").strip()
+
+
+def _lingering_helper(pid):
+    """True only when the executable PATH of the process (not its arguments)
+    equals one of LINGERING_EXES, or when the process is gone (ps exit 1).
+    Anything unreadable, empty or cut short ("...") is not lingering."""
+    rc, comm = _ps_value("comm", pid)
+    if rc == 1:
+        return True
+    if rc != 0 or not comm or comm.endswith("..."):
+        return False
+    return comm in LINGERING_EXES
+
+
+def _short(text, limit=120):
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def claude_app_blockers():
+    """Descriptions of what says the Claude app is running; [] when it is not.
+
+    Two checks: a process named exactly Claude, and any process started from
+    the app bundle (its helpers). The bundle lookup only collects candidate
+    PIDs; a PID is excluded only when its executable path (ps comm, never its
+    arguments) equals chrome-native-host or the bundle crash handler, the
+    helpers that outlive the app (_lingering_helper). A failure to run the
+    check, or an answer that cannot be read, counts as "running": the answer
+    must be known before the storage is written. The lookup commands can be
+    replaced with CLAUDE_ACCOUNT_MOVE_PGREP and CLAUDE_ACCOUNT_MOVE_PS (tests).
+    """
+    cmd = os.environ.get("CLAUDE_ACCOUNT_MOVE_PGREP", "pgrep")
+    found = []
+    for args in (["-x", "Claude"], ["-fl", APP_BUNDLE]):
+        try:
+            r = subprocess.run([cmd] + args, capture_output=True)
+        except OSError as exc:
+            return ["cannot run %s: %s" % (cmd, exc)]
+        if r.returncode == 1:
+            continue
+        if r.returncode != 0:
+            return ["%s failed with exit code %d" % (cmd, r.returncode)]
+        lines = [ln.strip() for ln in
+                 r.stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
+        if args[0] == "-x":
+            found.append(_short(lines[0]) if lines else "a process named Claude")
+            continue
+        if not lines:
+            found.append("a process of " + APP_BUNDLE)
+        for ln in lines:
+            pid = ln.split(None, 1)[0]
+            if not (pid.isdigit() and _lingering_helper(pid)):
+                found.append(_short(ln))
+    return found
 
 
 def claude_app_running():
-    """True when the Claude desktop app is running, or when that cannot be told.
+    """True when the Claude desktop app is running, or when that cannot be told."""
+    return bool(claude_app_blockers())
 
-    Two checks: a process named exactly Claude, and any process started from
-    the app bundle (its helpers). A failure to run the check counts as
-    "running": the answer must be known before the storage is written.
-    The pgrep command can be replaced with CLAUDE_ACCOUNT_MOVE_PGREP (tests).
-    """
-    cmd = os.environ.get("CLAUDE_ACCOUNT_MOVE_PGREP", "pgrep")
-    for args in APP_PATTERNS:
-        try:
-            r = subprocess.run([cmd] + list(args), capture_output=True)
-        except OSError:
-            return True
-        if r.returncode == 0:
-            return True
-        if r.returncode not in (0, 1):
-            return True
-    return False
+
+def app_blockers_note():
+    """Sentence for a refusal message: what exactly blocks. May be empty."""
+    found = claude_app_blockers()
+    if not found:
+        return ""
+    more = " (+%d more)" % (len(found) - 3) if len(found) > 3 else ""
+    return " Blocking process: " + "; ".join(found[:3]) + more + "."
