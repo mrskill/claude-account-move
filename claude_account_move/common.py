@@ -250,16 +250,31 @@ APP_BUNDLE = "/Applications/Claude.app/Contents/"
 # chrome-native-host by itself, and the crash handler may linger after a quit.
 # Neither one holds the storage, so neither blocks a write.
 NATIVE_HOST = APP_BUNDLE + "Helpers/chrome-native-host"
-CRASHPAD_SUFFIX = "/chrome_crashpad_handler"
-_ARGS_SPLIT_RE = re.compile(r"\s--")
+CRASHPAD = (APP_BUNDLE + "Frameworks/Electron Framework.framework/"
+            "Helpers/chrome_crashpad_handler")
+LINGERING_EXES = (NATIVE_HOST, CRASHPAD)
 
 
-def _lingering_helper(command):
-    """True for a process of the bundle that may outlive the app (see above)."""
-    exe = _ARGS_SPLIT_RE.split(command.strip(), 1)[0].strip()
-    if exe == NATIVE_HOST or exe.startswith(NATIVE_HOST + " "):
+def _ps_value(field, pid):
+    """(rc, text) of `ps -o <field>= -p <pid>`; rc None when ps cannot run."""
+    ps = os.environ.get("CLAUDE_ACCOUNT_MOVE_PS", "ps")
+    try:
+        r = subprocess.run([ps, "-o", field + "=", "-p", pid], capture_output=True)
+    except OSError:
+        return None, ""
+    return r.returncode, r.stdout.decode("utf-8", "replace").strip()
+
+
+def _lingering_helper(pid):
+    """True only when the executable PATH of the process (not its arguments)
+    equals one of LINGERING_EXES, or when the process is gone (ps exit 1).
+    Anything unreadable, empty or cut short ("...") is not lingering."""
+    rc, comm = _ps_value("comm", pid)
+    if rc == 1:
         return True
-    return exe.startswith(APP_BUNDLE) and exe.endswith(CRASHPAD_SUFFIX)
+    if rc != 0 or not comm or comm.endswith("..."):
+        return False
+    return comm in LINGERING_EXES
 
 
 def _short(text, limit=120):
@@ -270,11 +285,13 @@ def claude_app_blockers():
     """Descriptions of what says the Claude app is running; [] when it is not.
 
     Two checks: a process named exactly Claude, and any process started from
-    the app bundle (its helpers), except the helpers that outlive the app
-    (_lingering_helper). A failure to run the check, or an answer that cannot
-    be read, counts as "running": the answer must be known before the storage
-    is written. The process-lookup command can be replaced with
-    CLAUDE_ACCOUNT_MOVE_PGREP (tests).
+    the app bundle (its helpers). The bundle lookup only collects candidate
+    PIDs; a PID is excluded only when its executable path (ps comm, never its
+    arguments) equals chrome-native-host or the bundle crash handler, the
+    helpers that outlive the app (_lingering_helper). A failure to run the
+    check, or an answer that cannot be read, counts as "running": the answer
+    must be known before the storage is written. The lookup commands can be
+    replaced with CLAUDE_ACCOUNT_MOVE_PGREP and CLAUDE_ACCOUNT_MOVE_PS (tests).
     """
     cmd = os.environ.get("CLAUDE_ACCOUNT_MOVE_PGREP", "pgrep")
     found = []
@@ -295,9 +312,8 @@ def claude_app_blockers():
         if not lines:
             found.append("a process of " + APP_BUNDLE)
         for ln in lines:
-            parts = ln.split(None, 1)
-            command = parts[1] if len(parts) == 2 else ln
-            if not _lingering_helper(command):
+            pid = ln.split(None, 1)[0]
+            if not (pid.isdigit() and _lingering_helper(pid)):
                 found.append(_short(ln))
     return found
 
