@@ -84,16 +84,25 @@ def check_sync_agent(heartbeat, max_age_min=SYNC_MAX_AGE_MIN, now=None):
     return ok, "heartbeat %.1f min old (limit %.1f min)" % (age, max_age_min)
 
 
-def check_static_access(index, active_dir, pair_notes=None):
+def check_static_access(index, active_dir, pair_notes=None, pair_source=None):
     extra = " ".join(n for n in (pair_notes or []) if n)
+    where = st.describe_source(pair_source)
+    if where:
+        extra = "; ".join(x for x in (extra, where) if x)
     if not active_dir:
+        if where:
+            return False, ("active pair NOT MEASURED: the pair named in the app log "
+                           "has no folder in the store; %s (use --active-pair "
+                           "ACCOUNT/ORG)" % extra)
         return False, ("active pair NOT MEASURED: the app log names no pair%s "
                        "(use --active-pair ACCOUNT/ORG)" % (": " + extra if extra else ""))
     s = index.stores[STORES[0]]
     if active_dir not in s.dirs:
-        return False, "active pair is not a directory inside the store"
+        return False, ("active pair is not a directory inside the store"
+                       + ("; " + extra if extra else ""))
     if not os.access(active_dir, os.W_OK | os.X_OK):
-        return False, "active pair is not writable by permission bits"
+        return False, ("active pair is not writable by permission bits"
+                       + ("; " + extra if extra else ""))
     return True, ("active pair exists, inside the store, writable by "
                   "permission bits (write not attempted)"
                   + ("; " + extra if extra else ""))
@@ -224,13 +233,21 @@ def check_enotdir(paths):
 
 
 def run_checks(paths, index, tmap, heartbeat=None, sync_max_age_min=SYNC_MAX_AGE_MIN,
-               active_override=None, now_ms=None, identity=None):
-    """List of {"id","name","ok","detail"} plus the active directory used."""
+               active_override=None, now_ms=None, identity=None, pair_source=None):
+    """List of {"id","name","ok","detail"} plus the active directory used.
+
+    `pair_source`, a dict, receives the log file and mention time of the pair.
+    """
+    pair_source = {} if pair_source is None else pair_source
     expected = identity["app"]["value"] if identity else None
     pair_notes = []
-    pair = st.live_pair(paths, account=expected if active_override else None,
+    # Always filter the app log by the expected account: after an account move a
+    # rotated log may name only the other account's pair. When the account is
+    # unknown (identity None or unreadable) `expected` is None and the log is
+    # not filtered, as before.
+    pair = st.live_pair(paths, account=expected,
                         override=active_override, index=index, notes=pair_notes,
-                        auto_account=expected)
+                        auto_account=expected, source=pair_source)
     active_dir = st.pair_dir(paths, pair[0], pair[1]) if pair else None
     stale, empty = check_stale_and_empty(index, tmap, active_dir)
     plan = [
@@ -241,7 +258,7 @@ def run_checks(paths, index, tmap, heartbeat=None, sync_max_age_min=SYNC_MAX_AGE
         ("sync_agent", "sync job heartbeat",
          check_sync_agent(heartbeat, sync_max_age_min)),
         ("static_accessibility", "active pair accessible",
-         check_static_access(index, active_dir, pair_notes)),
+         check_static_access(index, active_dir, pair_notes, pair_source)),
         ("cards_fresh", "app keeps cards fresh",
          check_cards_fresh(index, tmap, active_dir, now_ms)),
         ("enotdir", "active pair writable", check_enotdir(paths)),

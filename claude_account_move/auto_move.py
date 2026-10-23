@@ -547,7 +547,9 @@ def cmd_auto(args, cli):
             out.say(ru.PROBE_START)
             ident = read_identity(paths)
             pair_notes = []
-            pair = st.live_pair(paths, account=ident["app"]["value"] if args.active_pair else None,
+            # Filter the app log by the expected account (a rotated log may name only
+            # the other account's pair); an unreadable account (None) means no filter.
+            pair = st.live_pair(paths, account=ident["app"]["value"],
                                 override=args.active_pair, index=st.scan(paths),
                                 notes=pair_notes, auto_account=ident["app"]["value"],
                                 command="auto")
