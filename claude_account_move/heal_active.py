@@ -165,8 +165,9 @@ def a_real(path):
 
 
 def relative_link_problem(root):
-    """Why moving the tree at `root` would change a relative symlink inside it
-    (one whose target leaves the tree), or None."""
+    """Why the tree at `root` cannot be moved safely, or None. Any symlink in it
+    is refused (a relative symlink may change its target after the move), except
+    a plain sibling name (no slash, not . or ..): that can never leave its folder."""
     errors = []
     for dp, dns, fns in os.walk(root, onerror=errors.append):
         for n in dns + fns:
@@ -174,12 +175,10 @@ def relative_link_problem(root):
             if not os.path.islink(p):
                 continue
             link = os.readlink(p)
-            if os.path.isabs(link):
+            if link and os.sep not in link and link not in (".", ".."):
                 continue
-            rel = os.path.normpath(os.path.join(os.path.relpath(dp, root), link))
-            if rel == ".." or rel.startswith(".." + os.sep):
-                return ("relative symlink %s -> %s points outside the folder and "
-                        "would change its target after the move" % (p, link))
+            return ("relative symlink check: %s -> %s is a symlink inside the folder "
+                    "and could change its target after the move" % (p, link))
     if errors:
         return "cannot read the folder %s completely: %s" % (root, errors[0])
     return None
@@ -313,14 +312,17 @@ def _heal_op(op, step):
     except FileNotFoundError:
         pass
     os.symlink(link_to_a, op["tmp"])
-    step("tmp_made")
     try:
+        step("tmp_made")
         rename_swap(op["target"], op["a_real"])
     except OSError:
-        os.unlink(op["tmp"])
+        try:
+            os.unlink(op["tmp"])
+        except OSError:
+            pass
         raise
-    step("swapped")
-    try:
+    try:                    # from here the disk may have changed: protected
+        step("swapped")
         os.rename(op["tmp"], op["target"])
         step("linked")
         _verify_done(op)
@@ -330,6 +332,18 @@ def _heal_op(op, step):
         except (OSError, Changed) as e2:
             raise RestoreFailed("%s; and restoring it failed: %s" % (exc, e2))
         raise
+
+
+def _restored(op):
+    """None when A is the original symlink and R the original folder again."""
+    la, lr = _lstat(op["path"]), _lstat(op["target"])
+    if la is None or not stat.S_ISLNK(la.st_mode) or os.readlink(op["path"]) != op["link"]:
+        return "%s is not the original symlink" % op["path"]
+    if not _same_dir(lr, op):
+        return "%s is not the original folder" % op["target"]
+    if os.path.realpath(op["path"]) != op["target"]:
+        return "%s does not resolve to %s again" % (op["path"], op["target"])
+    return None
 
 
 def _undo_op(op):
@@ -390,11 +404,19 @@ def apply(paths, rows):
                     d["step"] = "undone"
                 except (OSError, Changed) as e2:
                     errors.append("%s / %s: %s" % (d["path"], d["target"], e2))
+            touched = done + ([op] if op["step"] != "planned" else [])
+            for d in touched:                   # the rollback must be proven
+                bad = _restored(d)
+                if bad and not any(bad in e for e in errors):
+                    errors.append("not restored: " + bad)
             msg = "%s: %s: %s" % (op["store"], op["path"], exc)
             if errors:
                 doc["status"] = "failed"
                 doc["errors"] = errors
-                _save_journal(paths, doc)
+                try:
+                    _save_journal(paths, doc)
+                except OSError:
+                    pass
                 return [], msg, errors
             _drop_journal(paths)
             return [], msg, []
@@ -508,31 +530,45 @@ def log_events(paths):
 
 
 def plan_from_log(paths, now=None):
-    """(rows, notes): rows for the pairs named by an ENOTDIR line of the last 10
-    minutes, newer than the last account change, not overtaken by a later
-    non-error line naming another pair, and still a symlink."""
+    """(rows, notes). At most ONE pair is healed: the current one, taken from the
+    newest line of the log (of any kind) that names a sessions-store pair and is
+    newer than the last account change. It is healed only if an ENOTDIR line of
+    the last 10 minutes names it and it is still a symlink. Every other pair is
+    never touched."""
     now = time.time() if now is None else now
     ev = log_events(paths)
     last_acct = max([i for i, e in enumerate(ev) if e["kind"] == "acct"] or [-1])
-    notes, cands = [], {}
-    for i, e in enumerate(ev):
-        if i <= last_acct or e["kind"] != "error" or not e["enotdir"]:
+    named = [e for i, e in enumerate(ev) if i > last_acct and e["kind"] != "acct"]
+    if not named:
+        return [], ["no line of the app log names a pair after the last account "
+                    "change: nothing to heal"]
+    cur = named[-1]["pairs"][-1][1:]
+    stores, others, notes = set(), set(), []
+    for e in named:
+        if e["kind"] != "error" or not e["enotdir"] or e["ts"] is None \
+                or now - e["ts"] >= FROM_LOG_MAX_AGE_S:
             continue
-        if e["ts"] is None or now - e["ts"] >= FROM_LOG_MAX_AGE_S:
-            continue
-        later = [x for x in ev[i + 1:] if x["kind"] == "ok"]
-        newest = later[-1]["pairs"][-1][1:] if later else None
         for sto, acc, org in e["pairs"]:
-            if newest and newest != (acc, org):
-                notes.append("skipped %s/%s: the app wrote to %s/%s after the error"
-                             % (acc, org, newest[0], newest[1]))
-                continue
-            cands[(sto, acc, org)] = i
-    oks = [x for x in ev[last_acct + 1:] if x["kind"] == "ok"]
-    current = oks[-1]["pairs"][-1][1:] if oks else None
+            if (acc, org) == cur:
+                stores.add(sto)
+            else:
+                others.add((acc, org))
+    for acc, org in sorted(others):
+        notes.append("skipped %s/%s: the current pair is %s/%s" % (acc, org, cur[0], cur[1]))
     rows = []
-    for (sto, acc, org) in sorted(cands):
-        r = plan_store(paths, sto, (acc, org))
+    for sto in sorted(stores):
+        r = plan_store(paths, sto, cur)
         if r["state"] in ("heal", "refuse"):
             rows.append(r)
-    return dedupe(rows, current), notes
+    oks = [e for e in named if e["kind"] == "ok"]
+    confirmed = oks[-1]["pairs"][-1][1:] if oks else None
+    for r in rows:
+        if r["state"] != "heal" or confirmed == cur:
+            continue
+        for acc, org in sorted(others):     # an unconfirmed pair sharing the folder
+            o = plan_store(paths, r["store"], (acc, org))
+            if o["state"] == "heal" and o["target"] == r["target"]:
+                r.update(state="refuse", reason="pairs %s/%s and %s/%s share the "
+                         "folder %s and the current one is not confirmed by a write"
+                         % (cur[0], cur[1], acc, org, r["target"]))
+    return rows, notes

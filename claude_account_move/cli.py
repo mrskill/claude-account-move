@@ -457,9 +457,35 @@ def _cmd_finish(args, out):
 
 
 def _symlink_guard(paths, args, report, code):
-    """A symlinked active pair makes every card write fail (ENOTDIR): not ok."""
-    pair = heal_active.active_pair(paths, read_identity(paths), args.active_pair)[0]
-    bad = heal_active.symlinked(paths, pair) if pair else []
+    """A symlinked active pair makes every card write fail (ENOTDIR): not ok.
+
+    The pairs checked are the one the delivery check used (the app log) and the
+    one heal-active would choose. If neither can be determined the check FAILS.
+    """
+    ident = read_identity(paths)
+    target = ident["app"]["value"]
+    pairs = []
+    chosen = heal_active.active_pair(paths, ident, args.active_pair)[0]
+    if chosen:
+        pairs.append(chosen)
+    try:
+        live = st.live_pair(paths, account=target, override=args.active_pair)
+    except st.PairError:
+        live = None
+    if live and tuple(live) not in [tuple(p) for p in pairs]:
+        pairs.append(live)
+    if not pairs:
+        report["checks"].append({
+            "id": "active_pair_real", "name": "active pair is a real directory",
+            "ok": False, "detail": "the active account/organization pair cannot be "
+            "determined, so its writability is not proven; run again with "
+            "--active-pair ACCOUNT/ORG"})
+        return EXIT_FAIL
+    bad = []
+    for pair in pairs:
+        for item in heal_active.symlinked(paths, pair):
+            if item not in bad:
+                bad.append(item)
     if not bad:
         return code
     detail = ("; ".join("%s: %s is a symlink" % (s, p) for s, p in bad)
@@ -468,7 +494,7 @@ def _symlink_guard(paths, args, report, code):
               "finish again.")
     report["checks"].append({"id": "active_pair_real", "name": "active pair is a real directory",
                              "ok": False, "detail": detail})
-    return EXIT_FAIL if code != EXIT_FAIL else code
+    return EXIT_FAIL
 
 
 def cmd_heal_active(args):

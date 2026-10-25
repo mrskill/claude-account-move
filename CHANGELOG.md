@@ -35,3 +35,10 @@
   is re-checked (type, inode, link) before each step, and a step journal in the
   state directory lets the next run recover an interrupted heal; a failed
   rollback is reported with its paths and a non-zero exit.
+- `heal-active --from-log` heals at most one pair per tick: the one named by the
+  newest log line of any kind (after the last account change), and only when an
+  ENOTDIR line of the last 10 minutes names it. Older pairs are never touched.
+  Any symlink inside the moved folder is refused (except a plain sibling name).
+  The journal step after the swap is inside the protected block and a rollback
+  is verified before it is reported. `finish` checks the delivery pair and the
+  heal-active pair, and fails when no pair can be determined.
