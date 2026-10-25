@@ -20,9 +20,10 @@ Russian version: [README.ru.md](README.ru.md)
 | `finish` | after you signed in to the app and ran `claude /login` | Waits until the CLI account equals the app account, then compares the storage with the snapshot of THIS move and prints a verdict. |
 | `sync` | optional repair | Copies session cards that are missing in the new account's folder. Dry run by default (it prints the files). `sync --apply` adds files and `sync --undo` removes exactly the files a journal proves were added. |
 | `stamp` | optional, see below | Puts the date and time of the last real message into the title of every session. Dry run by default (it lists "was -> will be"). `stamp --apply` writes, `stamp --undo` restores the cards byte for byte. |
+| `heal-active` | optional repair, app quit | If the active folder `<store>/<account>/<org>` is a symlink (the app reads it but every card write fails with ENOTDIR), turns it into a real directory: removes the link, moves the real folder there and leaves a link at its old path. Dry run by default, `--apply` writes, refuses while the app runs, all stores or none. `finish` fails (exit `3`) while the active folder is a symlink, `prepare` fails on a recent ENOTDIR line for a symlinked folder, and `auto` runs it before `finish`. |
 | `auto` | the whole move in one run | Quit-the-app wait, `prepare`, a write probe, `stamp --apply`, waits for the new login, `finish`, `sync --apply` only when needed, a plain-Russian summary. See "One-click move (auto)". |
 
-`sync --apply`, `sync --undo`, `stamp --apply` and `stamp --undo` are the only
+`sync --apply`, `sync --undo`, `stamp --apply`, `stamp --undo` and `heal-active --apply` are the only
 operations that write into the Claude storage.
 
 The checks, all judged by names and ids recorded before the move, not by counts

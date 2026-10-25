@@ -505,6 +505,23 @@ def cmd_auto(args, cli):
                         ru.LOGIN_TIMEOUT % ru.LOGIN_REASON.get(reason, reason),
                         show_summary=True, login_reason=reason)
 
+        # 5b. the active pair must be a real directory (the app cannot save into
+        # a symlinked one); the app has to be quit for the move of the folder
+        out.say(ru.HEAL_START)
+        hcode, hrep = run_step(cli.cmd_heal_active, _ns(args, apply=True))
+        if hcode != EXIT_OK and (hrep or {}).get("verdict") == "app_running":
+            out.say(ru.HEAL_QUIT)
+            if wait_app_closed(args.wait_close, _poll(
+                    CLOSE_POLL_S, "CLAUDE_ACCOUNT_MOVE_CLOSE_POLL_S"), out):
+                hcode, hrep = run_step(cli.cmd_heal_active, _ns(args, apply=True))
+        step("heal_active", hcode == EXIT_OK, exit_code=hcode,
+             verdict=(hrep or {}).get("verdict"))
+        if hcode != EXIT_OK:
+            ctx["problem"] = ru.PROBLEM_STEP
+            return stop(hcode, "heal_failed", ru.HEAL_FAIL % (
+                hcode, (hrep or {}).get("reason") or (hrep or {}).get("verdict")),
+                show_summary=True)
+
         # 6. finish (and sync when only deliverable names are missing)
         out.say(ru.FINISH_START)
 
