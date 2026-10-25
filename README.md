@@ -140,7 +140,7 @@ sign-in.
 `deploy/com.neurovision.heal-active.plist` runs `heal-active --from-log --apply`
 every 60 seconds and logs to `~/.claude/hooks/state/heal-active.log`. Install it
 yourself (the tool never does), with `claude-account-move` linked into
-`/usr/local/bin`: create the state directory, copy the plist into your user
+`$HOME/MEGAsync/Private/Work/claude-account-move`: create the state directory, copy the plist into your user
 LaunchAgents folder and load it with `launchctl load`.
 
 ## A move, step by step

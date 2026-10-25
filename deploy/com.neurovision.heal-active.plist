@@ -8,7 +8,7 @@
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>exec /usr/local/bin/claude-account-move heal-active --from-log --apply &gt;&gt; "$HOME/.claude/hooks/state/heal-active.log" 2&gt;&amp;1</string>
+    <string>exec "$HOME/MEGAsync/Private/Work/claude-account-move/claude-account-move" heal-active --from-log --apply &gt;&gt; "$HOME/.claude/hooks/state/heal-active.log" 2&gt;&amp;1</string>
   </array>
   <key>StartInterval</key>
   <integer>60</integer>
