@@ -508,12 +508,12 @@ def cmd_auto(args, cli):
         # 5b. the active pair must be a real directory (the app cannot save into
         # a symlinked one); the app has to be quit for the move of the folder
         out.say(ru.HEAL_START)
-        hcode, hrep = run_step(cli.cmd_heal_active, _ns(args, apply=True))
+        hcode, hrep = run_step(cli.cmd_heal_active, _ns(args, apply=True, from_log=False))
         if hcode != EXIT_OK and (hrep or {}).get("verdict") == "app_running":
             out.say(ru.HEAL_QUIT)
             if wait_app_closed(args.wait_close, _poll(
                     CLOSE_POLL_S, "CLAUDE_ACCOUNT_MOVE_CLOSE_POLL_S"), out):
-                hcode, hrep = run_step(cli.cmd_heal_active, _ns(args, apply=True))
+                hcode, hrep = run_step(cli.cmd_heal_active, _ns(args, apply=True, from_log=False))
         step("heal_active", hcode == EXIT_OK, exit_code=hcode,
              verdict=(hrep or {}).get("verdict"))
         if hcode != EXIT_OK:

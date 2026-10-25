@@ -16,3 +16,11 @@
 - `auto` runs `heal-active` after the login and before `finish`.
 - `prepare` fails readiness (exit `3`) on an ENOTDIR line in `main.log` from the
   last 2 days that names a pair which is still a symlink.
+- `heal-active` takes the active pair from the app log first (newest save, read
+  or ENOTDIR line after the last "account changed" line), else the app account
+  with an organization that exists in the store; it never combines the app
+  account with the CLI organization unchecked, and refuses naming the sources
+  when they disagree.
+- `heal-active --from-log` heals every pair named by an ENOTDIR line of the last
+  10 minutes that is still a symlink, and may run while the app runs.
+- Added `deploy/com.neurovision.heal-active.plist` (launchd, every 60 seconds).

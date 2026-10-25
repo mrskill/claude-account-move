@@ -150,6 +150,10 @@ def build_parser():
                        "when it is a symlink (dry run; writes with --apply)")
     add_common(h)
     h.add_argument("--apply", action="store_true", help="really move (default: dry run)")
+    h.add_argument("--from-log", action="store_true",
+                   help="heal every pair named by an ENOTDIR line of the last 10 "
+                   "minutes that is still a symlink; allowed while the app runs "
+                   "(for the launchd agent)")
     a = sub.add_parser("auto", help="the whole move in one run: prepare, stamp, wait for "
                        "login, heal-active, finish, sync if needed (writes)")
     add_common(a)
@@ -453,7 +457,7 @@ def _cmd_finish(args, out):
 
 def _symlink_guard(paths, args, report, code):
     """A symlinked active pair makes every card write fail (ENOTDIR): not ok."""
-    pair = heal_active.active_pair(paths, read_identity(paths), args.active_pair)
+    pair = heal_active.active_pair(paths, read_identity(paths), args.active_pair)[0]
     bad = heal_active.symlinked(paths, pair) if pair else []
     if not bad:
         return code
@@ -479,18 +483,23 @@ def cmd_heal_active(args):
     if not os.path.isdir(paths.support):
         return fail(args, out, "heal-active", started, EXIT_NO_STORE, "no_store",
                     "storage not found: %s" % paths.support)
-    if args.apply and common.claude_app_running():
+    if args.apply and not args.from_log and common.claude_app_running():
         return fail(args, out, "heal-active", started, EXIT_FAIL, "app_running",
                     "Quit the Claude app first (Cmd+Q), then run this command "
                     "again: heal-active moves a folder the app keeps open."
                     + common.app_blockers_note())
-    pair = heal_active.active_pair(paths, read_identity(paths), args.active_pair)
-    if not pair:
-        return fail(args, out, "heal-active", started, EXIT_FAIL, "no_active_pair",
-                    "cannot tell the active account/organization pair; sign in "
-                    "or pass --active-pair ACCOUNT/ORG")
-    rows = heal_active.plan(paths, pair)
-    label = "%s/%s" % pair
+    if args.from_log:
+        rows = heal_active.plan_from_log(paths)
+        pair, label = None, "from the app log (ENOTDIR lines of the last 10 minutes)"
+    else:
+        pair, source, problem = heal_active.active_pair(
+            paths, read_identity(paths), args.active_pair)
+        if not pair:
+            return fail(args, out, "heal-active", started, EXIT_FAIL, "no_active_pair",
+                        "cannot tell the active account/organization pair: %s"
+                        % (problem or "unknown"))
+        rows = heal_active.plan(paths, pair)
+        label = "%s/%s (from %s)" % (pair[0], pair[1], source)
     out.say("active pair: %s" % label)
     refused = [r for r in rows if r["state"] == "refuse"]
     for r in rows:
@@ -528,8 +537,7 @@ def cmd_heal_active(args):
     if err:
         return fail(args, out, "heal-active", started, EXIT_FAIL, "failed",
                     "heal failed, everything was rolled back: " + err, **base)
-    after = [heal_active.plan_store(paths, r["store"], pair)["state"] for r in done]
-    ok = all(x == "real" for x in after)
+    ok = all(not os.path.islink(r["path"]) and os.path.isdir(r["path"]) for r in done)
     out.say("healed %d store(s): the active pair is now a real directory. "
             "Start the Claude app again." % len(done))
     code = EXIT_OK if ok else EXIT_FAIL

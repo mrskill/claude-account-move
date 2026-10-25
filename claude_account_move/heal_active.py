@@ -16,26 +16,85 @@ from . import store as st
 from .common import STORES, UUID_RE, inside
 
 ENOTDIR_MAX_AGE_S = 2 * 24 * 3600
+FROM_LOG_MAX_AGE_S = 10 * 60
 LOG_TAIL_BYTES = 8 * 1024 * 1024
 _LINE_TS = re.compile(r"^\s*\[?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
 _PAIR_PATH = re.compile(r"(claude-code-sessions|local-agent-mode-sessions)/"
                         r"([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})")
 
 
-def active_pair(paths, identity, override=None):
-    """(acc, org) of the active pair: --active-pair, else app account + CLI
-    organization, else the last pair of that account in the app log; or None."""
-    if override:
-        return st.parse_override(override)
-    acc = identity["app"]["value"]
-    org = identity.get("cli_org")
-    if acc and org:
-        return acc.lower(), org.lower()
-    if acc:
-        hits = st.app_pairs(paths, acc)
+_LOG_KEYS = ("enotdir", "save", "saved", "read", "load")
+
+
+def _log_text(paths):
+    try:
+        with open(paths.main_log, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - LOG_TAIL_BYTES))
+            return fh.read().decode("utf-8", "ignore")
+    except OSError:
+        return ""
+
+
+def log_pair(paths):
+    """(acc, org) of the newest save/read/ENOTDIR line that names a sessions
+    store path and is newer than the newest "account changed" line; or None."""
+    cand = None
+    for line in _log_text(paths).splitlines():
+        low = line.lower()
+        if "account changed" in low:
+            cand = None
+            continue
+        if not any(k in low for k in _LOG_KEYS):
+            continue
+        hits = [(a.lower(), o.lower()) for _s, a, o in _PAIR_PATH.findall(line)
+                if UUID_RE.match(a) and UUID_RE.match(o)]
         if hits:
-            return hits[-1]
-    return None
+            cand = hits[-1]
+    return cand
+
+
+def _orgs_under(paths, acc):
+    orgs = set()
+    for store in STORES:
+        base = os.path.join(paths.support, store, acc)
+        try:
+            names = os.listdir(base)
+        except OSError:
+            continue
+        orgs.update(n.lower() for n in names if UUID_RE.match(n))
+    return sorted(orgs)
+
+
+def active_pair(paths, identity, override=None):
+    """(pair, source, problem). The pair is --active-pair, else the pair the app
+    log names last (when its account is the app account), else the app account
+    with an organization that exists under it in the store (the CLI one when it
+    exists there, else the only one). When the sources disagree: pair None and
+    a problem text naming them."""
+    if override:
+        return st.parse_override(override), "--active-pair", None
+    acc = identity["app"]["value"]
+    acc = acc.lower() if acc else None
+    cli_org = identity.get("cli_org")
+    cli_org = cli_org.lower() if cli_org else None
+    lp = log_pair(paths)
+    if lp and (acc is None or lp[0] == acc):
+        return lp, "app log", None
+    if not acc:
+        return None, None, ("the app account is not readable and the app log names "
+                            "no usable pair")
+    orgs = _orgs_under(paths, acc)
+    if cli_org and cli_org in orgs:
+        return (acc, cli_org), "app account + CLI organization", None
+    if len(orgs) == 1:
+        return (acc, orgs[0]), "app account + its only organization", None
+    return None, None, (
+        "sources disagree, not guessing: app account %s; CLI organization %s; "
+        "organizations that exist under that account: %s; app log pair: %s. "
+        "Pass --active-pair ACCOUNT/ORG"
+        % (acc, cli_org or "none", ", ".join(orgs) or "none",
+           "%s/%s" % lp if lp else "none"))
 
 
 def pair_path(paths, store, pair):
@@ -124,17 +183,11 @@ def apply(rows):
     return done, None
 
 
-def recent_enotdir(paths, now=None):
+def recent_enotdir(paths, now=None, max_age_s=ENOTDIR_MAX_AGE_S):
     """[(store, path, line)] of ENOTDIR lines of the last 2 days in main.log
     that name a sessions-store pair which is still a symlink."""
     now = time.time() if now is None else now
-    try:
-        with open(paths.main_log, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            fh.seek(max(0, fh.tell() - LOG_TAIL_BYTES))
-            text = fh.read().decode("utf-8", "ignore")
-    except OSError:
-        return []
+    text = _log_text(paths)
     found, seen = [], set()
     for line in text.splitlines():
         if "ENOTDIR" not in line:
@@ -147,7 +200,7 @@ def recent_enotdir(paths, now=None):
                                            "%Y-%m-%d %H:%M:%S"))
         except (ValueError, OverflowError):
             continue
-        if now - ts >= ENOTDIR_MAX_AGE_S:
+        if now - ts >= max_age_s:
             continue
         for store, acc, org in _PAIR_PATH.findall(line):
             if not (UUID_RE.match(acc) and UUID_RE.match(org)):
@@ -157,3 +210,13 @@ def recent_enotdir(paths, now=None):
                 seen.add(p)
                 found.append((store, p, line.strip()[:160]))
     return found
+
+
+def plan_from_log(paths, now=None):
+    """Rows for every pair named by an ENOTDIR line of the last 10 minutes that
+    is still a symlink."""
+    rows = []
+    for store, path, _line in recent_enotdir(paths, now, FROM_LOG_MAX_AGE_S):
+        acc, org = path.split(os.sep)[-2:]
+        rows.append(plan_store(paths, store, (acc.lower(), org.lower())))
+    return rows
