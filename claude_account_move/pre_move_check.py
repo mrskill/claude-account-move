@@ -208,6 +208,17 @@ def check_settings(paths):
                   else "settings readable (permissions and hooks digested)")
 
 
+def check_enotdir(paths):
+    """No recent write failure (ENOTDIR) on a pair that is still a symlink."""
+    from . import heal_active
+    hits = heal_active.recent_enotdir(paths)
+    if not hits:
+        return True, "no ENOTDIR in the last 2 days for a symlinked pair"
+    return False, ("ENOTDIR (the app cannot save cards): %s. Quit the Claude app "
+                   "and run `heal-active --apply`"
+                   % "; ".join("%s: %s" % (s, p) for s, p, _l in hits[:5]))
+
+
 def run_checks(paths, index, tmap, heartbeat=None, sync_max_age_min=SYNC_MAX_AGE_MIN,
                active_override=None, now_ms=None, identity=None):
     """List of {"id","name","ok","detail"} plus the active directory used."""
@@ -229,6 +240,7 @@ def run_checks(paths, index, tmap, heartbeat=None, sync_max_age_min=SYNC_MAX_AGE
          check_static_access(index, active_dir, pair_notes)),
         ("cards_fresh", "app keeps cards fresh",
          check_cards_fresh(index, tmap, active_dir, now_ms)),
+        ("enotdir", "active pair writable", check_enotdir(paths)),
         ("zombies", "no deleted-but-alive sessions", check_zombies(index)),
         ("stale_copies", "active pair holds newest copies", stale),
         ("empty_cid_live", "no lost cliSessionId", empty),

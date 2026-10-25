@@ -9,9 +9,12 @@ finish   after signing in to the app and running `claude /login`: waits until
 sync     optional repair: copy missing cards into the target pair (writes).
 repair   optional repair: rebind target cards bound to a session other than the one
          the move snapshot recorded (dry run; writes with --apply).
+heal-active  optional repair: turn a symlinked active pair into a real directory
+         (dry run; writes with --apply; the app must be quit).
 stamp    optional: last-message time into every session title (writes with --apply).
 """
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -23,6 +26,7 @@ from . import post_move_check as post
 from . import pre_move_check as pre
 from . import store as st
 from . import common
+from . import heal_active
 from . import post_move_verify as verify
 from . import progress as prog
 from . import repair_cards
@@ -143,8 +147,16 @@ def build_parser():
     r.add_argument("--undo", metavar="JOURNAL", help="restore the cards a journal replaced")
     r.add_argument("--move-id", help="use this snapshot instead of the newest ready one")
     r.add_argument("--max-age-hours", type=float, default=72.0)
+    h = sub.add_parser("heal-active", help="make the active pair a real directory "
+                       "when it is a symlink (dry run; writes with --apply)")
+    add_common(h)
+    h.add_argument("--apply", action="store_true", help="really move (default: dry run)")
+    h.add_argument("--from-log", action="store_true",
+                   help="heal every pair named by an ENOTDIR line of the last 10 "
+                   "minutes that is still a symlink; allowed while the app runs "
+                   "(for the launchd agent)")
     a = sub.add_parser("auto", help="the whole move in one run: prepare, stamp, wait for "
-                       "login, finish, sync if needed (writes)")
+                       "login, heal-active, finish, sync if needed (writes)")
     add_common(a)
     a.add_argument("--new-move", action="store_true",
                    help="do not resume an unfinished move: start a new one")
@@ -422,6 +434,7 @@ def _cmd_finish(args, out):
         break
     pg.step("done")
     pg.close()
+    code = _symlink_guard(paths, args, report, code)
     if args.allow_unready_baseline and code == EXIT_OK and not man.get("ready"):
         code = EXIT_FAIL
     out.say("checks:")
@@ -440,6 +453,153 @@ def _cmd_finish(args, out):
                   pairs_physical=sum(len(s.dirs) for s in index.stores.values()),
                   transcripts=len(tmap), **report)
     emit(args, out, rep, mdir)
+    return code
+
+
+def _symlink_guard(paths, args, report, code):
+    """A symlinked active pair makes every card write fail (ENOTDIR): not ok.
+
+    The pairs checked are the one the delivery check used (the app log) and the
+    one heal-active would choose. If neither can be determined the check FAILS.
+    """
+    ident = read_identity(paths)
+    target = ident["app"]["value"]
+    pairs = []
+    chosen = heal_active.active_pair(paths, ident, args.active_pair)[0]
+    if chosen:
+        pairs.append(chosen)
+    try:
+        live = st.live_pair(paths, account=target, override=args.active_pair)
+    except st.PairError:
+        live = None
+    if live and tuple(live) not in [tuple(p) for p in pairs]:
+        pairs.append(live)
+    if not pairs:
+        report["checks"].append({
+            "id": "active_pair_real", "name": "active pair is a real directory",
+            "ok": False, "detail": "the active account/organization pair cannot be "
+            "determined, so its writability is not proven; run again with "
+            "--active-pair ACCOUNT/ORG"})
+        return EXIT_FAIL
+    bad = []
+    for pair in pairs:
+        for item in heal_active.symlinked(paths, pair):
+            if item not in bad:
+                bad.append(item)
+    if not bad:
+        return code
+    detail = ("; ".join("%s: %s is a symlink" % (s, p) for s, p in bad)
+              + ". The app cannot save new session cards there (ENOTDIR). Quit "
+              "the Claude app (Cmd+Q) and run `heal-active --apply`, then run "
+              "finish again.")
+    report["checks"].append({"id": "active_pair_real", "name": "active pair is a real directory",
+                             "ok": False, "detail": detail})
+    return EXIT_FAIL
+
+
+def cmd_heal_active(args):
+    started = time.monotonic()
+    out = Out.of(args)
+    paths = make_paths(args)
+    prob = state_dir_problem(paths)
+    if prob:
+        return fail(args, out, "heal-active", started, EXIT_INPUT, "input_error",
+                    "error: " + prob)
+    if args.active_pair:
+        st.parse_override(args.active_pair)
+    if not os.path.isdir(paths.support):
+        return fail(args, out, "heal-active", started, EXIT_NO_STORE, "no_store",
+                    "storage not found: %s" % paths.support)
+    if args.apply and not args.from_log and common.claude_app_running():
+        return fail(args, out, "heal-active", started, EXIT_FAIL, "app_running",
+                    "Quit the Claude app first (Cmd+Q), then run this command "
+                    "again: heal-active moves a folder the app keeps open."
+                    + common.app_blockers_note())
+    with (write_lock(paths) if args.apply else contextlib.nullcontext()):
+        return _heal_locked(args, out, paths, started)
+
+
+def _heal_locked(args, out, paths, started):
+    """The plan is built after the lock is taken, so it is never stale."""
+    jp = heal_active.journal_path(paths)
+    if args.apply:
+        msgs, errs = heal_active.recover(paths)
+        for m in msgs:
+            out.say(m)
+        if errs:
+            return fail(args, out, "heal-active", started, EXIT_FAIL, "recovery_failed",
+                        "an unfinished heal could not be settled: " + "; ".join(errs),
+                        journal=jp)
+    elif os.path.exists(jp):
+        out.say("note: an unfinished heal journal exists (%s); the next --apply "
+                "settles it first" % jp)
+    notes = []
+    if args.from_log:
+        rows, notes = heal_active.plan_from_log(paths)
+        pair, label = None, "from the app log (ENOTDIR lines of the last 10 minutes)"
+    else:
+        pair, source, problem = heal_active.active_pair(
+            paths, read_identity(paths), args.active_pair)
+        if not pair:
+            return fail(args, out, "heal-active", started, EXIT_FAIL, "no_active_pair",
+                        "cannot tell the active account/organization pair: %s"
+                        % (problem or "unknown"))
+        rows = heal_active.plan(paths, pair)
+        label = "%s/%s (from %s)" % (pair[0], pair[1], source)
+    out.say("active pair: %s" % label)
+    for n in notes:
+        out.say("  " + n)
+    refused = [r for r in rows if r["state"] == "refuse"]
+    for r in rows:
+        if r["state"] == "heal":
+            out.say("  %s: %s is a symlink to %s: would swap the folder into place "
+                    "and leave a link at its old path"
+                    % (r["store"], r["path"], r["target"]))
+        elif r["state"] == "refuse":
+            out.say("  %s: %s: REFUSED: %s" % (r["store"], r["path"], r["reason"]))
+        else:
+            out.say("  %s: %s: %s, nothing to do" % (
+                r["store"], r["path"],
+                "a real directory" if r["state"] == "real" else "absent"))
+    base = dict(active_pair=label, skipped=notes, stores=[
+        {k: r.get(k) for k in ("store", "path", "state", "target", "reason")}
+        for r in rows])
+    if refused:
+        return fail(args, out, "heal-active", started, EXIT_FAIL, "refused",
+                    "refused, nothing was changed: " + "; ".join(
+                        "%s: %s" % (r["store"], r["reason"]) for r in refused), **base)
+    todo = [r for r in rows if r["state"] == "heal"]
+    if not todo:
+        out.say("nothing to do: the active pair is not a symlink")
+        emit(args, out, _report("heal-active", EXIT_OK, "nothing_to_do", started,
+                                write_verified=False, **base))
+        return EXIT_OK
+    if not heal_active.swap_supported():
+        return fail(args, out, "heal-active", started, EXIT_FAIL, "refused",
+                    "refused, nothing was changed: the atomic exchange of two paths "
+                    "(renamex_np RENAME_SWAP) is not available on this system", **base)
+    if not args.apply:
+        out.say("dry run: nothing was changed. Quit the Claude app, then run with "
+                "--apply to heal.")
+        emit(args, out, _report("heal-active", EXIT_OK, "dry_run", started,
+                                write_verified=False, **base))
+        return EXIT_OK
+    done, err, rb = heal_active.apply(paths, todo)
+    if rb:
+        return fail(args, out, "heal-active", started, EXIT_FAIL, "rollback_failed",
+                    "heal failed (%s) and the rollback FAILED, the disk is partly "
+                    "changed: %s. Journal kept: %s" % (err, "; ".join(rb), jp),
+                    journal=jp, rollback_errors=rb, **base)
+    if err:
+        return fail(args, out, "heal-active", started, EXIT_FAIL, "failed",
+                    "heal failed, everything was rolled back (verified): " + err, **base)
+    ok = all(not os.path.islink(r["path"]) and os.path.isdir(r["path"]) for r in done)
+    out.say("healed %d store(s): the active pair is now a real directory. "
+            "Start the Claude app again." % len(done))
+    code = EXIT_OK if ok else EXIT_FAIL
+    emit(args, out, _report("heal-active", code, "healed" if ok else "fail", started,
+                            healed=[r["store"] for r in done], write_verified=ok,
+                            **base))
     return code
 
 
@@ -811,7 +971,7 @@ def _run(args):
     try:
         return {"prepare": cmd_prepare, "finish": cmd_finish,
                 "sync": cmd_sync, "repair": cmd_repair, "stamp": cmd_stamp,
-                "auto": cmd_auto}[args.command](args)
+                "heal-active": cmd_heal_active, "auto": cmd_auto}[args.command](args)
     except st.PairError as exc:
         return fail(args, Out.of(args), args.command, started, EXIT_INPUT,
                     "input_error", "error: %s" % exc)
