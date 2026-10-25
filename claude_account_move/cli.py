@@ -14,6 +14,7 @@ heal-active  optional repair: turn a symlinked active pair into a real directory
 stamp    optional: last-message time into every session title (writes with --apply).
 """
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -488,8 +489,27 @@ def cmd_heal_active(args):
                     "Quit the Claude app first (Cmd+Q), then run this command "
                     "again: heal-active moves a folder the app keeps open."
                     + common.app_blockers_note())
+    with (write_lock(paths) if args.apply else contextlib.nullcontext()):
+        return _heal_locked(args, out, paths, started)
+
+
+def _heal_locked(args, out, paths, started):
+    """The plan is built after the lock is taken, so it is never stale."""
+    jp = heal_active.journal_path(paths)
+    if args.apply:
+        msgs, errs = heal_active.recover(paths)
+        for m in msgs:
+            out.say(m)
+        if errs:
+            return fail(args, out, "heal-active", started, EXIT_FAIL, "recovery_failed",
+                        "an unfinished heal could not be settled: " + "; ".join(errs),
+                        journal=jp)
+    elif os.path.exists(jp):
+        out.say("note: an unfinished heal journal exists (%s); the next --apply "
+                "settles it first" % jp)
+    notes = []
     if args.from_log:
-        rows = heal_active.plan_from_log(paths)
+        rows, notes = heal_active.plan_from_log(paths)
         pair, label = None, "from the app log (ENOTDIR lines of the last 10 minutes)"
     else:
         pair, source, problem = heal_active.active_pair(
@@ -501,11 +521,13 @@ def cmd_heal_active(args):
         rows = heal_active.plan(paths, pair)
         label = "%s/%s (from %s)" % (pair[0], pair[1], source)
     out.say("active pair: %s" % label)
+    for n in notes:
+        out.say("  " + n)
     refused = [r for r in rows if r["state"] == "refuse"]
     for r in rows:
         if r["state"] == "heal":
-            out.say("  %s: %s is a symlink to %s: would remove the link, move that "
-                    "folder here and leave a link at its old path"
+            out.say("  %s: %s is a symlink to %s: would swap the folder into place "
+                    "and leave a link at its old path"
                     % (r["store"], r["path"], r["target"]))
         elif r["state"] == "refuse":
             out.say("  %s: %s: REFUSED: %s" % (r["store"], r["path"], r["reason"]))
@@ -513,7 +535,7 @@ def cmd_heal_active(args):
             out.say("  %s: %s: %s, nothing to do" % (
                 r["store"], r["path"],
                 "a real directory" if r["state"] == "real" else "absent"))
-    base = dict(active_pair=label, stores=[
+    base = dict(active_pair=label, skipped=notes, stores=[
         {k: r.get(k) for k in ("store", "path", "state", "target", "reason")}
         for r in rows])
     if refused:
@@ -526,17 +548,25 @@ def cmd_heal_active(args):
         emit(args, out, _report("heal-active", EXIT_OK, "nothing_to_do", started,
                                 write_verified=False, **base))
         return EXIT_OK
+    if not heal_active.swap_supported():
+        return fail(args, out, "heal-active", started, EXIT_FAIL, "refused",
+                    "refused, nothing was changed: the atomic exchange of two paths "
+                    "(renamex_np RENAME_SWAP) is not available on this system", **base)
     if not args.apply:
         out.say("dry run: nothing was changed. Quit the Claude app, then run with "
                 "--apply to heal.")
         emit(args, out, _report("heal-active", EXIT_OK, "dry_run", started,
                                 write_verified=False, **base))
         return EXIT_OK
-    with write_lock(paths):
-        done, err = heal_active.apply(todo)
+    done, err, rb = heal_active.apply(paths, todo)
+    if rb:
+        return fail(args, out, "heal-active", started, EXIT_FAIL, "rollback_failed",
+                    "heal failed (%s) and the rollback FAILED, the disk is partly "
+                    "changed: %s. Journal kept: %s" % (err, "; ".join(rb), jp),
+                    journal=jp, rollback_errors=rb, **base)
     if err:
         return fail(args, out, "heal-active", started, EXIT_FAIL, "failed",
-                    "heal failed, everything was rolled back: " + err, **base)
+                    "heal failed, everything was rolled back (verified): " + err, **base)
     ok = all(not os.path.islink(r["path"]) and os.path.isdir(r["path"]) for r in done)
     out.say("healed %d store(s): the active pair is now a real directory. "
             "Start the Claude app again." % len(done))

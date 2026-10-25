@@ -24,3 +24,14 @@
 - `heal-active --from-log` heals every pair named by an ENOTDIR line of the last
   10 minutes that is still a symlink, and may run while the app runs.
 - Added `deploy/com.neurovision.heal-active.plist` (launchd, every 60 seconds).
+- `heal-active` hardening: the folder is swapped into place with one atomic
+  exchange (renamex_np RENAME_SWAP, renameat2 RENAME_EXCHANGE on Linux), so the
+  active path is never missing; it refuses when the exchange is unavailable, when
+  a relative symlink inside the folder would change its target, and when several
+  organizations exist with no confirming log line (the CLI organization counts
+  only when the CLI is signed in to the app account). `--from-log` ignores errors
+  older than the last account change or overtaken by a write to another pair, and
+  keeps one pair per physical folder. The lock is taken before the plan, the disk
+  is re-checked (type, inode, link) before each step, and a step journal in the
+  state directory lets the next run recover an interrupted heal; a failed
+  rollback is reported with its paths and a non-zero exit.
