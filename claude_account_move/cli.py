@@ -1,4 +1,4 @@
-"""Command line: auto, prepare, finish, sync, stamp.
+"""Command line: auto, prepare, finish, sync, stamp, inventory.
 
 auto     everything in one run for a non-technical owner: app closed, prepare,
          write probe, stamp, wait for the new login, finish, sync if needed.
@@ -12,6 +12,8 @@ repair   optional repair: rebind target cards bound to a session other than the 
 heal-active  optional repair: turn a symlinked active pair into a real directory
          (dry run; writes with --apply; the app must be quit).
 stamp    optional: last-message time into every session title (writes with --apply).
+inventory  read-only: which accounts still have session data on this Mac and how many
+         sessions can still be opened (works after an account was deleted).
 """
 import argparse
 import contextlib
@@ -27,6 +29,7 @@ from . import pre_move_check as pre
 from . import store as st
 from . import common
 from . import heal_active
+from . import inventory
 from . import post_move_verify as verify
 from . import progress as prog
 from . import repair_cards
@@ -155,6 +158,11 @@ def build_parser():
                    help="heal every pair named by an ENOTDIR line of the last 10 "
                    "minutes that is still a symlink; allowed while the app runs "
                    "(for the launchd agent)")
+    v = sub.add_parser("inventory", help="which accounts still have session data on this Mac "
+                       "and how many sessions can still be opened (read-only)")
+    v.add_argument("--home", help="home directory to inspect (default: the HOME variable)")
+    v.add_argument("--json", action="store_true",
+                   help="print exactly one JSON report on stdout")
     a = sub.add_parser("auto", help="the whole move in one run: prepare, stamp, wait for "
                        "login, heal-active, finish, sync if needed (writes)")
     add_common(a)
@@ -938,6 +946,26 @@ def cmd_stamp(args):
     return code
 
 
+def cmd_inventory(args):
+    """Read-only: no state directory is built or created, the app may run."""
+    paths = Paths(home=args.home)
+    index = st.scan(paths)
+    rep, totals = inventory.build(paths, index, st.transcripts(paths),
+                                  read_identity(paths))
+    if not os.path.isdir(paths.support) and not os.path.isdir(paths.projects):
+        rep["exit"], rep["read_complete"] = EXIT_NO_STORE, False
+        rep["errors"] = ["nothing to inventory: neither %s nor %s exists"
+                         % (paths.support, paths.projects)]
+    if args.json:
+        print(json.dumps(rep, indent=1, ensure_ascii=False))
+    elif rep["exit"] == EXIT_NO_STORE:
+        print(rep["errors"][0], file=sys.stderr)
+    else:
+        for line in inventory.render_text(rep, totals):
+            print(line)
+    return rep["exit"]
+
+
 def cmd_auto(args):
     from . import auto_move          # imported late: auto_move calls the cmd_* above
     return auto_move.cmd_auto(args, sys.modules[__name__])
@@ -971,7 +999,8 @@ def _run(args):
     try:
         return {"prepare": cmd_prepare, "finish": cmd_finish,
                 "sync": cmd_sync, "repair": cmd_repair, "stamp": cmd_stamp,
-                "heal-active": cmd_heal_active, "auto": cmd_auto}[args.command](args)
+                "heal-active": cmd_heal_active, "auto": cmd_auto,
+                "inventory": cmd_inventory}[args.command](args)
     except st.PairError as exc:
         return fail(args, Out.of(args), args.command, started, EXIT_INPUT,
                     "input_error", "error: %s" % exc)
