@@ -24,9 +24,6 @@
   placeholder `__REPO__` (the README shows the `sed` line that fills it in) and
   the log is `~/Library/Logs/claude-account-move-heal-active.log`.
 - The READMEs no longer name a personal folder.
-
-## Unreleased
-
 - `heal-active` no longer refuses every symlink inside the moved folder. A
   relative link whose target stays inside the folder points at the same file
   after the move and is now allowed (live case 31.10.2026:

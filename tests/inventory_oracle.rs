@@ -519,6 +519,95 @@ fn unreadable_card_is_exit_3_with_report() {
     assert_eq!(account(&doc, ACC_A).get("cards").n(), 1);
 }
 
+// Round 1 review (Codex, 4edb07b), finding 1: an unreadable transcript folder
+// must not read as "no transcripts".
+#[test]
+fn unreadable_transcript_folder_is_exit_3() {
+    let h = scene();
+    let proj = h.home.join(".claude/projects/proj");
+    Command::new("chmod").arg("000").arg(&proj).status().unwrap();
+    let (code, doc, _) = h.inv();
+    Command::new("chmod").arg("755").arg(&proj).status().unwrap();
+    assert_eq!(code, 3);
+    assert!(!doc.get("read_complete").b());
+    assert!(!doc.get("errors").arr().is_empty());
+}
+
+// Finding 2: only an existing regular file (or a link to one) is a transcript.
+#[test]
+fn dangling_link_or_directory_is_not_a_transcript() {
+    let h = scene();
+    let proj = h.home.join(".claude/projects/proj");
+    // card 4 of B names ...0003, which has no transcript: give it a dangling link
+    symlink(h.root.join("nowhere.jsonl"), proj.join("22222222-0000-4000-8000-000000000003.jsonl")).unwrap();
+    // a directory with a transcript-like name, named by no card
+    fs::create_dir_all(proj.join("88888888-0000-4000-8000-000000000001.jsonl")).unwrap();
+    // a valid link to a real file still counts: card of A gets a second project
+    let other = h.home.join(".claude/projects/other");
+    fs::create_dir_all(&other).unwrap();
+    symlink(
+        proj.join("11111111-0000-4000-8000-000000000001.jsonl"),
+        other.join("11111111-0000-4000-8000-000000000001.jsonl"),
+    )
+    .unwrap();
+    let (code, doc, _) = h.inv();
+    assert_eq!(code, 0);
+    let f = folders_of(&doc, account(&doc, ACC_B))[0];
+    assert_eq!(f.get("with_transcript").n(), 2);
+    assert_eq!(f.get("without_transcript").n(), 1);
+    assert_eq!(doc.get("transcripts").get("total").n(), 4);
+    assert_eq!(account(&doc, ACC_A).get("with_transcript").n(), 1);
+}
+
+// Finding 3: one absurd timestamp is an incomplete read, not a crash.
+#[test]
+fn out_of_range_timestamp_is_exit_3_not_a_crash() {
+    let h = scene();
+    let b = h.support().join(CC).join(ACC_B).join(ORG_B);
+    h.card(&b, 6, "22222222-0000-4000-8000-000000000006", 253_402_300_800_000);
+    let (code, doc, _) = h.inv();
+    assert_eq!(code, 3);
+    assert!(!doc.get("read_complete").b());
+    assert_eq!(account(&doc, ACC_B).get("cards").n(), 5);
+    assert!(account(&doc, ACC_B).get("last_activity").s().starts_with("2026-05-28T"));
+    assert_eq!(account(&doc, ACC_A).get("cards").n(), 1);
+    let o = h.run(&["inventory"]);
+    assert_eq!(o.status.code(), Some(3), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+// Finding 4: the documented plist install keeps a path with &, # and spaces.
+#[test]
+fn documented_plist_install_survives_odd_paths() {
+    for f in ["README.md", "README.ru.md"] {
+        let t = fs::read_to_string(repo().join(f)).unwrap();
+        assert!(t.contains("plutil -replace ProgramArguments.2"), "{f}");
+        assert!(t.contains("mkdir -p ~/Library/LaunchAgents"), "{f}");
+    }
+    let h = new_home();
+    let odd = h.root.join("A&B #1 x");
+    fs::create_dir_all(odd.join("deploy")).unwrap();
+    fs::copy(repo().join("deploy/heal-active.plist"), odd.join("deploy/heal-active.plist")).unwrap();
+    // the README's steps, in the README's order
+    let script = r#"set -e
+mkdir -p ~/Library/LaunchAgents
+P=~/Library/LaunchAgents/io.github.mrskill.claude-account-move.heal-active.plist
+cp deploy/heal-active.plist "$P"
+plutil -replace ProgramArguments.2 -string "exec \"$PWD/claude-account-move\" heal-active --from-log --apply >> \"\$HOME/Library/Logs/claude-account-move-heal-active.log\" 2>&1" "$P"
+plutil -lint "$P" >/dev/null
+plutil -extract ProgramArguments.2 raw -o - "$P"
+"#;
+    let o = Command::new("bash").arg("-c").arg(script).current_dir(&odd).env("PWD", &odd).env("HOME", &h.home).output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    let got = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    assert_eq!(
+        got,
+        format!(
+            "exec \"{}/claude-account-move\" heal-active --from-log --apply >> \"$HOME/Library/Logs/claude-account-move-heal-active.log\" 2>&1",
+            odd.display()
+        )
+    );
+}
+
 #[test]
 fn nothing_to_inventory_is_exit_4() {
     let h = new_home();
