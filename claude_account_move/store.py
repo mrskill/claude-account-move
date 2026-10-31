@@ -16,6 +16,7 @@ import os
 import time
 import sys
 import re
+import stat
 
 from .common import (CARD_PREFIX, STORES, TOMB_PREFIX, TRANSCRIPT_RE, UUID_RE,
                      inside, iso_to_ms)
@@ -351,6 +352,22 @@ def _checked_glob(base, parts, obs):
     return found
 
 
+def _is_regular_file(path, obs):
+    """True for an existing regular file (a link to one counts).
+
+    A missing path or a dangling link is silently "no". Any other failure
+    (for example a folder that lists but cannot be searched) is recorded in obs
+    and is also "no", so it can never pass for an empty folder.
+    """
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        obs.errors.append("stat %s: %s" % (path, exc))
+        return False
+
+
 def transcripts(paths, progress=None, obs=None):
     """{session id (lower case): [transcript files]} from both known places.
     progress(done, total): optional, counts the files looked at.
@@ -370,7 +387,7 @@ def transcripts(paths, progress=None, obs=None):
             (paths.projects, ("*", "*.jsonl")),
             (paths.support, ("*-sessions", "*", "*", "local_*", ".claude",
                              "projects", "*", "*.jsonl")))
-            for f in _checked_glob(base, parts, obs) if os.path.isfile(f)]
+            for f in _checked_glob(base, parts, obs) if _is_regular_file(f, obs)]
     for i, f in enumerate(found, 1):
         if progress and (i % 50 == 0 or i == len(found)):
             progress(i, len(found))

@@ -228,6 +228,16 @@ class ExitCodes(Base):
         self.assertTrue(any(proj in e for e in doc["errors"]), doc["errors"])
         self.assertEqual(self.h.run("inventory").returncode, 3)
 
+    def test_listable_but_unsearchable_folder_is_exit_3(self):
+        self.scene()
+        proj = self.h.projects
+        os.chmod(proj, 0o444)           # entries can be listed but not stat'ed
+        self.addCleanup(os.chmod, proj, 0o755)
+        code, doc, _ = self.inv()
+        self.assertEqual((code, doc["read_complete"]), (3, False))
+        self.assertTrue(any("stat " in e and proj in e for e in doc["errors"]),
+                        doc["errors"])
+
     def test_unreadable_agent_mode_transcript_folder_is_exit_3(self):
         self.scene()
         d = os.path.join(self.h.pair(LAM, B, ORG_B), "local_" + uid(0x51),
