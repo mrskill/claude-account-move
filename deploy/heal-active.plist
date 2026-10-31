@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.neurovision.heal-active</string>
+  <string>io.github.mrskill.claude-account-move.heal-active</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>exec "$HOME/MEGAsync/Private/Work/claude-account-move/claude-account-move" heal-active --from-log --apply &gt;&gt; "$HOME/.claude/hooks/state/heal-active.log" 2&gt;&amp;1</string>
+    <string>exec "__REPO__/claude-account-move" heal-active --from-log --apply &gt;&gt; "$HOME/Library/Logs/claude-account-move-heal-active.log" 2&gt;&amp;1</string>
   </array>
   <key>StartInterval</key>
   <integer>60</integer>

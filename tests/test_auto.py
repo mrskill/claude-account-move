@@ -485,8 +485,8 @@ class Launcher(unittest.TestCase):
         self.assertEqual(subprocess.run(["bash", "-n", LAUNCHER]).returncode, 0)
         r = subprocess.run([sys.executable, os.path.join(ROOT, "claude-account-move"),
                             "--version"], capture_output=True, text=True)
-        self.assertIn("0.1.3", r.stdout)
-        self.assertEqual(__version__, "0.1.3")
+        self.assertIn("0.1.4", r.stdout)
+        self.assertEqual(__version__, "0.1.4")
 
     def _stage(self):
         tmp = tempfile.mkdtemp(prefix="cam-launch-")
@@ -517,8 +517,48 @@ class Launcher(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_ACCOUNT_MOVE_HOME"}
         env["HOME"] = os.path.join(tmp, "fakehome")
         r = subprocess.run(["bash", link], env=env, input="\n", capture_output=True, text=True)
-        self.assertIn("--state-dir %s/MEGAsync/Private/Work/claude-account-move-state"
-                      % env["HOME"], r.stdout)
+        self.assertIn("--state-dir %s/.claude-account-move --pause" % env["HOME"], r.stdout)
+        self.assertNotIn("MEGAsync", r.stdout)
+
+    def _run_with_local_env(self, text):
+        tmp, real, link = self._stage()
+        with open(os.path.join(real, "local.env"), "w") as fh:
+            fh.write(text)
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_ACCOUNT_MOVE_HOME"}
+        env["HOME"] = os.path.join(tmp, "fakehome")
+        r = subprocess.run(["bash", link], env=env, input="\n", capture_output=True, text=True)
+        return env["HOME"], r
+
+    def test_local_env_sets_the_state_dir(self):
+        home, r = self._run_with_local_env(
+            "# comment\n\nCLAUDE_ACCOUNT_MOVE_HOME=\"$HOME/my state\"\n")
+        self.assertIn("ARGS=auto --state-dir %s/my state --pause" % home, r.stdout)
+        self.assertEqual(r.stderr, "")
+
+    def test_local_env_last_line_wins_and_quotes_are_stripped(self):
+        home, r = self._run_with_local_env(
+            "CLAUDE_ACCOUNT_MOVE_HOME=/first\nCLAUDE_ACCOUNT_MOVE_HOME='~/second'\n")
+        self.assertIn("ARGS=auto --state-dir %s/second --pause" % home, r.stdout)
+
+    def test_local_env_is_never_executed_and_foreign_lines_warn(self):
+        tmp, real, link = self._stage()
+        marker = os.path.join(tmp, "pwned")
+        with open(os.path.join(real, "local.env"), "w") as fh:
+            fh.write("touch %s\nOTHER=1\n$(touch %s)\n" % (marker, marker))
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_ACCOUNT_MOVE_HOME"}
+        env["HOME"] = os.path.join(tmp, "fakehome")
+        r = subprocess.run(["bash", link], env=env, input="\n", capture_output=True, text=True)
+        self.assertFalse(os.path.exists(marker))
+        self.assertEqual(r.stderr.count("warning: local.env line"), 3)
+        self.assertIn("--state-dir %s/.claude-account-move --pause" % env["HOME"], r.stdout)
+
+    def test_environment_wins_over_local_env(self):
+        tmp, real, link = self._stage()
+        with open(os.path.join(real, "local.env"), "w") as fh:
+            fh.write("CLAUDE_ACCOUNT_MOVE_HOME=/from/file\n")
+        env = dict(os.environ, CLAUDE_ACCOUNT_MOVE_HOME="/from/env")
+        r = subprocess.run(["bash", link], env=env, input="\n", capture_output=True, text=True)
+        self.assertIn("ARGS=auto --state-dir /from/env --pause", r.stdout)
 
     def test_exit_code_is_passed_through(self):
         tmp, real, link = self._stage()

@@ -151,12 +151,22 @@ class FromLog(Base):
 
 class Deploy(unittest.TestCase):
     def test_plist_runs_from_log_every_minute(self):
-        p = os.path.join(os.path.dirname(HERE), "deploy", "com.neurovision.heal-active.plist")
+        p = os.path.join(os.path.dirname(HERE), "deploy", "heal-active.plist")
         with open(p) as fh:
             t = fh.read()
         self.assertIn("heal-active --from-log --apply", t)
         self.assertIn("<integer>60</integer>", t)
-        self.assertIn("heal-active.log", t)
+        self.assertIn("claude-account-move-heal-active.log", t)
+
+    def test_plist_is_a_neutral_template(self):
+        deploy = os.path.join(os.path.dirname(HERE), "deploy")
+        with open(os.path.join(deploy, "heal-active.plist")) as fh:
+            t = fh.read()
+        self.assertIn("<string>io.github.mrskill.claude-account-move.heal-active</string>", t)
+        self.assertIn('exec "__REPO__/claude-account-move"', t)
+        self.assertNotIn("MEGAsync", t)
+        self.assertNotIn("neurovision", t.lower())
+        self.assertFalse(os.path.exists(os.path.join(deploy, "com.neurovision.heal-active.plist")))
 
 
 if __name__ == "__main__":

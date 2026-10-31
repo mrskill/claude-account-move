@@ -3,3 +3,4 @@ __pycache__/
 .DS_Store
 .selftest/
 .claude-account-move/
+local.env
