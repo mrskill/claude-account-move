@@ -7,6 +7,7 @@ account files (`common.read_identity`) into a report: per physical folder, per
 account, and for the transcripts as a whole. Nothing is written anywhere and
 no session title is ever put into the report.
 """
+import os
 from datetime import datetime, timezone
 
 from .common import EXIT_FAIL, EXIT_OK, STORES
@@ -15,11 +16,38 @@ MAX_ERRORS = 20
 
 
 def rfc3339(ms):
-    """RFC 3339 UTC time of a millisecond stamp, or None when there is none."""
+    """RFC 3339 UTC time of a millisecond stamp, or None when there is none.
+    Raises ValueError for a stamp that is not a time (negative, out of range)."""
     if not ms:
         return None
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ")
+    if ms < 0:
+        raise ValueError("negative time stamp")
+    try:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError) as exc:
+        raise ValueError(str(exc))
+
+
+def _act(card):
+    """The card's activity in ms; 0 (no activity) when it is not a time."""
+    try:
+        rfc3339(card["act"])
+    except ValueError:
+        return 0
+    return card["act"]
+
+
+def _bad_times(index):
+    """Errors for cards whose lastActivityAt is not a time (path, no title)."""
+    out = []
+    for store in STORES:
+        for real, d in sorted(index.stores[store].dirs.items()):
+            for name, card in sorted(d["cards"].items()):
+                if _act(card) != card["act"]:
+                    out.append("card lastActivityAt is not a valid time: %s"
+                               % os.path.join(real, name))
+    return out
 
 
 def _has_transcript(card, tmap):
@@ -37,10 +65,10 @@ def _basis(index, tmap, picks):
     for store, real in picks:
         for name, card in index.stores[store].dirs[real]["cards"].items():
             cur = best.get((store, name))
-            if cur is None or (card["act"], card["turns"]) > (cur["act"], cur["turns"]):
+            if cur is None or (_act(card), card["turns"]) > (_act(cur), cur["turns"]):
                 best[(store, name)] = card
     openable = sum(1 for c in best.values() if _has_transcript(c, tmap))
-    newest = max((c["act"] for c in best.values()), default=0)
+    newest = max((_act(c) for c in best.values()), default=0)
     return len(best), openable, newest
 
 
@@ -56,7 +84,7 @@ def _folder(index, tmap, store, real):
             with_t += 1
         else:
             without_t += 1
-    newest = max((c["act"] for c in d["cards"].values()), default=0)
+    newest = max((_act(c) for c in d["cards"].values()), default=0)
     aliases = sorted(({"account": a["acc"], "org": a["org"], "kind": a["kind"]}
                       for a in s.aliases if a["target"] == real),
                      key=lambda a: (a["account"], a["org"]))
@@ -113,8 +141,9 @@ def build(paths, index, tmap, identity):
         for d in s.dirs.values():
             named.update(c["cid"].lower() for c in d["cards"].values() if c["cid"])
     with_card = len(named & set(tmap))
-    errors = (index.obs.errors + _identity_errors(identity, paths))[:MAX_ERRORS]
-    complete = index.obs.complete() and not _identity_errors(identity, paths)
+    problems = _identity_errors(identity, paths) + _bad_times(index)
+    errors = (index.obs.errors + problems)[:MAX_ERRORS]
+    complete = index.obs.complete() and not problems
     all_cards, all_open, _ms = _basis(index, tmap, picks)
     rep = {"command": "inventory", "exit": EXIT_OK if complete else EXIT_FAIL,
             "read_complete": complete, "errors": errors,

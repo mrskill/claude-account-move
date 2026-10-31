@@ -950,7 +950,8 @@ def cmd_inventory(args):
     """Read-only: no state directory is built or created, the app may run."""
     paths = Paths(home=args.home)
     index = st.scan(paths)
-    rep, totals = inventory.build(paths, index, st.transcripts(paths),
+    rep, totals = inventory.build(paths, index,
+                                  st.transcripts(paths, obs=index.obs),
                                   read_identity(paths))
     if not os.path.isdir(paths.support) and not os.path.isdir(paths.projects):
         rep["exit"], rep["read_complete"] = EXIT_NO_STORE, False

@@ -218,6 +218,76 @@ class ExitCodes(Base):
         self.assertIsNone(doc["cli_account"])
         self.assertTrue(any("CLI account" in e for e in doc["errors"]))
 
+    def test_unreadable_transcript_folder_is_exit_3(self):
+        self.scene()
+        proj = self.h.projects
+        os.chmod(proj, 0)
+        self.addCleanup(os.chmod, proj, 0o755)
+        code, doc, _ = self.inv()
+        self.assertEqual((code, doc["read_complete"]), (3, False))
+        self.assertTrue(any(proj in e for e in doc["errors"]), doc["errors"])
+        self.assertEqual(self.h.run("inventory").returncode, 3)
+
+    def test_unreadable_agent_mode_transcript_folder_is_exit_3(self):
+        self.scene()
+        d = os.path.join(self.h.pair(LAM, B, ORG_B), "local_" + uid(0x51),
+                         ".claude", "projects", "p")
+        os.makedirs(d)
+        os.chmod(d, 0)
+        self.addCleanup(os.chmod, d, 0o755)
+        code, doc, _ = self.inv()
+        self.assertEqual((code, doc["read_complete"]), (3, False))
+        self.assertTrue(any(d in e for e in doc["errors"]), doc["errors"])
+
+    def test_missing_optional_transcript_places_are_not_an_error(self):
+        h = self.h
+        h.accounts(cli=A, app=A)
+        h.card(h.pair(CC, A, ORG_A), 1, uid(0x11), act=T_NEW)
+        code, doc, _ = self.inv()
+        self.assertEqual((code, doc["read_complete"], doc["errors"]), (0, True, []))
+
+    def test_dangling_link_and_directory_are_not_transcripts(self):
+        self.scene()
+        proj = self.h.projects
+        os.symlink(os.path.join(self.tmp, "nowhere.jsonl"),
+                   os.path.join(proj, uid(0x23) + ".jsonl"))
+        os.makedirs(os.path.join(proj, uid(0x88) + ".jsonl"))
+        code, doc, _ = self.inv()
+        self.assertEqual(code, 0)
+        f = doc["folders"][self.account(doc, B)["folders"][0]]
+        self.assertEqual((f["with_transcript"], f["without_transcript"]), (2, 1))
+        self.assertEqual(doc["transcripts"]["total"], 4)
+
+    def test_link_to_a_real_file_is_a_transcript(self):
+        self.scene()
+        other = os.path.join(self.tmp, "home", ".claude", "projects", "other")
+        os.makedirs(other)
+        os.symlink(os.path.join(self.h.projects, uid(0x23) + ".jsonl"),
+                   os.path.join(other, uid(0x23) + ".jsonl"))   # dangling target
+        self.h.transcript(uid(0x23))                            # now the target exists
+        code, doc, _ = self.inv()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.account(doc, B)["with_transcript"], 3)
+        self.assertEqual(doc["transcripts"]["total"], 5)
+
+    def test_invalid_activity_time_is_exit_3_and_never_a_crash(self):
+        _, b = self.scene()
+        for n, act in ((6, 253402300800000), (7, -5), (8, 10 ** 30)):
+            self.h.card(b, n, uid(0x60 + n), act=act, title=TITLE)
+        code, doc, r = self.inv()
+        self.assertEqual((code, doc["read_complete"]), (3, False))
+        b_acc = self.account(doc, B)
+        self.assertEqual(b_acc["cards"], 7)
+        self.assertTrue(b_acc["last_activity"].startswith("2026-05-28T"))
+        bad = [e for e in doc["errors"] if "lastActivityAt" in e]
+        self.assertEqual(len(bad), 3)
+        self.assertTrue(all(b in e for e in bad))
+        self.assertNotIn(TITLE, r.stdout)
+        text = self.h.run("inventory")
+        self.assertEqual(text.returncode, 3, text.stderr)
+        self.assertIn("WARNING", text.stdout)
+        self.assertNotIn(TITLE, text.stdout)
+
     def test_missing_account_files_are_not_an_error(self):
         h = self.h
         h.pair(CC, B, ORG_B)

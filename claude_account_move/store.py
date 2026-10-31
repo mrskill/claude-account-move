@@ -9,6 +9,7 @@ Reading is strictly read-only. Problems that would make a count untrustworthy
 (unreadable directory, malformed card, link pointing outside the store) are
 recorded in `Index.obs` and never turned into silent zeros.
 """
+import fnmatch
 import glob
 import json
 import os
@@ -323,14 +324,53 @@ def scan(paths, progress=None):
     return idx
 
 
-def transcripts(paths, progress=None):
+def _checked_glob(base, parts, obs):
+    """glob.glob(base/parts...) that records every existing folder it cannot list.
+
+    glob hides listing errors, so an unreadable folder reads as "no files".
+    A folder or file that is simply missing stays silent. Names starting with a
+    dot do not match a wildcard, as in glob.
+    """
+    found = [base]
+    for part in parts:
+        nxt = []
+        for p in found:
+            if "*" not in part:
+                nxt.append(os.path.join(p, part))
+                continue
+            try:
+                names = os.listdir(p)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError as exc:
+                obs.errors.append("listdir %s: %s" % (p, exc))
+                continue
+            nxt.extend(os.path.join(p, n) for n in sorted(names)
+                       if not n.startswith(".") and fnmatch.fnmatchcase(n, part))
+        found = nxt
+    return found
+
+
+def transcripts(paths, progress=None, obs=None):
     """{session id (lower case): [transcript files]} from both known places.
-    progress(done, total): optional, counts the files looked at."""
+    progress(done, total): optional, counts the files looked at.
+
+    With obs (an Observation) the walk is checked: a folder that exists and
+    cannot be listed is recorded as an error, and only an existing regular file
+    (a link to one counts) is a transcript, never a dangling link or a folder
+    with such a name. Without obs the behaviour is the plain glob."""
     out = {}
     pats = [os.path.join(paths.projects, "*", "*.jsonl"),
             os.path.join(paths.support, "*-sessions", "*", "*", "local_*",
                          ".claude", "projects", "*", "*.jsonl")]
-    found = [f for pat in pats for f in glob.glob(pat)]
+    if obs is None:
+        found = [f for pat in pats for f in glob.glob(pat)]
+    else:
+        found = [f for base, parts in (
+            (paths.projects, ("*", "*.jsonl")),
+            (paths.support, ("*-sessions", "*", "*", "local_*", ".claude",
+                             "projects", "*", "*.jsonl")))
+            for f in _checked_glob(base, parts, obs) if os.path.isfile(f)]
     for i, f in enumerate(found, 1):
         if progress and (i % 50 == 0 or i == len(found)):
             progress(i, len(found))
