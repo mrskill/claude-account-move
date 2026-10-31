@@ -3,8 +3,9 @@
 The pair folder moves as one tree. A relative link whose target, normalized
 lexically from the link's own directory, stays at or below the moved folder
 points to the same file after the move, so it is safe. A relative link that
-escapes the folder is refused. An absolute link into the folder is refused (it
-would keep pointing at the old place); an absolute link outside it is fine.
+escapes the folder is refused. Any absolute link is refused, whether it points
+into the folder (it would keep pointing at the old place) or outside it (kept
+by test_heal_active_r4 AnySymlink.test_absolute_symlink_refuses).
 A dangling link that stays inside the tree is allowed."""
 import os
 import shutil
@@ -79,13 +80,15 @@ class UnitRule(unittest.TestCase):
         self.assertIsNotNone(msg)
         self.assertIn("absolute symlink", msg)
 
-    def test_absolute_link_to_a_file_outside_the_tree_is_allowed(self):
+    def test_absolute_link_to_a_file_outside_the_tree_is_refused(self):
         outside = tempfile.mkdtemp(prefix="cam-relink-out-")
         self.addCleanup(shutil.rmtree, outside, True)
         target = os.path.join(outside, "far.txt")
         write(target)
         os.symlink(target, os.path.join(self.root, "f"))
-        self.assertIsNone(heal_active.relative_link_problem(self.root))
+        msg = heal_active.relative_link_problem(self.root)
+        self.assertIsNotNone(msg)
+        self.assertIn("absolute symlink", msg)
 
     def test_dangling_relative_link_inside_the_tree_is_allowed(self):
         os.makedirs(os.path.join(self.root, "a"))
