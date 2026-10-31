@@ -533,6 +533,20 @@ fn unreadable_transcript_folder_is_exit_3() {
     assert!(!doc.get("errors").arr().is_empty());
 }
 
+// Round 2 review (Codex, 37ec069): a folder that can be listed but not
+// searched (mode 0444) must not drop its transcripts silently.
+#[test]
+fn listable_but_unsearchable_folder_is_exit_3() {
+    let h = scene();
+    let proj = h.home.join(".claude/projects/proj");
+    Command::new("chmod").arg("444").arg(&proj).status().unwrap();
+    let (code, doc, _) = h.inv();
+    Command::new("chmod").arg("755").arg(&proj).status().unwrap();
+    assert_eq!(code, 3);
+    assert!(!doc.get("read_complete").b());
+    assert!(!doc.get("errors").arr().is_empty());
+}
+
 // Finding 2: only an existing regular file (or a link to one) is a transcript.
 #[test]
 fn dangling_link_or_directory_is_not_a_transcript() {
