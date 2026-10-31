@@ -1,6 +1,6 @@
 # claude-account-move
 
-Version 0.1.3. Move Claude Code (the desktop app for Mac and the CLI) from one
+Version 0.1.4. Move Claude Code (the desktop app for Mac and the CLI) from one
 Claude account to another without losing your sessions, and prove afterwards
 that nothing was lost.
 
@@ -21,6 +21,7 @@ Russian version: [README.ru.md](README.ru.md)
 | `sync` | optional repair | Copies session cards that are missing in the new account's folder. Dry run by default (it prints the files). `sync --apply` adds files and `sync --undo` removes exactly the files a journal proves were added. |
 | `stamp` | optional, see below | Puts the date and time of the last real message into the title of every session. Dry run by default (it lists "was -> will be"). `stamp --apply` writes, `stamp --undo` restores the cards byte for byte. |
 | `heal-active` | optional repair, app quit | If the active folder `<store>/<account>/<org>` is a symlink (the app reads it but every card write fails with ENOTDIR), turns it into a real directory: removes the link, moves the real folder there and leaves a link at its old path. The pair is taken from the app log (newest save, read or ENOTDIR line after the last account change), else the app account with an organization that exists in the store; when these disagree it refuses and names them (or pass `--active-pair`). Dry run by default, `--apply` writes, refuses while the app runs, all stores or none. It also refuses when a symlink inside the moved folder would change its target: every absolute link (wherever it points), and a relative link whose target, walked step by step from its own folder, leaves the folder, passes through another symlink or points at its own folder or a parent; only the last component may be a symlink or missing, so relative links that stay inside the folder and dangling relative links inside it are fine. The check runs again for each store just before the swap and refuses the whole run if it no longer passes. `heal-active --from-log --apply` heals every pair named by an ENOTDIR line of the last 10 minutes and may run while the app runs. `finish` fails (exit `3`) while the active folder is a symlink, `prepare` fails on a recent ENOTDIR line for a symlinked folder, and `auto` runs it before `finish`. |
+| `inventory` | any time, also after an account was deleted | Read-only. Lists every account that still has session data on this Mac and how many of its sessions can still be opened (the transcript is on disk). Works while the app runs, writes nothing, not even the state directory. See "What is left on this Mac (inventory)". |
 | `auto` | the whole move in one run | Quit-the-app wait, `prepare`, a write probe, `stamp --apply`, waits for the new login, `finish`, `sync --apply` only when needed, a plain-Russian summary. See "One-click move (auto)". |
 
 `sync --apply`, `sync --undo`, `stamp --apply`, `stamp --undo` and `heal-active --apply` are the only
@@ -60,7 +61,7 @@ is a failure, never a pass.
   JSON documents (so anything in them, including a token if present, passes
   through memory), keeps only the account and organization ids, and never writes,
   logs or transmits anything else from them.
-- `prepare`, `finish` and the checks change nothing in the Claude storage or in
+- `prepare`, `finish`, `inventory` and the checks change nothing in the Claude storage or in
   your settings. Everything they write goes to the state directory (see below).
   They do not even write a probe file into the storage (only `auto` does, one small file that it reads back and deletes at once). The only commands that
   touch the storage are `sync --apply` (adds card files), `sync --undo` (deletes
@@ -85,7 +86,7 @@ is a failure, never a pass.
 ```sh
 git clone https://github.com/mrskill/claude-account-move.git
 cd claude-account-move
-./claude-account-move --version      # claude-account-move 0.1.3
+./claude-account-move --version      # claude-account-move 0.1.4
 ```
 
 Or download a release archive, unpack it and run `./claude-account-move` from
@@ -97,10 +98,23 @@ The entry script resolves the link, so the package next to it is found.
 
 For an owner who does not use a terminal. One file, `Claude Move.command` in the
 repository folder. You can put an alias (or a symlink) to it on the Desktop: it
-finds its own folder. The state directory is
-`~/MEGAsync/Private/Work/claude-account-move-state` (the owner's default, kept
-in the launcher) unless the
-`CLAUDE_ACCOUNT_MOVE_HOME` variable names another one.
+finds its own folder. The state directory is the first of these that exists:
+
+1. the `CLAUDE_ACCOUNT_MOVE_HOME` environment variable;
+2. the value of a line `CLAUDE_ACCOUNT_MOVE_HOME=<path>` in an optional file
+   `local.env` next to the launcher (git-ignored, so it stays on your machine);
+3. `~/.claude-account-move`, the default of the program itself.
+
+`local.env` is read line by line and never executed. Blank lines and lines
+starting with `#` are skipped. One pair of surrounding quotes is removed from
+the value, and a leading `$HOME/` or `~/` stands for your home directory. Any
+other line is ignored with a warning on stderr, and the last matching line wins.
+A missing or unreadable file is the same as no file. Example:
+
+```sh
+# local.env
+CLAUDE_ACCOUNT_MOVE_HOME="$HOME/Documents/claude-account-move-state"
+```
 
 1. Sign out of Claude in the app and quit it completely (Cmd+Q). If you forget,
    the program asks you to quit and waits (up to 10 minutes, `--wait-close`).
@@ -137,11 +151,67 @@ sign-in.
 
 ### Optional: keep the active pair healed (launchd)
 
-`deploy/com.neurovision.heal-active.plist` runs `heal-active --from-log --apply`
-every 60 seconds and logs to `~/.claude/hooks/state/heal-active.log`. Install it
-yourself (the tool never does), with `claude-account-move` linked into
-`$HOME/MEGAsync/Private/Work/claude-account-move`: create the state directory, copy the plist into your user
-LaunchAgents folder and load it with `launchctl load`.
+`deploy/heal-active.plist` is a template. It runs `heal-active --from-log --apply`
+every 60 seconds and logs to `~/Library/Logs/claude-account-move-heal-active.log`.
+The placeholder `__REPO__` stands for the folder that holds `claude-account-move`.
+Install it yourself (the tool never does), from the repository folder:
+
+```sh
+sed "s#__REPO__#$PWD#g" deploy/heal-active.plist > ~/Library/LaunchAgents/io.github.mrskill.claude-account-move.heal-active.plist
+launchctl load ~/Library/LaunchAgents/io.github.mrskill.claude-account-move.heal-active.plist
+```
+
+To remove it: `launchctl unload` the same file, then delete the file.
+
+## What is left on this Mac (inventory)
+
+Use it when a Claude account was deleted or you signed in with another one, and
+you want to know whether the session data of the earlier accounts is still on
+this Mac and how much of it can still be opened.
+
+```sh
+./claude-account-move inventory          # text
+./claude-account-move inventory --json   # exactly one JSON document on stdout
+```
+
+It reads both session stores of the app (`claude-code-sessions` and
+`local-agent-mode-sessions`), the transcripts in `~/.claude/projects` and in the
+agent-mode folders, the CLI account (`~/.claude.json`) and the app account
+(`config.json`). A folder reached through several symlinked names is counted
+once. Per account it prints the session cards, how many of them have a
+transcript on disk (those can still be opened), the newest activity, and per
+folder the deletion marks and scheduled tasks. Session titles are never printed.
+The app account is listed first, then the accounts by newest activity.
+
+It is strictly read-only: it writes nothing into the Claude storage or your
+settings and does not create the state directory. It may run while the Claude
+app is open, and it takes no `--state-dir`.
+
+Example (shortened ids):
+
+```
+Claude session data on this Mac (read-only, nothing was changed)
+
+Account 0e1c...a7 [app account, CLI account]
+  sessions: 6, can be opened (transcript on disk): 6, last activity: 2026-10-30 18:41 UTC
+  claude-code-sessions/0e1c...a7/5b02...9d: sessions 6 (with transcript 6, without 0, no session id 0), deletion marks 0, scheduled tasks 1
+
+Account 7f3a...c4
+  sessions: 39, can be opened (transcript on disk): 35, last activity: 2026-08-02 09:12 UTC
+  claude-code-sessions/7f3a...c4/21d8...e0: sessions 39 (with transcript 35, without 3, no session id 1), deletion marks 2, scheduled tasks 0
+
+Transcripts on disk: 41 (41 named by a session card, 0 without a card)
+
+2 accounts have session data on this Mac; 41 of 45 sessions can still be opened (transcript on disk)
+```
+
+A session "with transcript" has its conversation on disk. A session "without"
+is only a card in the panel list: its conversation is gone. "No session id"
+means the card has no link to a conversation. Exit codes: `0` everything was
+read, `3` the storage was read incompletely (the report is still printed, with
+`read_complete: false` and at most 20 errors; the numbers may be too low), `4`
+neither the Claude support folder nor `~/.claude/projects` exists, `2` input
+error.
 
 ## A move, step by step
 
@@ -269,11 +339,11 @@ no heartbeat configured that check is skipped.
 
 | Code | Meaning |
 |---|---|
-| 0 | `prepare`: ready to move. `finish`: everything arrived and all checks passed. `sync`: done or dry run with nothing wrong. |
+| 0 | `prepare`: ready to move. `finish`: everything arrived and all checks passed. `sync`: done or dry run with nothing wrong. `inventory`: everything was read. |
 | 1 | Internal error of the tool, or a required state write failed (snapshot, pointer, journal, a symlink inside the state directory). Says nothing about loss or readiness. A failure to save the optional JSON report file is only warned about on stderr. |
 | 2 | Input error: no command, state directory overlapping the Claude storage, your settings or logs, malformed or foreign `--active-pair`, a journal that cannot be used (unreadable, no begin record, belongs to another home directory). |
-| 3 | Failure on substance. `prepare`: a readiness check is red. `finish`: something is missing or different (card, target binding, transcript, deletion mark, task, settings, account, folder). `sync`: input could not be read completely, no target folder could be determined, a copy failed, a conflict was found, or (`--undo`) a journal has a torn or damaged part or names files that are not proven to be ours (those are kept). `stamp`: input could not be read completely, a card changed between plan and write (left alone), a write failed, or (`--undo`) a card changed since the stamp (kept). |
-| 4 | Storage not found (no Claude application support folder, or no account/organization folder in it). |
+| 3 | Failure on substance. `prepare`: a readiness check is red. `finish`: something is missing or different (card, target binding, transcript, deletion mark, task, settings, account, folder). `sync`: input could not be read completely, no target folder could be determined, a copy failed, a conflict was found, or (`--undo`) a journal has a torn or damaged part or names files that are not proven to be ours (those are kept). `stamp`: input could not be read completely, a card changed between plan and write (left alone), a write failed, or (`--undo`) a card changed since the stamp (kept). `inventory`: the storage was read incompletely (the report is still printed). |
+| 4 | Storage not found (no Claude application support folder, or no account/organization folder in it). `inventory`: neither the support folder nor `~/.claude/projects` exists. |
 | 5 | `finish`: nothing is lost but not everything is delivered yet and your sync job is alive. Wait and run again. |
 | 6 | `finish`: the wait for login ran out. `login.reason` in the JSON report says why: `cli_lags`, `app_not_switched`, `identity_invalid`. |
 | 7 | `finish`: no usable "before" snapshot of this move (missing, damaged, not ready, without a source account, older than `--max-age-hours`, other home directory, unknown `--move-id`). |
@@ -343,7 +413,7 @@ prevent that too.)
 
 ## Limitations
 
-- Read-only everywhere except `sync --apply` (adds card files and may create the
+- Read-only everywhere (`inventory` included) except `sync --apply` (adds card files and may create the
   agent-mode folder of the target account when it does not exist yet),
   `sync --undo` (removes what `--apply` added), `stamp --apply` (rewrites card
   titles) and `stamp --undo`.

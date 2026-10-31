@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.4
+
+- Added `inventory [--home DIR] [--json]`: a read-only report of every account
+  that still has session data on this Mac (after an account was deleted or
+  replaced). Per physical folder of both stores and per account it counts the
+  session cards, deletion marks, scheduled tasks, cards with a transcript on
+  disk, cards without one and cards without a session id, plus the newest
+  activity, and it counts the transcripts that no card names. Symlinked names of
+  one folder are counted once. It writes nothing, does not create the state
+  directory, may run while the app is open and never prints a session title.
+  Exit codes: `0` read completely, `3` read incompletely (the report is still
+  printed), `4` neither the Claude support folder nor `~/.claude/projects`
+  exists, `2` input error.
+- The launcher `Claude Move.command` no longer carries a personal default for
+  the state directory. It uses `CLAUDE_ACCOUNT_MOVE_HOME`, else the value of a
+  `CLAUDE_ACCOUNT_MOVE_HOME=<path>` line of an optional, git-ignored `local.env`
+  next to it (read line by line, never executed), else
+  `~/.claude-account-move`.
+- `deploy/com.neurovision.heal-active.plist` is now the template
+  `deploy/heal-active.plist`: label
+  `io.github.mrskill.claude-account-move.heal-active`, the program path is the
+  placeholder `__REPO__` (the README shows the `sed` line that fills it in) and
+  the log is `~/Library/Logs/claude-account-move-heal-active.log`.
+- The READMEs no longer name a personal folder.
+
 ## Unreleased
 
 - `heal-active` no longer refuses every symlink inside the moved folder. A
