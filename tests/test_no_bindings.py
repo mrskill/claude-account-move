@@ -25,7 +25,7 @@ def package_files(root):
     for dp, dns, fns in os.walk(root):
         dns[:] = [d for d in dns if d not in SKIP_DIRS]
         for f in fns:
-            if f != ".DS_Store":
+            if f not in (".DS_Store", ".git"):      # .git is a file in a worktree
                 yield os.path.join(dp, f)
 
 

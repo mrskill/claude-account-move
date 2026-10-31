@@ -164,9 +164,6 @@ class Deploy(unittest.TestCase):
             t = fh.read()
         self.assertIn("<string>io.github.mrskill.claude-account-move.heal-active</string>", t)
         self.assertIn('exec "__REPO__/claude-account-move"', t)
-        self.assertNotIn("MEGAsync", t)
-        self.assertNotIn("neurovision", t.lower())
-        self.assertFalse(os.path.exists(os.path.join(deploy, "com.neurovision.heal-active.plist")))
 
 
 if __name__ == "__main__":

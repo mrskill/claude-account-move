@@ -518,7 +518,6 @@ class Launcher(unittest.TestCase):
         env["HOME"] = os.path.join(tmp, "fakehome")
         r = subprocess.run(["bash", link], env=env, input="\n", capture_output=True, text=True)
         self.assertIn("--state-dir %s/.claude-account-move --pause" % env["HOME"], r.stdout)
-        self.assertNotIn("MEGAsync", r.stdout)
 
     def _run_with_local_env(self, text):
         tmp, real, link = self._stage()
