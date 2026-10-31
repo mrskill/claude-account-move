@@ -165,15 +165,14 @@ def a_real(path):
 
 
 def relative_link_problem(root):
-    """Why the tree at `root` cannot be moved safely, or None. A relative symlink
-    is fine when its target, normalized lexically from the link's own folder, stays
-    at or below `root` (it points at the same file after the move); one that leaves
-    the folder is refused, since its target would change; so is one that, resolved,
-    leaves the folder or points at its own folder or a parent. An absolute symlink into
-    `root` is refused (it would keep pointing at the old place); one outside is
-    fine. A dangling link inside the tree is allowed."""
+    """Why the tree at `root` cannot be moved safely, or None. Every absolute
+    symlink is refused, wherever it points (inside it would keep pointing at the
+    old place). A relative symlink is fine when its target, normalized lexically
+    from the link's own folder, stays at or below `root` (it points at the same
+    file after the move); one that leaves the folder is refused, since its target
+    would change; so is one that, resolved, leaves the folder or points at its own
+    folder or a parent. A dangling link inside the tree is allowed."""
     errors = []
-    roots = {root, os.path.realpath(root)}
     for dp, dns, fns in os.walk(root, onerror=errors.append):
         for n in dns + fns:
             p = os.path.join(dp, n)
@@ -181,14 +180,8 @@ def relative_link_problem(root):
                 continue
             link = os.readlink(p)
             if os.path.isabs(link):
-                # the literal path and the one through a resolved folder (/var vs
-                # /private/var), against both spellings of the root
-                seen = (os.path.normpath(link), a_real(os.path.normpath(link)))
-                if any(inside(t, r) for t in seen for r in roots):
-                    return ("absolute symlink check: %s -> %s points into the folder "
-                            "and would keep pointing at the old place after the move"
-                            % (p, link))
-                continue
+                return ("absolute symlink check: %s -> %s is an absolute symlink "
+                        "inside the folder and is not moved safely" % (p, link))
             # position inside the folder, so a name like ../<root name>/x is not
             # taken for an inside target
             rel = os.path.normpath(os.path.join(os.path.relpath(dp, root), link))

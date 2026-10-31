@@ -6,12 +6,11 @@
   relative link whose target stays inside the folder points at the same file
   after the move and is now allowed (live case 31.10.2026:
   `node_modules/.bin/nanoid -> ../nanoid/bin/nanoid.js` inside a local-agent
-  session's `outputs` blocked the move step), as are a dangling link inside the
-  folder and an absolute link to a place outside it. Still refused: a relative
-  link that leaves the folder (or leaves and re-enters by the folder's own name),
-  one that resolves outside through a symlinked folder, one that points at its
-  own folder or a parent, and an absolute link into the folder (checked against
-  both the literal and the resolved path, so `/var` and `/private/var` agree).
+  session's `outputs` blocked the move step), as is a dangling relative link
+  inside the folder. Still refused: every absolute link, whatever it points at;
+  a relative link that leaves the folder (or leaves and re-enters by the
+  folder's own name), one that resolves outside through a symlinked folder, and
+  one that points at its own folder or a parent (a loop).
 - Added `heal-active`: when the active pair `<store>/<account>/<org>` of
   `claude-code-sessions` or `local-agent-mode-sessions` is a symlink, the app
   reads through it but every card write fails with ENOTDIR and new cards are
