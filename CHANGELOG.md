@@ -7,10 +7,14 @@
   after the move and is now allowed (live case 31.10.2026:
   `node_modules/.bin/nanoid -> ../nanoid/bin/nanoid.js` inside a local-agent
   session's `outputs` blocked the move step), as is a dangling relative link
-  inside the folder. Still refused: every absolute link, whatever it points at;
-  a relative link that leaves the folder (or leaves and re-enters by the
-  folder's own name), one that resolves outside through a symlinked folder, and
-  one that points at its own folder or a parent (a loop).
+  inside the folder. The target is walked one component at a time from the
+  link's own folder: it may never go above the moved folder at any step, and no
+  folder on the way may be another symlink (only the last component may be a
+  symlink or missing). Still refused: every absolute link, whatever it points
+  at, and a relative link that points at its own folder or a parent (a loop,
+  found by device and inode, so case-folding volumes cannot hide it). The check
+  runs again for each store just before the swap; a failure there rolls back
+  like any other changed-disk failure.
 - Added `heal-active`: when the active pair `<store>/<account>/<org>` of
   `claude-code-sessions` or `local-agent-mode-sessions` is a symlink, the app
   reads through it but every card write fails with ENOTDIR and new cards are

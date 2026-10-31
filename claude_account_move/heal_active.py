@@ -164,14 +164,55 @@ def a_real(path):
                         os.path.basename(path))
 
 
+def _stays_inside(root, dp, link):
+    """True when the relative `link` found in folder `dp` of the tree at `root`
+    points at the same file after the tree moves. The target is walked one
+    component at a time from `dp`: never above `root` at any step, and no folder
+    on the way may be a symlink (only the last component may be one, or be
+    missing). A target that is the link's own folder or a parent is a loop."""
+    cur = [c for c in os.path.relpath(dp, root).split(os.sep) if c != os.curdir]
+    parts = [c for c in link.split(os.sep) if c not in ("", os.curdir)]
+    last = len(parts) - (0 if link.endswith(os.sep) else 1)   # a "d/" must be a folder
+    gone = False                         # a folder on the way does not exist
+    for i, c in enumerate(parts):
+        if c == os.pardir:
+            if not cur:
+                return False
+            cur.pop()
+            continue
+        cur.append(c)
+        if i < last and not gone:
+            try:
+                mode = os.lstat(os.path.join(root, *cur)).st_mode
+            except OSError:
+                gone = True              # dangling inside the tree is fine
+            else:
+                if stat.S_ISLNK(mode):
+                    return False
+    try:
+        end = os.stat(os.path.join(root, *cur))
+    except OSError:
+        return True
+    if not stat.S_ISDIR(end.st_mode):
+        return True
+    here = dp                            # identity, not spelling (case-folding volumes)
+    while True:
+        st = os.stat(here)
+        if (st.st_dev, st.st_ino) == (end.st_dev, end.st_ino):
+            return False
+        up = os.path.dirname(here)
+        if here == root or up == here:
+            return True
+        here = up
+
+
 def relative_link_problem(root):
     """Why the tree at `root` cannot be moved safely, or None. Every absolute
     symlink is refused, wherever it points (inside it would keep pointing at the
-    old place). A relative symlink is fine when its target, normalized lexically
-    from the link's own folder, stays at or below `root` (it points at the same
-    file after the move); one that leaves the folder is refused, since its target
-    would change; so is one that, resolved, leaves the folder or points at its own
-    folder or a parent. A dangling link inside the tree is allowed."""
+    old place). A relative symlink is fine when walking its target from its own
+    folder never leaves `root` and passes through no other symlink (it points at
+    the same file after the move); otherwise, or when it points at its own folder
+    or a parent, it is refused. A dangling link inside the tree is allowed."""
     errors = []
     for dp, dns, fns in os.walk(root, onerror=errors.append):
         for n in dns + fns:
@@ -182,19 +223,10 @@ def relative_link_problem(root):
             if os.path.isabs(link):
                 return ("absolute symlink check: %s -> %s is an absolute symlink "
                         "inside the folder and is not moved safely" % (p, link))
-            # position inside the folder, so a name like ../<root name>/x is not
-            # taken for an inside target
-            rel = os.path.normpath(os.path.join(os.path.relpath(dp, root), link))
-            # the lexical form ignores symlinked folders on the way (d/../x with
-            # d -> .), so the resolved target must stay inside as well; a link to
-            # its own folder or a parent of it would make the tree loop
-            real = os.path.realpath(p)
-            if (rel == os.pardir or rel.startswith(os.pardir + os.sep)
-                    or not inside(real, os.path.realpath(root))
-                    or inside(os.path.realpath(dp), real)):
-                return ("relative symlink check: %s -> %s leaves the folder or "
-                        "loops back on it and could change its target after the move"
-                        % (p, link))
+            if not _stays_inside(root, dp, link):
+                return ("relative symlink check: %s -> %s leaves the folder, passes "
+                        "through another symlink or loops back on it and could "
+                        "change its target after the move" % (p, link))
     if errors:
         return "cannot read the folder %s completely: %s" % (root, errors[0])
     return None
@@ -298,7 +330,8 @@ def _replace_link(path, content, tmp):
 
 
 def _recheck(op):
-    """Raise Changed unless A is still the planned symlink and R the planned dir."""
+    """Raise Changed unless A is still the planned symlink and R the planned dir,
+    and the symlinks inside R are still safe to move."""
     la, lr = _lstat(op["path"]), _lstat(op["target"])
     if la is None or not stat.S_ISLNK(la.st_mode) or os.readlink(op["path"]) != op["link"]:
         raise Changed("%s is no longer the planned symlink" % op["path"])
@@ -307,6 +340,9 @@ def _recheck(op):
     if not _same_dir(lr, op):
         raise Changed("%s is no longer the planned real directory (inode changed)"
                       % op["target"])
+    bad = relative_link_problem(op["target"])   # a folder may have become a link
+    if bad:
+        raise Changed(bad)
 
 
 def _verify_done(op):
