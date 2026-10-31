@@ -154,12 +154,21 @@ sign-in.
 `deploy/heal-active.plist` is a template. It runs `heal-active --from-log --apply`
 every 60 seconds and logs to `~/Library/Logs/claude-account-move-heal-active.log`.
 The placeholder `__REPO__` stands for the folder that holds `claude-account-move`.
-Install it yourself (the tool never does), from the repository folder:
+Install it yourself (the tool never does). Run these lines from the repository
+folder; the `plutil -replace` line writes your folder in place of `__REPO__`
+(it is safe for a path with spaces, `&` or `#`):
 
 ```sh
-sed "s#__REPO__#$PWD#g" deploy/heal-active.plist > ~/Library/LaunchAgents/io.github.mrskill.claude-account-move.heal-active.plist
-launchctl load ~/Library/LaunchAgents/io.github.mrskill.claude-account-move.heal-active.plist
+mkdir -p ~/Library/LaunchAgents
+P=~/Library/LaunchAgents/io.github.mrskill.claude-account-move.heal-active.plist
+cp deploy/heal-active.plist "$P"
+plutil -replace ProgramArguments.2 -string "exec \"$PWD/claude-account-move\" heal-active --from-log --apply >> \"\$HOME/Library/Logs/claude-account-move-heal-active.log\" 2>&1" "$P"
+plutil -lint "$P"
+launchctl load "$P"
 ```
+
+A repository path that contains a double quote, a dollar sign or a backtick is
+not supported.
 
 To remove it: `launchctl unload` the same file, then delete the file.
 

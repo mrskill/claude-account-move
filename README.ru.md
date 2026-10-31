@@ -159,12 +159,21 @@ CLAUDE_ACCOUNT_MOVE_HOME="$HOME/Documents/claude-account-move-state"
 падает с ENOTDIR; команда превращает ее в настоящий каталог) и пишет журнал в
 `~/Library/Logs/claude-account-move-heal-active.log`. Заглушка `__REPO__`
 означает папку, где лежит `claude-account-move`. Установите сами (инструмент
-этого не делает), из папки репозитория:
+этого не делает). Выполните эти строки из папки репозитория; строка
+`plutil -replace` подставляет вашу папку вместо `__REPO__` (путь с пробелами,
+`&` или `#` допустим):
 
 ```sh
-sed "s#__REPO__#$PWD#g" deploy/heal-active.plist > ~/Library/LaunchAgents/io.github.mrskill.claude-account-move.heal-active.plist
-launchctl load ~/Library/LaunchAgents/io.github.mrskill.claude-account-move.heal-active.plist
+mkdir -p ~/Library/LaunchAgents
+P=~/Library/LaunchAgents/io.github.mrskill.claude-account-move.heal-active.plist
+cp deploy/heal-active.plist "$P"
+plutil -replace ProgramArguments.2 -string "exec \"$PWD/claude-account-move\" heal-active --from-log --apply >> \"\$HOME/Library/Logs/claude-account-move-heal-active.log\" 2>&1" "$P"
+plutil -lint "$P"
+launchctl load "$P"
 ```
+
+Путь к репозиторию с двойной кавычкой, знаком доллара или обратным апострофом
+не поддерживается.
 
 Чтобы убрать: `launchctl unload` того же файла, затем удалите файл.
 

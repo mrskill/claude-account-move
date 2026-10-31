@@ -21,7 +21,7 @@
 - `deploy/com.neurovision.heal-active.plist` is now the template
   `deploy/heal-active.plist`: label
   `io.github.mrskill.claude-account-move.heal-active`, the program path is the
-  placeholder `__REPO__` (the README shows the `sed` line that fills it in) and
+  placeholder `__REPO__` (the README shows the `plutil -replace` step that fills it in) and
   the log is `~/Library/Logs/claude-account-move-heal-active.log`.
 - The READMEs no longer name a personal folder.
 - `heal-active` no longer refuses every symlink inside the moved folder. A
