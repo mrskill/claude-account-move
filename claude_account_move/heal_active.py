@@ -165,20 +165,43 @@ def a_real(path):
 
 
 def relative_link_problem(root):
-    """Why the tree at `root` cannot be moved safely, or None. Any symlink in it
-    is refused (a relative symlink may change its target after the move), except
-    a plain sibling name (no slash, not . or ..): that can never leave its folder."""
+    """Why the tree at `root` cannot be moved safely, or None. A relative symlink
+    is fine when its target, normalized lexically from the link's own folder, stays
+    at or below `root` (it points at the same file after the move); one that leaves
+    the folder is refused, since its target would change; so is one that, resolved,
+    leaves the folder or points at its own folder or a parent. An absolute symlink into
+    `root` is refused (it would keep pointing at the old place); one outside is
+    fine. A dangling link inside the tree is allowed."""
     errors = []
+    roots = {root, os.path.realpath(root)}
     for dp, dns, fns in os.walk(root, onerror=errors.append):
         for n in dns + fns:
             p = os.path.join(dp, n)
             if not os.path.islink(p):
                 continue
             link = os.readlink(p)
-            if link and os.sep not in link and link not in (".", ".."):
+            if os.path.isabs(link):
+                # the literal path and the one through a resolved folder (/var vs
+                # /private/var), against both spellings of the root
+                seen = (os.path.normpath(link), a_real(os.path.normpath(link)))
+                if any(inside(t, r) for t in seen for r in roots):
+                    return ("absolute symlink check: %s -> %s points into the folder "
+                            "and would keep pointing at the old place after the move"
+                            % (p, link))
                 continue
-            return ("relative symlink check: %s -> %s is a symlink inside the folder "
-                    "and could change its target after the move" % (p, link))
+            # position inside the folder, so a name like ../<root name>/x is not
+            # taken for an inside target
+            rel = os.path.normpath(os.path.join(os.path.relpath(dp, root), link))
+            # the lexical form ignores symlinked folders on the way (d/../x with
+            # d -> .), so the resolved target must stay inside as well; a link to
+            # its own folder or a parent of it would make the tree loop
+            real = os.path.realpath(p)
+            if (rel == os.pardir or rel.startswith(os.pardir + os.sep)
+                    or not inside(real, os.path.realpath(root))
+                    or inside(os.path.realpath(dp), real)):
+                return ("relative symlink check: %s -> %s leaves the folder or "
+                        "loops back on it and could change its target after the move"
+                        % (p, link))
     if errors:
         return "cannot read the folder %s completely: %s" % (root, errors[0])
     return None
