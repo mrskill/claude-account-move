@@ -2,17 +2,16 @@
 
 ## Unreleased
 
-- `prepare` counts a recent ENOTDIR line only for the pair the app writes now
-  (the pair `heal-active` also takes from the app log: the newest save, read or
-  ENOTDIR line after the last "account changed" line). An ENOTDIR line about a
-  symlinked pair the app has already left is stale and no longer fails the
-  "active pair writable" check; when the app log names no current pair, every
-  recent hit on a symlinked pair counts as before. Live case 02.11.2026:
-  `prepare` failed on ENOTDIR lines of 01.11 for pair `d9bbd39a`, whose
-  local-agent folder is a symlink to the current pair `252e7efa`, while the app
-  was writing to `252e7efa`; healing the old pair would have turned the current
-  one into a symlink. `heal_active.recent_enotdir` takes an optional `current=`
-  pair for tests.
+- `prepare` no longer fails on a stale ENOTDIR line. A recent ENOTDIR line for a
+  symlinked pair is cleared only by a later store-root load in the same store
+  (`Loaded N sessions from <store>/<account>/<org>`, no `enotdir`/`fail`/`error`,
+  nothing deeper than the org) that names another pair: the app logs no
+  successful saves, and the root it loads is the root it writes into. A card
+  read or save of another pair, a load in the other store, `account changed`, a
+  failed or deeper load and a load of the same pair do not clear it. Live case
+  02.11.2026: ENOTDIR lines of 01.11 for pair `d9bbd39a`, a symlink to the
+  current pair `252e7efa`. `heal_active.recent_enotdir(paths, now, max_age_s)`
+  reads the log once and no longer calls `log_pair`.
 - `heal-active` no longer refuses every symlink inside the moved folder. A
   relative link whose target stays inside the folder points at the same file
   after the move and is now allowed (live case 31.10.2026:
