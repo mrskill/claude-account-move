@@ -1,30 +1,60 @@
-"""ORACLE: `prepare` counts an ENOTDIR line only for the pair the app writes now.
+"""ORACLE (round 2): `prepare` counts an ENOTDIR line unless the app has since
+re-rooted its store onto another pair.
 
-Defect measured live on 02.11.2026. `prepare` failed on the check "active pair
-writable" (pre_move_check.check_enotdir -> heal_active.recent_enotdir) because of
-ENOTDIR lines from 01.11 19:16 about pair <A>/d9bbd39a, whose
-local-agent-mode-sessions folder is a symlink. The app no longer writes there:
-heal_active.log_pair(paths), the newest save/read/ENOTDIR line naming a store
-pair, returns <A>/252e7efa, a real directory in both stores. The two org folders
-share one real folder (d9bbd39a -> 252e7efa), so healing d9bbd39a would turn the
-current pair into a symlink (ping-pong). The check must not block on a pair the
-app has left.
+Defect measured live on 02.11.2026. `prepare` failed on "active pair writable"
+(pre_move_check.check_enotdir -> heal_active.recent_enotdir) because of ENOTDIR
+lines from 01.11 19:16 about pair <A>/d9bbd39a, whose local-agent-mode-sessions
+folder is a symlink to <A>/252e7efa. The app has since reloaded its stores onto
+<A>/252e7efa, so the old failure is stale; healing d9bbd39a would turn the real
+pair into a symlink (ping-pong).
 
-Rule pinned here. When log_pair(paths) returns a pair, only ENOTDIR hits whose
-(account, org) equals that current pair count. When log_pair returns None, every
-recent hit on a symlinked pair counts (today's behaviour). Unchanged: the 2-day
-window, the symlink condition, the ignoring of non-store paths.
+What the real main.log shows (measured 02.11.2026): the app logs NO successful
+saves. It logs failures and, at store start, ONE line per store root:
+  [info] Loaded 176 persisted sessions from <home>/Library/Application Support/
+         Claude/local-agent-mode-sessions/<acc>/<org>
+  [info] Loaded 1812 persisted sessions from <home>/.../claude-code-sessions/
+         <acc>/<org> (200 archived deferred, 1331 ms)
+The root it loads is the root it then writes cards into.
 
-Tests 1 and 5 of the brief (stale ENOTDIR on a pair the app left; direct
-recent_enotdir) are red on the release b2ced7e; the others pin behaviour that
-must not change. Fake HOME only; the real ~/Library is never touched.
+Rule pinned here (judge ruling after the Codex review of d01b696, which found that
+a read of pair B suppressed a write failure on A, that success in one store
+suppressed a failure in the other, and that log_pair() and the hit scan read the
+log twice):
+
+ R1. A hit is a timestamped main.log line of the last 2 days containing ENOTDIR
+     and naming <store>/<acc>/<org> whose pair path is a symlink now.
+ R2. A hit on pair P in store S is cleared only by a LATER line in the same
+     snapshot that is a store-root load in the SAME store S naming a pair Q != P
+     (account or org differ, compared lower-case).
+ R3. A store-root load is a timestamped line with no enotdir/fail/error
+     (case-insensitive) containing `loaded` and `sessions from`
+     (case-insensitive), where the character right after the org UUID of the
+     matched pair path is not `/` (end of line, space, quote, `(` are fine).
+ R4. Nothing else clears a hit: not a card read, not a `Saved session` line, not
+     a root load in the OTHER store, not `account changed`, not a failed load, not
+     a load of a deeper path.
+ R5. A root load naming P itself does not clear P; an ENOTDIR on P after a
+     clearing root load is a new hit and counts.
+ R6. One snapshot: recent_enotdir reads the log once per call
+     (heal_active._log_text called once) and no longer calls log_pair.
+ R7. Signature: recent_enotdir(paths, now=None, max_age_s=ENOTDIR_MAX_AGE_S);
+     the `current` parameter of d01b696 is gone. Return shape: [(store, path, line)].
+ Unchanged: the 2-day window, the symlink condition, non-store paths ignored,
+ prepare exit 3 with the symlink path in stdout on a counted hit, exit 0 and
+ `ready: true` otherwise.
+
+Every case runs for both stores unless it is inherently two-store; each goes
+through `prepare --json` and directly through `recent_enotdir`. Fake HOME only;
+the real ~/Library is never touched.
 """
+import inspect
 import os
 import shutil
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -32,175 +62,46 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, ROOT)
 import test_heal_active as tha  # noqa: E402
 from fixture import CC, LAM, Home, uid  # noqa: E402
-from test_cli import A, O1, build_source, parse  # noqa: E402
+from test_cli import A, B, O1, O2, build_source, parse  # noqa: E402
 
 from claude_account_move import heal_active  # noqa: E402
 from claude_account_move.common import Paths  # noqa: E402
 
 STORES = (CC, LAM)
-O_NOW = uid(0x25, 2)        # the pair the app writes now (252e7efa in the field)
+O_NOW = uid(0xab, 0xcd)     # Q: the pair the app loads now (real dir); has hex letters
+O3 = uid(0x33, 3)           # a second symlinked pair, for the two-store case
+SUFFIXES = ("", " (200 archived deferred, 1331 ms)", "'", '"', " ")
 
 
 def stamp(age):
     return (datetime.now() - age).strftime("%Y-%m-%d %H:%M:%S")
 
 
-class EnotdirCurrentPair(tha.Base):
-    """prepare: ENOTDIR on a symlinked pair the app has left does not block."""
+def other(store):
+    return LAM if store == CC else CC
 
-    # the helper of the existing class, reused: appends an ENOTDIR line for the
-    # pair (account, org) of a store and returns that pair's path
-    enotdir = tha.PrepareEnotdir.enotdir
+
+class Enotdir(tha.Base):
+    enotdir = tha.PrepareEnotdir.enotdir    # appends an ENOTDIR failure line, returns the path
+
+    # -- fixtures -----------------------------------------------------------
 
     def fresh(self):
-        """A new fake home with account A, org O1 (cards), as build_source makes."""
-        self.tmp = tempfile.mkdtemp(prefix="cam-enotdir-cur-")
+        """A new fake home: account A, org O1 with cards (build_source); the
+        real pair Q = O_NOW in both stores."""
+        self.tmp = tempfile.mkdtemp(prefix="cam-r2-")
         self.h = Home(self.tmp)
         self.addCleanup(shutil.rmtree, self.tmp, True)
         build_source(self.h)
+        for store in STORES:
+            self.h.pair(store, A, O_NOW)
 
     def setUp(self):
         self.fresh()
 
-    # -- fixtures -----------------------------------------------------------
-
-    def current_pair_real(self):
-        """O_NOW is a real directory in both stores; in each store O1 is an
-        alias of it only where `alias_in` says so (see alias)."""
-        for store in STORES:
-            self.h.pair(store, A, O_NOW)
-
     def alias(self, store):
-        """The live shape: in `store`, O1 -> O_NOW (O_NOW real, holding the cards)."""
-        o1 = os.path.join(self.h.support, store, A, O1)
-        now = os.path.join(self.h.support, store, A, O_NOW)
-        shutil.rmtree(now, ignore_errors=True)      # the empty one made above
-        os.rename(o1, now)
-        os.symlink(now, o1)
-        return o1
-
-    def line(self, text, age=timedelta(minutes=5)):
-        with open(self.h.home + "/Library/Logs/Claude/main.log", "a") as fh:
-            fh.write("%s %s\n" % (stamp(age), text))
-
-    def path(self, store, org):
-        return os.path.join(self.h.support, store, A, org)
-
-    def save_line(self, store, org, age=timedelta(minutes=5)):
-        self.line("[info] Saved session local_x to %s/local_x.json"
-                  % self.path(store, org), age)
-
-    def read_line(self, store, org, age=timedelta(minutes=5)):
-        self.line("[info] Read session local_x from %s/local_x.json"
-                  % self.path(store, org), age)
-
-    def log_pair(self):
-        return heal_active.log_pair(Paths(self.h.home, self.h.state))
-
-    def prepare(self):
-        return self.h.run("prepare", "--json")
-
-    # -- 1. the live case ---------------------------------------------------
-
-    def test_stale_enotdir_on_left_pair_newer_save_on_real_pair_is_ready(self):
-        for store in STORES:
-            for kind in ("save", "read"):
-                with self.subTest(store=store, newer_line=kind):
-                    self.fresh()
-                    self.current_pair_real()
-                    self.alias(store)
-                    self.enotdir(store, A, O1, timedelta(hours=1))
-                    getattr(self, kind + "_line")(store, O_NOW)
-                    self.assertEqual(self.log_pair(), (A, O_NOW))   # premise
-                    r = self.prepare()
-                    self.assertEqual(r.returncode, 0, r.stdout)
-                    self.assertTrue(parse(r)["ready"], r.stdout)
-
-    # -- 2. the app came back to the symlinked pair -------------------------
-
-    def test_newer_line_names_the_symlinked_pair_again_fails(self):
-        cases = (
-            ("save", lambda s: self.save_line(s, O1)),
-            ("read", lambda s: self.read_line(s, O1)),
-            ("enotdir", lambda s: self.enotdir(s, A, O1, timedelta(minutes=5))),
-        )
-        for store in STORES:
-            for kind, newer in cases:
-                with self.subTest(store=store, newer_line=kind):
-                    self.fresh()
-                    self.current_pair_real()
-                    o1 = self.alias(store)
-                    self.enotdir(store, A, O1, timedelta(hours=1))
-                    self.save_line(store, O_NOW, timedelta(minutes=30))
-                    newer(store)                       # last word: O1 again
-                    self.assertEqual(self.log_pair(), (A, O1))      # premise
-                    r = self.prepare()
-                    self.assertEqual(r.returncode, 3, r.stdout)
-                    self.assertFalse(parse(r)["ready"])
-                    self.assertIn("ENOTDIR", r.stdout)
-                    self.assertIn(o1, r.stdout)
-
-    # -- 3. log_pair is the symlinked pair itself ---------------------------
-
-    def test_recent_enotdir_alone_current_pair_is_the_symlinked_one_fails(self):
-        for store in STORES:
-            with self.subTest(store=store):
-                self.fresh()
-                self.current_pair_real()
-                o1 = self.alias(store)
-                self.enotdir(store, A, O1, timedelta(hours=1))
-                self.assertEqual(self.log_pair(), (A, O1))          # premise
-                r = self.prepare()
-                self.assertEqual(r.returncode, 3, r.stdout)
-                self.assertFalse(parse(r)["ready"])
-                self.assertIn(o1, r.stdout)
-
-    # -- 4. log_pair is None: today's behaviour -----------------------------
-
-    def test_no_current_pair_known_recent_enotdir_on_symlink_fails(self):
-        for store in STORES:
-            with self.subTest(store=store):
-                self.fresh()
-                self.current_pair_real()
-                o1 = self.alias(store)
-                self.enotdir(store, A, O1, timedelta(hours=1))
-                self.line("[info] account changed: signed in as someone else",
-                          timedelta(minutes=30))
-                self.assertIsNone(self.log_pair())                  # premise
-                r = self.prepare()
-                self.assertEqual(r.returncode, 3, r.stdout)
-                self.assertFalse(parse(r)["ready"])
-                self.assertIn(o1, r.stdout)
-
-    def test_no_current_pair_known_even_after_a_save_on_real_pair(self):
-        """A save on the real pair BEFORE "account changed" does not make it
-        current: log_pair forgets it, so every recent hit counts again."""
-        for store in STORES:
-            with self.subTest(store=store):
-                self.fresh()
-                self.current_pair_real()
-                o1 = self.alias(store)
-                self.enotdir(store, A, O1, timedelta(hours=2))
-                self.save_line(store, O_NOW, timedelta(hours=1))
-                self.line("[info] account changed", timedelta(minutes=30))
-                self.assertIsNone(self.log_pair())                  # premise
-                r = self.prepare()
-                self.assertEqual(r.returncode, 3, r.stdout)
-                self.assertIn(o1, r.stdout)
-
-
-class RecentEnotdirUnit(tha.Base):
-    """heal_active.recent_enotdir directly."""
-
-    enotdir = tha.PrepareEnotdir.enotdir
-
-    def setUp(self):
-        tha.Base.setUp(self)
-        build_source(self.h)
-        for store in STORES:
-            self.h.pair(store, A, O_NOW)
-
-    def alias(self, store):
+        """The live shape: in `store`, O1 -> O_NOW (O_NOW real, holding the cards).
+        Returns the symlink path of P = O1."""
         o1 = os.path.join(self.h.support, store, A, O1)
         now = os.path.join(self.h.support, store, A, O_NOW)
         shutil.rmtree(now, ignore_errors=True)
@@ -208,56 +109,337 @@ class RecentEnotdirUnit(tha.Base):
         os.symlink(now, o1)
         return o1
 
-    def append(self, text, age):
+    def symlink_pair(self, store, org, acc=A, target=O_NOW):
+        """pair `org` of `store` as a symlink to the real pair `target`."""
+        p = os.path.join(self.h.support, store, acc, org)
+        shutil.rmtree(p, ignore_errors=True)
+        os.symlink(os.path.join(self.h.support, store, acc, target), p)
+        return p
+
+    def path(self, store, org, acc=A):
+        return os.path.join(self.h.support, store, acc, org)
+
+    def line(self, text, age=timedelta(minutes=5)):
         with open(self.h.home + "/Library/Logs/Claude/main.log", "a") as fh:
             fh.write("%s %s\n" % (stamp(age), text))
+
+    def read_line(self, store, org, age=timedelta(minutes=5), acc=A):
+        self.line("[info] Read session local_x from %s/local_x.json"
+                  % self.path(store, org, acc), age)
+
+    def save_line(self, store, org, age=timedelta(minutes=5), acc=A):
+        self.line("[info] Saved session local_x to %s/local_x.json"
+                  % self.path(store, org, acc), age)
+
+    def load_line(self, store, org, age=timedelta(minutes=5), acc=A, suffix="",
+                  upper=False):
+        p = self.path(store, org, acc)
+        if upper:
+            p = p.replace(org, org.upper()).replace(acc, acc.upper())
+        self.line("[info] Loaded 176 persisted sessions from %s%s" % (p, suffix), age)
 
     def paths(self):
         return Paths(self.h.home, self.h.state)
 
-    def test_stale_enotdir_on_left_pair_returns_nothing(self):
+    def hits(self):
+        return [(s, p) for s, p, _l in heal_active.recent_enotdir(self.paths())]
+
+    def prepare(self):
+        return self.h.run("prepare", "--json")
+
+    def blocks(self, store, p):
+        """Both views agree: the hit on symlink `p` of `store` counts."""
+        self.assertEqual(self.hits(), [(store, p)])
+        r = self.prepare()
+        self.assertEqual(r.returncode, 3, r.stdout)
+        self.assertFalse(parse(r)["ready"], r.stdout)
+        self.assertIn("ENOTDIR", r.stdout)
+        self.assertIn(p, r.stdout)
+
+    def clear(self):
+        """Both views agree: no hit counts."""
+        self.assertEqual(self.hits(), [])
+        r = self.prepare()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertTrue(parse(r)["ready"], r.stdout)
+
+    def scene(self, store):
+        """fresh home, P = O1 aliased to Q in `store`, ENOTDIR on P an hour ago."""
+        self.fresh()
+        p = self.alias(store)
+        self.enotdir(store, A, O1, timedelta(hours=1))
+        return p
+
+    # -- N1 (Codex 1): a read or a save of Q is not a writer transition ------
+
+    def test_n1_later_card_read_from_real_pair_still_blocks(self):
         for store in STORES:
             with self.subTest(store=store):
-                self.tearDown()
-                tha.Base.setUp(self)
-                build_source(self.h)
-                for s in STORES:
-                    self.h.pair(s, A, O_NOW)
+                p = self.scene(store)
+                self.read_line(store, O_NOW)
+                self.blocks(store, p)
+
+    def test_n1_later_saved_session_on_real_pair_still_blocks(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                p = self.scene(store)
+                self.save_line(store, O_NOW)
+                self.blocks(store, p)
+
+    # -- N2 (Codex 2): the evidence must come from the SAME store ------------
+
+    def test_n2_root_load_only_in_the_other_store_still_blocks(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                p = self.scene(store)
+                self.load_line(other(store), O_NOW)
+                self.blocks(store, p)
+
+    def test_n2_two_stores_different_pairs_only_the_uncleared_hit_is_returned(self):
+        for lam_cleared in (False, True):
+            with self.subTest(lam_cleared=lam_cleared):
+                self.fresh()
+                stale, live = (CC, LAM) if lam_cleared else (LAM, CC)
+                # `live` keeps its hit: P = O1 symlink, no root load in `live`
+                live_p = self.alias(live)
+                self.enotdir(live, A, O1, timedelta(hours=1))
+                # `stale` has its own symlinked pair O3, hit, then a root load of Q
+                self.symlink_pair(stale, O3)
+                self.enotdir(stale, A, O3, timedelta(minutes=50))
+                self.load_line(stale, O_NOW, timedelta(minutes=5))
+                self.assertEqual(self.hits(), [(live, live_p)])
+                r = self.prepare()
+                self.assertEqual(r.returncode, 3, r.stdout)
+                self.assertFalse(parse(r)["ready"], r.stdout)
+                self.assertIn(live_p, r.stdout)
+
+    # -- N3 (Codex 3): one snapshot per call, no log_pair --------------------
+
+    def test_n3_one_log_read_per_call_and_log_pair_is_not_called(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                p = self.scene(store)
+                hit = ("%s [error] Failed to save session local_x: ENOTDIR: not a "
+                       "directory, mkdir '%s' at ensureStorageDir\n"
+                       % (stamp(timedelta(hours=1)), p))
+                load = ("%s [info] Loaded 176 persisted sessions from %s\n"
+                        % (stamp(timedelta(minutes=5)), self.path(store, O_NOW)))
+                again = ("%s [error] Failed to save session local_x: ENOTDIR: not a "
+                         "directory, mkdir '%s' at ensureStorageDir\n"
+                         % (stamp(timedelta(minutes=1)), p))
+                snap1 = hit + load
+                snap2 = snap1 + again
+                calls = []
+
+                def fake_log_text(_paths):
+                    calls.append(1)
+                    return snap1 if len(calls) == 1 else snap2
+
+                with mock.patch.object(heal_active, "_log_text",
+                                       side_effect=fake_log_text) as lt, \
+                        mock.patch.object(heal_active, "log_pair",
+                                          side_effect=AssertionError(
+                                              "recent_enotdir must not call log_pair")):
+                    hits = heal_active.recent_enotdir(self.paths())
+                    self.assertEqual(lt.call_count, 1)
+                self.assertEqual(hits, [])             # snapshot 1: hit cleared
+                # a second call is a new snapshot (here: snapshot 2): the new hit counts
+                with mock.patch.object(heal_active, "_log_text",
+                                       return_value=snap2) as lt:
+                    hits = heal_active.recent_enotdir(self.paths())
+                    self.assertEqual(lt.call_count, 1)
+                self.assertEqual([(s, q) for s, q, _l in hits], [(store, p)])
+
+    # -- R7: signature -------------------------------------------------------
+
+    def test_r7_signature_has_no_current_parameter(self):
+        sig = inspect.signature(heal_active.recent_enotdir)
+        self.assertEqual(list(sig.parameters), ["paths", "now", "max_age_s"])
+        self.assertIsNone(sig.parameters["now"].default)
+        self.assertEqual(sig.parameters["max_age_s"].default,
+                         heal_active.ENOTDIR_MAX_AGE_S)
+
+    def test_r7_return_shape_is_store_path_line(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                p = self.scene(store)
+                hits = heal_active.recent_enotdir(self.paths())
+                self.assertEqual(len(hits), 1)
+                s, q, ln = hits[0]
+                self.assertEqual((s, q), (store, p))
+                self.assertIn("ENOTDIR", ln)
+
+    # -- N4: account changed is not a root load ------------------------------
+
+    def test_n4_account_changed_after_the_hit_still_blocks(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                p = self.scene(store)
+                self.line("[info] account changed: signed in as someone else",
+                          timedelta(minutes=30))
+                self.blocks(store, p)
+
+    def test_n4_account_changed_after_a_root_load_before_the_hit_still_blocks(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                self.fresh()
+                p = self.alias(store)
+                self.load_line(store, O_NOW, timedelta(hours=2))   # before the hit
+                self.enotdir(store, A, O1, timedelta(hours=1))
+                self.line("[info] account changed", timedelta(minutes=30))
+                self.blocks(store, p)
+
+    # -- N5: R5 --------------------------------------------------------------
+
+    def test_n5_root_load_of_the_same_pair_does_not_clear(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                p = self.scene(store)
+                self.load_line(store, O1)
+                self.blocks(store, p)
+
+    def test_n5_new_enotdir_after_a_clearing_root_load_counts(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                p = self.scene(store)
+                self.load_line(store, O_NOW, timedelta(minutes=30))
+                self.enotdir(store, A, O1, timedelta(minutes=10))
+                self.blocks(store, p)
+
+    # -- N6: R4 / R3 ---------------------------------------------------------
+
+    def test_n6_failed_load_of_another_pair_does_not_clear(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                p = self.scene(store)
+                self.line("[error] Failed to load sessions from %s"
+                          % self.path(store, O_NOW))
+                self.blocks(store, p)
+
+    def test_n6_load_of_a_deeper_path_does_not_clear(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                p = self.scene(store)
+                self.line("[info] Loaded 3 sessions from %s/sub"
+                          % self.path(store, O_NOW))
+                self.blocks(store, p)
+
+    def test_n6_load_line_with_error_or_enotdir_or_fail_does_not_clear(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                p = self.scene(store)
+                for word in ("2 errors", "ENOTDIR", "fail"):
+                    self.line("[info] Loaded 3 persisted sessions from %s (%s)"
+                              % (self.path(store, O_NOW), word))
+                self.blocks(store, p)
+
+    def test_n6_untimestamped_load_line_does_not_clear(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                p = self.scene(store)
+                with open(self.h.home + "/Library/Logs/Claude/main.log", "a") as fh:
+                    fh.write("Loaded 176 persisted sessions from %s\n"
+                             % self.path(store, O_NOW))
+                self.blocks(store, p)
+
+    # -- N7: nothing later ---------------------------------------------------
+
+    def test_n7_no_later_line_blocks(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                p = self.scene(store)
+                self.blocks(store, p)
+
+    def test_n7_root_load_BEFORE_the_hit_does_not_clear(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                self.fresh()
+                p = self.alias(store)
+                self.load_line(store, O_NOW, timedelta(hours=2))
+                self.enotdir(store, A, O1, timedelta(hours=1))
+                self.blocks(store, p)
+
+    # -- P1: the live 01.11 case ---------------------------------------------
+
+    def test_p1_root_load_of_the_real_pair_in_the_same_store_clears(self):
+        for store in STORES:
+            for suffix in SUFFIXES:
+                with self.subTest(store=store, suffix=suffix):
+                    self.scene(store)
+                    self.load_line(store, O_NOW, suffix=suffix)
+                    self.clear()
+
+    def test_p1_root_load_clears_even_with_reads_and_saves_around_it(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                self.scene(store)
+                self.read_line(store, O1, timedelta(minutes=30))
+                self.load_line(store, O_NOW, timedelta(minutes=20))
+                self.read_line(store, O_NOW, timedelta(minutes=10))
+                self.clear()
+
+    def test_p1_both_stores_loaded_clears_both_hits(self):
+        self.fresh()
+        for store in STORES:
+            self.alias(store)
+            self.enotdir(store, A, O1, timedelta(hours=1))
+        for store in STORES:
+            self.load_line(store, O_NOW, timedelta(minutes=5))
+        self.clear()
+
+    # -- P2: case-insensitive UUIDs -------------------------------------------
+
+    def test_p2_mixed_case_uuids_in_the_load_line_still_clear(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                self.scene(store)
+                self.load_line(store, O_NOW, upper=True)
+                self.clear()
+
+    def test_p2_mixed_case_load_of_the_same_pair_does_not_clear(self):
+        letters = uid(0xef, 0xab)       # P with hex letters, a symlink to Q
+        for store in STORES:
+            with self.subTest(store=store):
+                self.fresh()
+                p = self.symlink_pair(store, letters)
+                self.enotdir(store, A, letters, timedelta(hours=1))
+                self.load_line(store, letters, upper=True)
+                self.assertEqual(self.hits(), [(store, p)])
+
+    # -- P3: a different account counts as a different pair -------------------
+
+    def test_p3_root_load_of_another_account_in_the_same_store_clears(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                self.scene(store)
+                self.h.pair(store, B, O2)
+                self.load_line(store, O2, acc=B)
+                self.assertEqual(self.hits(), [])
+
+    # -- unchanged behaviour ----------------------------------------------------
+
+    def test_unchanged_enotdir_older_than_two_days_is_ignored(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                self.fresh()
                 self.alias(store)
-                self.enotdir(store, A, O1, timedelta(hours=1))
-                self.append("[info] Saved session local_x to %s/local_x.json"
-                            % os.path.join(self.h.support, store, A, O_NOW),
-                            timedelta(minutes=5))
-                self.assertEqual(heal_active.log_pair(self.paths()), (A, O_NOW))
-                self.assertEqual(heal_active.recent_enotdir(self.paths()), [])
+                self.enotdir(store, A, O1, timedelta(days=3))
+                self.clear()
 
-    def test_enotdir_on_the_current_symlinked_pair_is_returned(self):
+    def test_unchanged_pair_that_is_a_real_directory_is_ignored(self):
         for store in STORES:
             with self.subTest(store=store):
-                self.tearDown()
-                tha.Base.setUp(self)
-                build_source(self.h)
-                for s in STORES:
-                    self.h.pair(s, A, O_NOW)
-                o1 = self.alias(store)
-                self.enotdir(store, A, O1, timedelta(hours=1))
-                hits = heal_active.recent_enotdir(self.paths())
-                self.assertEqual([(s, p) for s, p, _l in hits], [(store, o1)])
+                self.fresh()
+                self.enotdir(store, A, O1, timedelta(hours=1))   # O1 stays real
+                self.clear()
 
-    def test_unknown_current_pair_returns_every_recent_symlink_hit(self):
-        for store in STORES:
-            with self.subTest(store=store):
-                self.tearDown()
-                tha.Base.setUp(self)
-                build_source(self.h)
-                for s in STORES:
-                    self.h.pair(s, A, O_NOW)
-                o1 = self.alias(store)
-                self.enotdir(store, A, O1, timedelta(hours=1))
-                self.append("[info] account changed", timedelta(minutes=30))
-                self.assertIsNone(heal_active.log_pair(self.paths()))
-                hits = heal_active.recent_enotdir(self.paths())
-                self.assertEqual([(s, p) for s, p, _l in hits], [(store, o1)])
+    def test_unchanged_path_outside_the_stores_is_ignored(self):
+        self.fresh()
+        self.alias(CC)
+        self.line("[error] Failed to save: ENOTDIR: not a directory, mkdir '%s/%s/%s'"
+                  % (os.path.join(self.h.support, "other-sessions"), A, O1),
+                  timedelta(hours=1))
+        self.clear()
 
 
 if __name__ == "__main__":
