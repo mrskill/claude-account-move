@@ -522,10 +522,17 @@ def recover(paths):
     return msgs, errs
 
 
-def recent_enotdir(paths, now=None, max_age_s=ENOTDIR_MAX_AGE_S):
+def recent_enotdir(paths, now=None, max_age_s=ENOTDIR_MAX_AGE_S, current=None):
     """[(store, path, line)] of ENOTDIR lines of the last 2 days in main.log
-    that name a sessions-store pair which is still a symlink."""
+    that name a sessions-store pair which is still a symlink.
+
+    Only the pair the app writes now counts: when log_pair(paths) (or `current`)
+    names a pair, a hit on any other pair is stale, the app has left it, and
+    healing it would turn the current pair into a symlink (the two org folders
+    share one real folder). When no current pair is known, every hit counts."""
     now = time.time() if now is None else now
+    if current is None:
+        current = log_pair(paths)
     text = _log_text(paths)
     found, seen = [], set()
     for line in text.splitlines():
@@ -543,6 +550,8 @@ def recent_enotdir(paths, now=None, max_age_s=ENOTDIR_MAX_AGE_S):
             continue
         for store, acc, org in _PAIR_PATH.findall(line):
             if not (UUID_RE.match(acc) and UUID_RE.match(org)):
+                continue
+            if current and (acc.lower(), org.lower()) != current:
                 continue
             p = pair_path(paths, store, (acc, org))
             if p not in seen and os.path.islink(p):

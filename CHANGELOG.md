@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `prepare` counts a recent ENOTDIR line only for the pair the app writes now
+  (the pair `heal-active` also takes from the app log: the newest save, read or
+  ENOTDIR line after the last "account changed" line). An ENOTDIR line about a
+  symlinked pair the app has already left is stale and no longer fails the
+  "active pair writable" check; when the app log names no current pair, every
+  recent hit on a symlinked pair counts as before. Live case 02.11.2026:
+  `prepare` failed on ENOTDIR lines of 01.11 for pair `d9bbd39a`, whose
+  local-agent folder is a symlink to the current pair `252e7efa`, while the app
+  was writing to `252e7efa`; healing the old pair would have turned the current
+  one into a symlink. `heal_active.recent_enotdir` takes an optional `current=`
+  pair for tests.
 - `heal-active` no longer refuses every symlink inside the moved folder. A
   relative link whose target stays inside the folder points at the same file
   after the move and is now allowed (live case 31.10.2026:
