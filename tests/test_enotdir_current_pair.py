@@ -23,9 +23,12 @@ log twice):
 
  R1. A hit is a timestamped main.log line of the last 2 days containing ENOTDIR
      and naming <store>/<acc>/<org> whose pair path is a symlink now.
- R2. A hit on pair P in store S is cleared only by a LATER line in the same
-     snapshot that is a store-root load in the SAME store S naming a pair Q != P
-     (account or org differ, compared lower-case).
+ R2. (round 3, replaces the round-2 wording) A hit on pair P in store S is
+     cleared only when the LAST store-root load in S that comes after the hit
+     names a pair Q != P (account or org differ, compared lower-case). If the
+     last later root load in S names P, or there is none, the hit counts.
+     Loads of the other store never matter. Each hit is judged on its own: with
+     two hits P1 and P2 in S and a last later load of P2, P2 counts, P1 is cleared.
  R3. A store-root load is a timestamped line with no enotdir/fail/error
      (case-insensitive) containing `loaded` and `sessions from`
      (case-insensitive), where the character right after the org UUID of the
@@ -33,8 +36,10 @@ log twice):
  R4. Nothing else clears a hit: not a card read, not a `Saved session` line, not
      a root load in the OTHER store, not `account changed`, not a failed load, not
      a load of a deeper path.
- R5. A root load naming P itself does not clear P; an ENOTDIR on P after a
-     clearing root load is a new hit and counts.
+ R5. A root load naming P itself does not clear P, and it undoes an earlier
+     clearing load: ENOTDIR(P) -> Loaded(Q) -> Loaded(P) counts (the writer came
+     back to P, found by Codex r2 on 86be622); ... -> Loaded(Q) clears again. An
+     ENOTDIR on P after a clearing root load is a new hit and counts.
  R6. One snapshot: recent_enotdir reads the log once per call
      (heal_active._log_text called once) and no longer calls log_pair.
  R7. Signature: recent_enotdir(paths, now=None, max_age_s=ENOTDIR_MAX_AGE_S);
@@ -341,6 +346,44 @@ class Enotdir(tha.Base):
                     fh.write("Loaded 176 persisted sessions from %s\n"
                              % self.path(store, O_NOW))
                 self.blocks(store, p)
+
+    # -- N8..N11 (round 3): only the LAST later root load in the store decides --
+
+    def test_n8_load_q_then_load_p_again_blocks(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                p = self.scene(store)
+                self.load_line(store, O_NOW, timedelta(minutes=30))
+                self.load_line(store, O1, timedelta(minutes=10))
+                self.blocks(store, p)
+
+    def test_n9_load_q_load_p_load_q_clears(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                self.scene(store)
+                self.load_line(store, O_NOW, timedelta(minutes=30))
+                self.load_line(store, O1, timedelta(minutes=20))
+                self.load_line(store, O_NOW, timedelta(minutes=10))
+                self.clear()
+
+    def test_n10_load_of_p_in_the_other_store_never_matters(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                self.scene(store)
+                self.load_line(store, O_NOW, timedelta(minutes=30))
+                self.load_line(other(store), O1, timedelta(minutes=10))
+                self.clear()
+
+    def test_n11_two_hits_last_load_names_one_of_them(self):
+        for store in STORES:
+            with self.subTest(store=store):
+                self.fresh()
+                self.alias(store)                              # P1 = O1 -> Q
+                p2 = self.symlink_pair(store, O3)              # P2 = O3 -> Q
+                self.enotdir(store, A, O1, timedelta(hours=1))
+                self.enotdir(store, A, O3, timedelta(minutes=50))
+                self.load_line(store, O3, timedelta(minutes=5))
+                self.blocks(store, p2)                         # P1 cleared, P2 counts
 
     # -- N7: nothing later ---------------------------------------------------
 
