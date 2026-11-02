@@ -3,12 +3,13 @@
 ## Unreleased
 
 - `prepare` no longer fails on a stale ENOTDIR line. A recent ENOTDIR line for a
-  symlinked pair is cleared only by a later store-root load in the same store
-  (`Loaded N sessions from <store>/<account>/<org>`, no `enotdir`/`fail`/`error`,
-  nothing deeper than the org) that names another pair: the app logs no
-  successful saves, and the root it loads is the root it writes into. A card
-  read or save of another pair, a load in the other store, `account changed`, a
-  failed or deeper load and a load of the same pair do not clear it. Live case
+  symlinked pair is cleared only when the last later store-root load in the same
+  store (`Loaded N sessions from <store>/<account>/<org>`, no
+  `enotdir`/`fail`/`error`, nothing deeper than the org) names another pair: the
+  app logs no successful saves, and the root it loads is the root it writes
+  into. With no later load, or when the last one names the same pair again, the
+  hit counts. A card read or save of another pair, a load in the other store,
+  `account changed`, and a failed or deeper load do not clear it. Live case
   02.11.2026: ENOTDIR lines of 01.11 for pair `d9bbd39a`, a symlink to the
   current pair `252e7efa`. `heal_active.recent_enotdir(paths, now, max_age_s)`
   reads the log once and no longer calls `log_pair`.

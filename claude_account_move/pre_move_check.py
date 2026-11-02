@@ -210,14 +210,14 @@ def check_settings(paths):
 
 def check_enotdir(paths):
     """No recent write failure (ENOTDIR) on a pair that is still a symlink, unless
-    the app has since loaded another store root in the same store (it left that
-    pair)."""
+    the last later store-root load in the same store names another pair (the app
+    left that pair)."""
     from . import heal_active
     hits = heal_active.recent_enotdir(paths)
     if not hits:
         return True, ("no ENOTDIR in the last 2 days left on a symlinked pair "
-                      "(none, or the app reloaded another store root in the same "
-                      "store since)")
+                      "(none, or the last later store-root load in the same "
+                      "store names another pair)")
     return False, ("ENOTDIR (the app cannot save cards): %s. Quit the Claude app "
                    "and run `heal-active --apply`"
                    % "; ".join("%s: %s" % (s, p) for s, p, _l in hits[:5]))

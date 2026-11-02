@@ -543,12 +543,13 @@ def recent_enotdir(paths, now=None, max_age_s=ENOTDIR_MAX_AGE_S):
 
     The app logs no successful saves, only failures and, at store start, one
     "Loaded N sessions from <store>/<acc>/<org>" line per store root, the root it
-    then writes into. A hit on pair P in store S is stale only when a later
-    store-root load in the same store S names another pair Q: the app has moved
-    its writer to Q. Nothing else clears a hit (a read or a save of Q, a load in
-    the other store, a failed or deeper load, a load of P itself)."""
+    then writes into. A hit on pair P in store S is stale only when the LAST
+    store-root load in S after the hit names another pair Q: the app has moved
+    its writer to Q. With no such load, or when the last one names P again, the
+    hit counts. Nothing else matters (a read or a save of Q, a load in the other
+    store, a failed or deeper load)."""
     now = time.time() if now is None else now
-    pending = {}                       # (store, acc, org) lower-cased -> hit
+    pending = {}           # (store, acc, org) lower-cased -> [hit, last later load]
     for line in _log_text(paths).splitlines():
         if "ENOTDIR" in line:
             ts = _ts(line)
@@ -556,14 +557,19 @@ def recent_enotdir(paths, now=None, max_age_s=ENOTDIR_MAX_AGE_S):
                 continue
             for store, acc, org in _PAIR_PATH.findall(line):
                 if UUID_RE.match(acc) and UUID_RE.match(org):
-                    pending.setdefault((store, acc.lower(), org.lower()),
-                                       (store, acc, org, line.strip()[:160]))
+                    key = (store, acc.lower(), org.lower())
+                    ent = pending.setdefault(
+                        key, [(store, acc, org, line.strip()[:160]), None])
+                    ent[1] = None          # a new hit forgets the loads before it
             continue
         for store, acc, org in _root_loads(line):
-            for key in [k for k in pending if k[0] == store and k[1:] != (acc, org)]:
-                del pending[key]
+            for key, ent in pending.items():
+                if key[0] == store:
+                    ent[1] = (acc, org)
     found, seen = [], set()
-    for store, acc, org, text in pending.values():
+    for key, ((store, acc, org, text), last) in pending.items():
+        if last is not None and last != key[1:]:
+            continue
         p = pair_path(paths, store, (acc, org))
         if p not in seen and os.path.islink(p):
             seen.add(p)
