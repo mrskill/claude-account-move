@@ -522,32 +522,58 @@ def recover(paths):
     return msgs, errs
 
 
+def _root_loads(line):
+    """[(store, acc, org)] lower-cased, when `line` is a store-root load: a
+    timestamped "Loaded N ... sessions from <store>/<acc>/<org>" line without
+    enotdir/fail/error where nothing but a space, quote or "(" (or the end of the
+    line) follows the org (a deeper path is not the store root)."""
+    low = line.lower()
+    if _ts(line) is None or "loaded" not in low or "sessions from" not in low \
+            or any(k in low for k in ("enotdir", "fail", "error")):
+        return []
+    return [(s, a.lower(), o.lower()) for m in _PAIR_PATH.finditer(line)
+            for s, a, o in [m.groups()]
+            if UUID_RE.match(a) and UUID_RE.match(o)
+            and line[m.end():m.end() + 1] != "/"]
+
+
 def recent_enotdir(paths, now=None, max_age_s=ENOTDIR_MAX_AGE_S):
     """[(store, path, line)] of ENOTDIR lines of the last 2 days in main.log
-    that name a sessions-store pair which is still a symlink."""
+    (one read of the log) that name a sessions-store pair which is still a symlink.
+
+    The app logs no successful saves, only failures and, at store start, one
+    "Loaded N sessions from <store>/<acc>/<org>" line per store root, the root it
+    then writes into. A hit on pair P in store S is stale only when the LAST
+    store-root load in S after the hit names another pair Q: the app has moved
+    its writer to Q. With no such load, or when the last one names P again, the
+    hit counts. Nothing else matters (a read or a save of Q, a load in the other
+    store, a failed or deeper load)."""
     now = time.time() if now is None else now
-    text = _log_text(paths)
-    found, seen = [], set()
-    for line in text.splitlines():
-        if "ENOTDIR" not in line:
-            continue
-        m = _LINE_TS.match(line)
-        if not m:
-            continue
-        try:
-            ts = time.mktime(time.strptime(m.group(1).replace("T", " "),
-                                           "%Y-%m-%d %H:%M:%S"))
-        except (ValueError, OverflowError):
-            continue
-        if now - ts >= max_age_s:
-            continue
-        for store, acc, org in _PAIR_PATH.findall(line):
-            if not (UUID_RE.match(acc) and UUID_RE.match(org)):
+    pending = {}           # (store, acc, org) lower-cased -> [hit, last later load]
+    for line in _log_text(paths).splitlines():
+        if "ENOTDIR" in line:
+            ts = _ts(line)
+            if ts is None or now - ts >= max_age_s:
                 continue
-            p = pair_path(paths, store, (acc, org))
-            if p not in seen and os.path.islink(p):
-                seen.add(p)
-                found.append((store, p, line.strip()[:160]))
+            for store, acc, org in _PAIR_PATH.findall(line):
+                if UUID_RE.match(acc) and UUID_RE.match(org):
+                    key = (store, acc.lower(), org.lower())
+                    ent = pending.setdefault(
+                        key, [(store, acc, org, line.strip()[:160]), None])
+                    ent[1] = None          # a new hit forgets the loads before it
+            continue
+        for store, acc, org in _root_loads(line):
+            for key, ent in pending.items():
+                if key[0] == store:
+                    ent[1] = (acc, org)
+    found, seen = [], set()
+    for key, ((store, acc, org, text), last) in pending.items():
+        if last is not None and last != key[1:]:
+            continue
+        p = pair_path(paths, store, (acc, org))
+        if p not in seen and os.path.islink(p):
+            seen.add(p)
+            found.append((store, p, text))
     return found
 
 
