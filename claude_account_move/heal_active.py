@@ -549,19 +549,22 @@ def loaded_pair_problem(paths, store, pair):
 
 
 def repair_conflict(paths, loads, todo_stores):
-    """(store, path) of the first store in `todo_stores` whose repair would move
-    or replace a physical path that is, lies inside or contains the real loaded
-    pair of ANOTHER store (compared by realpath, so shared roots show up), or
-    None. The moved folder is the link target; the replaced one is the link."""
-    others = [(s, os.path.realpath(pair_path(paths, s, p)))
-              for s, p in loads.items()
-              if s not in todo_stores and loaded_pair_problem(paths, s, p) is None]
+    """(store, other store, path) of the first store in `todo_stores` whose heal
+    would move or replace a physical path that is, lies inside or contains the
+    real directory of ANOTHER store's pair in `loads` ({store: pair}), or None.
+    Paths are compared by realpath, so a shared root shows up. The moved folder
+    is the link target; the replaced one is the link. A pair of another store
+    that is missing or not a directory is not a conflict."""
     for store in todo_stores:
         a = pair_path(paths, store, loads[store])
         touched = {os.path.realpath(a),
                    os.path.join(os.path.realpath(os.path.dirname(a)),
                                 os.path.basename(a))}
-        for other, real in others:
+        for other, p in loads.items():
+            if other == store or loaded_pair_problem(paths, other, p) in (
+                    "missing", "not a directory"):
+                continue
+            real = os.path.realpath(pair_path(paths, other, p))
             for t in touched:
                 if inside(t, real) or inside(real, t):
                     return store, other, t

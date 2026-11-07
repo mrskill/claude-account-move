@@ -569,6 +569,20 @@ def _heal_locked(args, out, paths, started):
     for n in notes:
         out.say("  " + n)
     refused = [r for r in rows if r["state"] == "refuse"]
+    # a heal must not move or replace a folder that is, lies inside or contains
+    # the real directory of another store's pair (a shared physical root):
+    # refuse as a whole, before anything is moved (dry run included)
+    loads = {r["store"]: tuple(r["pair"]) for r in rows}
+    clash = heal_active.repair_conflict(
+        paths, loads, [r["store"] for r in rows if r["state"] == "heal"])
+    if clash:
+        return fail(args, out, "heal-active", started, EXIT_FAIL, "refused",
+                    "refused, nothing was changed: %s: healing %s would move or "
+                    "replace %s, which is, lies inside or contains the directory "
+                    "of %s (a shared physical root)"
+                    % (clash[0], heal_active.pair_path(paths, clash[0], loads[clash[0]]),
+                       clash[2], clash[1]),
+                    active_pair=label)
     for r in rows:
         if r["state"] == "heal":
             out.say("  %s: %s is a symlink to %s: would swap the folder into place "

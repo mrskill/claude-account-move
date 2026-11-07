@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `heal-active` refuses a shared physical root before moving anything: when a
+  heal row would move or replace a folder that is, lies inside or contains
+  another store's directory for the pair (compared by realpath, e.g. one store
+  root is a symlink to the other), the whole heal is refused with exit 3 and
+  verdict `refused`, dry run included. It shares `heal_active.repair_conflict`
+  with the `auto` repair (which now also compares against stores that are
+  healed in the same round).
 - `auto` post-start verification, round 3. The pair each store loaded must be a
   real directory whether or not the store has cards: missing or not a directory
   fails `active_pair_real` and stops `auto` with exit 3 (not healed). The log
