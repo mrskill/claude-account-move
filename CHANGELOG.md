@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `auto` post-start verification, round 2 (review findings). Per store: after
+  the start, `finish` judges each store by the pair that store loaded
+  (`store_pairs`, internal), and the repair heals only a store whose loaded pair
+  is a symlink (internal `stores` of `heal-active`); a real loaded pair is never
+  touched. Freshness is a byte position in `main.log` taken when `auto` asks
+  (`heal_active.log_mark`, `fresh_root_loads(paths, acc, mark)`): a rotated or
+  truncated log counts as all new, no clock decides. A move that `auto` stopped
+  after its first finish (no start, repair failed) is resumable again:
+  `find_unfinished_move` treats a newer failed `report-auto.json` as unfinished.
 - `auto` verifies the move after the app has started under the new account.
   Defect 1: `--active-pair` (the OLD account's pair) was copied into every step;
   now only prepare, the write probe and stamp use it, and heal-active, finish

@@ -149,12 +149,13 @@ def wait_app_closed(limit_s, poll_s, out):
     return False
 
 
-def wait_app_start(paths, account, since, limit_s, poll_s):
-    """{store: (acc, org)} once every store has a fresh store-root load of
-    `account` (log stamp at or after `since`); None when the time is up."""
+def wait_app_start(paths, account, mark, limit_s, poll_s):
+    """{store: (acc, org)} once every store has a store-root load of `account`
+    appended to main.log after `mark` (heal_active.log_mark); None when the
+    time is up."""
     deadline = time.monotonic() + max(0.0, limit_s)
     while True:
-        loads = heal_active.fresh_root_loads(paths, account, since)
+        loads = heal_active.fresh_root_loads(paths, account, mark)
         if all(s in loads for s in STORES):
             return loads
         if time.monotonic() >= deadline:
@@ -226,7 +227,21 @@ def find_unfinished_move(paths, current_app_account):
     mdir = os.path.join(root, name)
     rep, err = common.read_json(os.path.join(mdir, "report-finish.json"))
     if not err and isinstance(rep, dict) and rep.get("exit_code") == EXIT_OK:
-        return None                               # finished: a new move starts
+        # An `auto` run that stopped after its first finish (no app start, repair
+        # failed) left a finish report with exit 0 behind, but the move is not
+        # verified: a newer failed `auto` report means resume, until a later
+        # finish report (newer than that auto report) says exit 0 again.
+        fin = os.path.join(mdir, "report-finish.json")
+        arep, aerr = common.read_json(os.path.join(mdir, "report-auto.json"))
+        try:
+            newer_auto = os.path.getmtime(os.path.join(mdir, "report-auto.json")) \
+                >= os.path.getmtime(fin)
+        except OSError:
+            newer_auto = False
+        stopped = (not aerr and isinstance(arep, dict)
+                   and arep.get("exit_code") not in (None, EXIT_OK) and newer_auto)
+        if not stopped:
+            return None                           # finished: a new move starts
     before, man, move_id, problem = snap.load_baseline(paths, name, allow_unready=True)
     if man is not None and not man.get("ready"):
         return None                               # a prepare that was not ready
@@ -558,7 +573,8 @@ def cmd_auto(args, cli):
             return run_step(cli.cmd_finish, _ns(
                 args, post_login=True, wait_login=30.0, wait_sync=0.0,
                 move_id=ctx["move_id"], allow_same_account=args.allow_same_account,
-                allow_unready_baseline=False, max_age_hours=72.0))
+                allow_unready_baseline=False, max_age_hours=72.0,
+                store_pairs=ctx.get("store_pairs")))
 
         def finish_sync():
             fcode, frep = finish_once()
@@ -599,10 +615,12 @@ def cmd_auto(args, cli):
         start_poll = _poll(START_POLL_S, "CLAUDE_ACCOUNT_MOVE_START_POLL_S")
         new_acc = (read_identity(paths).get("app") or {}).get("value")
 
-        def open_and_wait(ask_text):
+        def open_and_wait(ask_text, mark=None):
+            # freshness is a position in main.log, not a clock: only lines
+            # appended after this mark count
+            mark = mark or heal_active.log_mark(paths)
             out.say(ask_text % int(args.wait_start))
-            since = int(time.time())
-            loads = wait_app_start(paths, new_acc, since, args.wait_start, start_poll)
+            loads = wait_app_start(paths, new_acc, mark, args.wait_start, start_poll)
             if loads is None:
                 step("app_start", False)
                 ctx["problem"] = ru.PROBLEM_START
@@ -610,6 +628,7 @@ def cmd_auto(args, cli):
                                   show_summary=True)
             step("app_start", True, loads=sorted("%s/%s/%s" % (s, a, o)
                                                  for s, (a, o) in loads.items()))
+            ctx["store_pairs"] = dict(loads)    # every later check: per store
             out.say(ru.START_SEEN)
             return loads, None
 
@@ -630,20 +649,26 @@ def cmd_auto(args, cli):
                 ctx["finish"] = frep
                 ctx["problem"] = ru.PROBLEM_PAIR
                 return stop(EXIT_FAIL, "app_running", ru.APP_TIMEOUT, show_summary=True)
-            hcode = EXIT_OK
-            for acc, org in sorted(set(loads.values())):
+            mark = heal_active.log_mark(paths)   # the app is quit: later lines are new
+            # per store: only a store whose loaded pair is a symlink is healed,
+            # toward its own loaded pair; stores sharing one pair go in one call
+            todo = {}
+            for store, pair in loads.items():
+                if os.path.islink(heal_active.pair_path(paths, store, pair)):
+                    todo.setdefault(pair, []).append(store)
+            for (acc, org), stores in sorted(todo.items()):
                 hcode, hrep = run_step(cli.cmd_heal_active, _ns(
                     args, post_login=True, apply=True, from_log=False,
-                    active_pair="%s/%s" % (acc, org)))
+                    active_pair="%s/%s" % (acc, org), stores=sorted(stores)))
                 step("heal_active", hcode == EXIT_OK, exit_code=hcode,
-                     verdict=(hrep or {}).get("verdict"))
+                     verdict=(hrep or {}).get("verdict"), stores=sorted(stores))
                 if hcode != EXIT_OK:
                     ctx["finish"] = frep
                     ctx["problem"] = ru.PROBLEM_STEP
                     return stop(hcode, "heal_failed", ru.HEAL_FAIL % (
                         hcode, (hrep or {}).get("reason") or (hrep or {}).get("verdict")),
                         show_summary=True)
-            loads, stopped = open_and_wait(ru.START_REPAIR_AGAIN)
+            loads, stopped = open_and_wait(ru.START_REPAIR_AGAIN, mark)
             if stopped is not None:
                 return stopped
             res, stopped = finish_sync()

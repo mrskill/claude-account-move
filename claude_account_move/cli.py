@@ -427,7 +427,8 @@ def _cmd_finish(args, out):
             args.heartbeat, args.sync_max_age_min)[0]
         report, code = post.evaluate(paths, before, index, tmap,
                                      read_identity(paths), target, source, alive,
-                                     args.active_pair, args.allow_same_account)
+                                     args.active_pair, args.allow_same_account,
+                                     getattr(args, "store_pairs", None))
         if code == EXIT_WAIT and time.monotonic() < deadline:
             out.say("waiting for the sync job to deliver ...")
             pg.wait("sync delivery", time.monotonic() - t_wait, args.wait_sync,
@@ -468,15 +469,23 @@ def _symlink_guard(paths, args, report, code):
     ident = read_identity(paths)
     target = ident["app"]["value"]
     pairs = []
-    chosen = heal_active.active_pair(paths, ident, args.active_pair)[0]
-    if chosen:
-        pairs.append(chosen)
-    try:
-        live = st.live_pair(paths, account=target, override=args.active_pair)
-    except st.PairError:
-        live = None
-    if live and tuple(live) not in [tuple(p) for p in pairs]:
-        pairs.append(live)
+    per_store = getattr(args, "store_pairs", None)
+    if per_store:
+        # the app started: each store is judged by the pair THAT store loaded
+        bad = [(s, heal_active.pair_path(paths, s, per_store[s])) for s in st.STORES
+               if s in per_store
+               and os.path.islink(heal_active.pair_path(paths, s, per_store[s]))]
+        pairs = [per_store[s] for s in st.STORES if s in per_store]
+    else:
+        chosen = heal_active.active_pair(paths, ident, args.active_pair)[0]
+        if chosen:
+            pairs.append(chosen)
+        try:
+            live = st.live_pair(paths, account=target, override=args.active_pair)
+        except st.PairError:
+            live = None
+        if live and tuple(live) not in [tuple(p) for p in pairs]:
+            pairs.append(live)
     if not pairs:
         report["checks"].append({
             "id": "active_pair_real", "name": "active pair is a real directory",
@@ -484,11 +493,12 @@ def _symlink_guard(paths, args, report, code):
             "determined, so its writability is not proven; run again with "
             "--active-pair ACCOUNT/ORG"})
         return EXIT_FAIL
-    bad = []
-    for pair in pairs:
-        for item in heal_active.symlinked(paths, pair):
-            if item not in bad:
-                bad.append(item)
+    if not per_store:
+        bad = []
+        for pair in pairs:
+            for item in heal_active.symlinked(paths, pair):
+                if item not in bad:
+                    bad.append(item)
     if not bad:
         return code
     detail = ("; ".join("%s: %s is a symlink" % (s, p) for s, p in bad)
@@ -548,6 +558,9 @@ def _heal_locked(args, out, paths, started):
                         "cannot tell the active account/organization pair: %s"
                         % (problem or "unknown"))
         rows = heal_active.plan(paths, pair)
+        only = getattr(args, "stores", None)
+        if only:                       # internal: heal only these stores
+            rows = [r for r in rows if r["store"] in only]
         label = "%s/%s (from %s)" % (pair[0], pair[1], source)
     out.say("active pair: %s" % label)
     for n in notes:

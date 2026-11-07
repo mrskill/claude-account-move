@@ -537,18 +537,34 @@ def _root_loads(line):
             and line[m.end():m.end() + 1] != "/"]
 
 
-def fresh_root_loads(paths, acc, since):
+def log_mark(paths):
+    """(inode, size) of main.log now; (None, 0) when there is no log."""
+    try:
+        sb = os.stat(paths.main_log)
+    except OSError:
+        return (None, 0)
+    return (sb.st_ino, sb.st_size)
+
+
+def fresh_root_loads(paths, acc, mark):
     """{store: (acc, org)} of the newest store-root load (same definition as
-    _root_loads) of account `acc` whose log stamp is at or after `since`
-    (epoch seconds, whole-second resolution like the log). Empty when none."""
+    _root_loads) of account `acc` in the bytes appended to main.log after
+    `mark` (from log_mark). A log whose inode changed or that is shorter than
+    the mark (rotated, truncated) counts as all new. No clock decides."""
     acc = acc.lower() if acc else None
     found = {}
     if not acc:
         return found
-    for line in _log_text(paths).splitlines():
-        ts = _ts(line)
-        if ts is None or ts < since:
-            continue
+    ino, size = mark
+    try:
+        with open(paths.main_log, "rb") as fh:
+            sb = os.fstat(fh.fileno())
+            start = size if (sb.st_ino == ino and sb.st_size >= size) else 0
+            fh.seek(start)
+            text = fh.read().decode("utf-8", "ignore")
+    except OSError:
+        return found
+    for line in text.splitlines():
         for store, a, o in _root_loads(line):
             if a == acc:
                 found[store] = (a, o)

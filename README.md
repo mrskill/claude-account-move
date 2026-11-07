@@ -124,8 +124,14 @@ in the launcher) unless the
    that run is the verdict. If it fails only because the loaded folder is a
    symlink, the program asks you to quit the app, heals exactly that pair,
    asks you to open the app again and compares a third time (one repair round
-   at most). If the app never starts under the new account in time, it stops
-   with exit `3` and never reports success on an unmeasured folder.
+   at most). The app may load a different organization in each store, so every
+   check after the start judges each store by the pair that store loaded, and
+   the repair changes only a store whose loaded pair is a symlink. "Fresh"
+   means appended to `main.log` after the ask (a byte position, not a clock;
+   a rotated or truncated log counts as all new). If the app never starts under
+   the new account in time, or the repair fails, `auto` stops with exit `3`,
+   never reports success on an unmeasured folder, and leaves the move
+   resumable: the next `auto` run resumes it and asks for the start again.
 8. It prints a summary with numbers and denominators, where the snapshot and the
    journals are, the exact undo commands, and one verdict line in Russian, either
    "everything is in place" or "there is a problem: ...". Then press Enter to
