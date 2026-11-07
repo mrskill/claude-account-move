@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `heal-active` and the `auto` repair also protect the other store's root
+  folder: a heal is refused (exit 3, `refused`, nothing moved) when a folder it
+  would move or replace (by realpath) is, lies inside or contains another
+  store's root, whatever rows the plan holds (`--from-log` plans one store, and
+  a link target inside the other store's root is caught too).
 - `heal-active` refuses a shared physical root before moving anything: when a
   heal row would move or replace a folder that is, lies inside or contains
   another store's directory for the pair (compared by realpath, e.g. one store
