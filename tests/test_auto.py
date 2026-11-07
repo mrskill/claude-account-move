@@ -15,7 +15,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-from fixture import CC, LAM, Home, tree_digest, uid  # noqa: E402
+from fixture import AskWatcher, CC, LAM, Home, OwnerApp, tree_digest, uid  # noqa: E402
 from test_cli import A, B, O1, O2, build_source, switch_to_target  # noqa: E402
 
 from claude_account_move import __version__  # noqa: E402
@@ -56,15 +56,24 @@ class Base(unittest.TestCase):
     def run_auto(self, *extra, app_running=None, wait=None, cli_login=None,
                  read_back=None, settle=0.05, real_login=False):
         """(exit code, stdout, stderr, mocks). Everything outside is replaced."""
-        argv = ["auto", "--home", self.h.home, "--state-dir", self.h.state] + list(extra)
-        running = app_running if app_running is not None else (lambda: False)
+        argv = ["auto", "--home", self.h.home, "--state-dir", self.h.state]
+        if "--wait-start" not in extra:
+            argv += ["--wait-start", "5"]
+        argv += list(extra)
+        custom = app_running if app_running is not None else (lambda: False)
+
+        def running():
+            mine = custom()
+            return app.running() or mine
         wait = wait or self.user_logs_in()
+        app = OwnerApp(self.h, B, O2)        # opens the app only after auto asks
 
         def fake_login(cmd, timeout=None):
             self.login_calls.append(tuple(cmd))
             return cli_login(cmd) if cli_login else 0
 
-        out, err = io.StringIO(), io.StringIO()
+        out = AskWatcher(lambda marker: app.start())
+        err = AskWatcher(lambda marker: app.start())     # --json: the text goes to stderr
         with contextlib.ExitStack() as es:
             es.enter_context(mock.patch.object(common, "claude_app_running", running))
             es.enter_context(mock.patch.object(auto_move, "wait_app_switch", wait))
@@ -78,6 +87,7 @@ class Base(unittest.TestCase):
             es.enter_context(contextlib.redirect_stdout(out))
             es.enter_context(contextlib.redirect_stderr(err))
             code = cli.main(argv)
+        app.join()
         return code, out.getvalue(), err.getvalue(), m
 
     def support_leftovers(self):
@@ -96,7 +106,8 @@ def slurp(path, mode="rb"):
 
 def tree_digest_outside_support(h):
     d = tree_digest(h.home)
-    return {k: v for k, v in d.items() if not k.startswith(h.support)}
+    logs = os.path.join(h.home, "Library", "Logs")       # the app's own log is not auto's write
+    return {k: v for k, v in d.items() if not k.startswith((h.support, logs))}
 
 
 class Happy(Base):
@@ -108,7 +119,7 @@ class Happy(Base):
         self.assertEqual(out.strip().splitlines()[-1], ru.VERDICT_OK)
         for n in ("cmd_prepare", "cmd_stamp", "cmd_sync"):
             self.assertEqual(m[n].call_count, 1, n)
-        self.assertEqual(m["cmd_finish"].call_count, 2)     # once again after sync
+        self.assertEqual(m["cmd_finish"].call_count, 3)     # before the start, again after sync, after the start
         self.assertIn(ru.OF % (3, 3), out)                  # numbers with denominators
         self.assertIn("stamp --undo", out)
         self.assertIn("sync --undo", out)
@@ -123,7 +134,7 @@ class Happy(Base):
         code, out, _, m = self.run_auto(wait=self.user_logs_in(also_sync=True))
         self.assertEqual(code, 0, out)
         self.assertEqual(m["cmd_sync"].call_count, 0)
-        self.assertEqual(m["cmd_finish"].call_count, 1)
+        self.assertEqual(m["cmd_finish"].call_count, 2)     # before the start, after the start
         self.assertNotIn("sync --undo", out)
 
     def test_no_stamp_flag(self):

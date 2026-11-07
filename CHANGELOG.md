@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- `auto` post-start verification, round 3. The pair each store loaded must be a
+  real directory whether or not the store has cards: missing or not a directory
+  fails `active_pair_real` and stops `auto` with exit 3 (not healed). The log
+  mark after the repair is taken when the second ask is printed. The repair
+  refuses, moving nothing, when the physical folder it would move or replace
+  (by realpath) is, lies inside or contains another store's real loaded pair
+  (`heal_active.repair_conflict`, `loaded_pair_problem`).
+- `auto` post-start verification, round 2 (review findings). Per store: after
+  the start, `finish` judges each store by the pair that store loaded
+  (`store_pairs`, internal), and the repair heals only a store whose loaded pair
+  is a symlink (internal `stores` of `heal-active`); a real loaded pair is never
+  touched. Freshness is a byte position in `main.log` taken when `auto` asks
+  (`heal_active.log_mark`, `fresh_root_loads(paths, acc, mark)`): a rotated or
+  truncated log counts as all new, no clock decides. A move that `auto` stopped
+  after its first finish (no start, repair failed) is resumable again:
+  `find_unfinished_move` treats a newer failed `report-auto.json` as unfinished.
+- `auto` verifies the move after the app has started under the new account.
+  Defect 1: `--active-pair` (the OLD account's pair) was copied into every step;
+  now only prepare, the write probe and stamp use it, and heal-active, finish
+  and sync after the login get `active_pair=None` (`_ns(post_login=True)`).
+  Defect 2: the app chooses its org folder only at start, so after finish `auto`
+  asks to open Claude, waits (`--wait-start`, default 300 s, env
+  `CLAUDE_ACCOUNT_MOVE_START_POLL_S`) for a fresh store-root load of the new
+  account in each store (`heal_active.fresh_root_loads`, same definition as
+  `_root_loads`), and the verdict is a second finish with the app running. If
+  that fails only on `active_pair_real`, one repair round (quit, heal the loaded
+  pair, reopen, third finish). No fresh load in time: exit 3, never success.
+  The first finish no longer stops `auto` on names the app restores at start.
 - `prepare` no longer fails on a stale ENOTDIR line. A recent ENOTDIR line for a
   symlinked pair is cleared only when the last later store-root load in the same
   store (`Loaded N sessions from <store>/<account>/<org>`, no

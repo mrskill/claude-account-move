@@ -130,7 +130,8 @@ def _check(out, cid, ok, detail):
 
 
 def evaluate(paths, before, index, tmap, identity, target, source,
-             sync_alive=False, active_override=None, allow_same_account=False):
+             sync_alive=False, active_override=None, allow_same_account=False,
+             store_pairs=None):
     """Compare the present state with the snapshot. Returns (report, exit code)."""
     checks, notes = [], []
     code = EXIT_OK
@@ -151,6 +152,8 @@ def evaluate(paths, before, index, tmap, identity, target, source,
     pair_notes = []
     pair = st.live_pair(paths, account=target, override=active_override,
                         index=index, notes=pair_notes, command="finish")
+    if store_pairs and STORES[0] in store_pairs:
+        pair = store_pairs[STORES[0]]       # the pair THIS store loaded
     active_dir = st.pair_dir(paths, pair[0], pair[1]) if pair else None
     cc = index.stores[STORES[0]]
     if active_dir and active_dir not in cc.dirs:
@@ -197,6 +200,9 @@ def evaluate(paths, before, index, tmap, identity, target, source,
             t_dirs = [active_dir] if active_present else []
         else:
             t_dirs = verify.target_dirs(index, name, target)
+            if store_pairs and name in store_pairs:
+                lp = st.pair_dir(paths, store_pairs[name][0], store_pairs[name][1], name)
+                t_dirs = [lp] if lp and lp in s.dirs else []
             t_names = set().union(*[names_by_dir[r] for r in t_dirs]) if t_dirs else None
         missing_in_target = None if t_names is None else sorted(names_before - t_names)
         # A lagging TARGET directory with a live sync job is delivery in
