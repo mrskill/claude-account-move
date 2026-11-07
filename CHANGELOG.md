@@ -4,8 +4,8 @@
 
 - `auto` shows a countdown while it waits for the app to start under the new
   account (`wait_app_start` printed nothing for up to 300 s): a line at the
-  start and every 30 s, like the wait for the app to quit, and one line when
-  the load is seen.
+  start and every 30 s, like the wait for the app to quit (seconds left rounded
+  up, never printed at 0).
 - The overlap refusals compare physical identity, not path strings: on a
   case-insensitive volume (macOS default) `payload` and `PAYLOAD` are one folder
   although `realpath` keeps both spellings. New `common.inside_physical(a, b)`

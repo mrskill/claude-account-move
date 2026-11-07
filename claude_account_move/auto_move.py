@@ -21,6 +21,7 @@ The steps are the existing cmd_* functions of cli.py run quietly; their
 reports are collected through args.capture. Texts: ru_text.py.
 """
 import argparse
+import math
 import os
 import re
 import secrets
@@ -153,22 +154,24 @@ def wait_app_start(paths, account, mark, limit_s, poll_s, out):
     """{store: (acc, org)} once every store has a store-root load of `account`
     appended to main.log after `mark` (heal_active.log_mark); None when the
     time is up. Prints a countdown at the start and every 30 s (like
-    wait_app_closed), and one line when the load is seen."""
+    wait_app_closed); the seconds left are rounded up and never printed at 0."""
     t0 = time.monotonic()
     deadline = t0 + max(0.0, limit_s)
     last = -1
     while True:
         loads = heal_active.fresh_root_loads(paths, account, mark)
         if all(s in loads for s in STORES):
-            out.say(ru.START_LOADED)
             return loads
-        if time.monotonic() >= deadline:
+        now = time.monotonic()           # one reading for every decision below
+        if now >= deadline:
             return None
-        tick = int((time.monotonic() - t0) // 30)
+        left = deadline - now
+        tick = int((now - t0) // 30)
         if tick != last:
-            out.say(ru.START_WAIT % max(0, int(deadline - time.monotonic())))
+            if math.ceil(left) > 0:
+                out.say(ru.START_WAIT % math.ceil(left))
             last = tick
-        time.sleep(min(poll_s, max(0.01, deadline - time.monotonic())))
+        time.sleep(min(poll_s, max(0.01, left)))
 
 
 def only_active_pair_failed(rep):
