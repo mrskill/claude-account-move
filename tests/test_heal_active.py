@@ -518,6 +518,46 @@ class StoreRootProtected(Base):
         check_healed(ch, CC)
 
 
+def volume_is_case_insensitive():
+    """Probe the temp volume: create `x`, ask for `X`."""
+    d = tempfile.mkdtemp(prefix="cam-case-")
+    try:
+        open(os.path.join(d, "x"), "w").close()
+        return os.path.exists(os.path.join(d, "X"))
+    finally:
+        shutil.rmtree(d, True)
+
+
+@unittest.skipUnless(volume_is_case_insensitive(), "case-sensitive volume")
+class CaseVariantRoot(Base):
+    """R14: `payload` and `PAYLOAD` are one folder on a case-insensitive volume;
+    realpath keeps both spellings, so a string compare misses the overlap."""
+
+    check = SharedRoot.check
+    enotdir = StoreRootProtected.enotdir
+
+    def layout(self):
+        """CC/A/O -> ../payload; CC/payload/A/O real; LAM -> CC/PAYLOAD."""
+        cc = os.path.join(self.h.support, CC)
+        os.makedirs(os.path.join(cc, ACC))
+        os.makedirs(os.path.join(cc, "payload", ACC, ORG))
+        os.symlink(os.path.join("..", "payload"), os.path.join(cc, ACC, ORG))
+        os.symlink(os.path.join(CC, "PAYLOAD"), os.path.join(self.h.support, LAM))
+        set_identity(self.h, ACC, ORG)
+        self.h.log((ACC, ORG))
+
+    def test_plain_apply_refuses_before_moving(self):
+        self.layout()
+        before = self.digest()
+        self.check(self.heal("--apply", "--json"), before)
+
+    def test_from_log_apply_refuses_before_moving(self):
+        self.layout()
+        self.enotdir(CC, ACC, ORG)
+        before = self.digest()
+        self.check(self.heal("--from-log", "--apply", "--json"), before)
+
+
 class IdentitySource(Base):
     def test_active_pair_follows_identity_not_a_constant(self):
         ch1 = Chain(self.h, acc=uid(0x91, 1), org=uid(0x92, 2))
