@@ -126,8 +126,8 @@ in the launcher) unless the
    asks you to open the app again and compares a third time (one repair round
    at most). The app may load a different organization in each store, so every
    check after the start judges each store by the pair that store loaded, and
-   the repair changes only a store whose loaded pair is a symlink. "Fresh"
-   means appended to `main.log` after the ask (a byte position, not a clock;
+   the repair changes only a store whose loaded pair is a symlink. A loaded pair that is missing or not a directory fails the check and stops `auto` (never healed), and the repair refuses, moving nothing, when the folder it would move is, lies inside or contains another store's real loaded pair (a shared physical root). "Fresh"
+   means appended to `main.log` after the ask (after the second ask, when the repair ran) (a byte position, not a clock;
    a rotated or truncated log counts as all new). If the app never starts under
    the new account in time, or the repair fails, `auto` stops with exit `3`,
    never reports success on an unmeasured folder, and leaves the move

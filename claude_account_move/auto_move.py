@@ -615,10 +615,10 @@ def cmd_auto(args, cli):
         start_poll = _poll(START_POLL_S, "CLAUDE_ACCOUNT_MOVE_START_POLL_S")
         new_acc = (read_identity(paths).get("app") or {}).get("value")
 
-        def open_and_wait(ask_text, mark=None):
+        def open_and_wait(ask_text):
             # freshness is a position in main.log, not a clock: only lines
-            # appended after this mark count
-            mark = mark or heal_active.log_mark(paths)
+            # appended after this mark (taken as the ask is printed) count
+            mark = heal_active.log_mark(paths)
             out.say(ask_text % int(args.wait_start))
             loads = wait_app_start(paths, new_acc, mark, args.wait_start, start_poll)
             if loads is None:
@@ -649,13 +649,28 @@ def cmd_auto(args, cli):
                 ctx["finish"] = frep
                 ctx["problem"] = ru.PROBLEM_PAIR
                 return stop(EXIT_FAIL, "app_running", ru.APP_TIMEOUT, show_summary=True)
-            mark = heal_active.log_mark(paths)   # the app is quit: later lines are new
+            # a loaded pair that is missing or not a directory cannot be healed
+            for store in st.STORES:
+                if store in loads and heal_active.loaded_pair_problem(
+                        paths, store, loads[store]) not in (None, "a symlink"):
+                    ctx["finish"] = frep
+                    ctx["problem"] = ru.PROBLEM_PAIR
+                    return stop(EXIT_FAIL, "loaded_pair_missing", ru.START_BAD_PAIR % (
+                        store, heal_active.pair_path(paths, store, loads[store])),
+                        show_summary=True)
             # per store: only a store whose loaded pair is a symlink is healed,
             # toward its own loaded pair; stores sharing one pair go in one call
             todo = {}
             for store, pair in loads.items():
                 if os.path.islink(heal_active.pair_path(paths, store, pair)):
                     todo.setdefault(pair, []).append(store)
+            clash = heal_active.repair_conflict(
+                paths, loads, sorted(x for v in todo.values() for x in v))
+            if clash:
+                ctx["finish"] = frep
+                ctx["problem"] = ru.PROBLEM_PAIR
+                return stop(EXIT_FAIL, "repair_refused", ru.START_SHARED % (
+                    clash[2], clash[1]), show_summary=True)
             for (acc, org), stores in sorted(todo.items()):
                 hcode, hrep = run_step(cli.cmd_heal_active, _ns(
                     args, post_login=True, apply=True, from_log=False,
@@ -668,7 +683,7 @@ def cmd_auto(args, cli):
                     return stop(hcode, "heal_failed", ru.HEAL_FAIL % (
                         hcode, (hrep or {}).get("reason") or (hrep or {}).get("verdict")),
                         show_summary=True)
-            loads, stopped = open_and_wait(ru.START_REPAIR_AGAIN, mark)
+            loads, stopped = open_and_wait(ru.START_REPAIR_AGAIN)
             if stopped is not None:
                 return stopped
             res, stopped = finish_sync()

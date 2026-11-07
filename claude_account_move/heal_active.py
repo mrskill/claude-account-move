@@ -537,6 +537,37 @@ def _root_loads(line):
             and line[m.end():m.end() + 1] != "/"]
 
 
+def loaded_pair_problem(paths, store, pair):
+    """None when the pair a store loaded is a real directory; else a short
+    reason: missing, not a directory, or a symlink."""
+    p = pair_path(paths, store, pair)
+    if os.path.islink(p):
+        return "a symlink"
+    if not os.path.lexists(p):
+        return "missing"
+    return None if os.path.isdir(p) else "not a directory"
+
+
+def repair_conflict(paths, loads, todo_stores):
+    """(store, path) of the first store in `todo_stores` whose repair would move
+    or replace a physical path that is, lies inside or contains the real loaded
+    pair of ANOTHER store (compared by realpath, so shared roots show up), or
+    None. The moved folder is the link target; the replaced one is the link."""
+    others = [(s, os.path.realpath(pair_path(paths, s, p)))
+              for s, p in loads.items()
+              if s not in todo_stores and loaded_pair_problem(paths, s, p) is None]
+    for store in todo_stores:
+        a = pair_path(paths, store, loads[store])
+        touched = {os.path.realpath(a),
+                   os.path.join(os.path.realpath(os.path.dirname(a)),
+                                os.path.basename(a))}
+        for other, real in others:
+            for t in touched:
+                if inside(t, real) or inside(real, t):
+                    return store, other, t
+    return None
+
+
 def log_mark(paths):
     """(inode, size) of main.log now; (None, 0) when there is no log."""
     try:

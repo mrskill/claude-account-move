@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `auto` post-start verification, round 3. The pair each store loaded must be a
+  real directory whether or not the store has cards: missing or not a directory
+  fails `active_pair_real` and stops `auto` with exit 3 (not healed). The log
+  mark after the repair is taken when the second ask is printed. The repair
+  refuses, moving nothing, when the physical folder it would move or replace
+  (by realpath) is, lies inside or contains another store's real loaded pair
+  (`heal_active.repair_conflict`, `loaded_pair_problem`).
 - `auto` post-start verification, round 2 (review findings). Per store: after
   the start, `finish` judges each store by the pair that store loaded
   (`store_pairs`, internal), and the repair heals only a store whose loaded pair

@@ -474,7 +474,7 @@ def _symlink_guard(paths, args, report, code):
         # the app started: each store is judged by the pair THAT store loaded
         bad = [(s, heal_active.pair_path(paths, s, per_store[s])) for s in st.STORES
                if s in per_store
-               and os.path.islink(heal_active.pair_path(paths, s, per_store[s]))]
+               and heal_active.loaded_pair_problem(paths, s, per_store[s])]
         pairs = [per_store[s] for s in st.STORES if s in per_store]
     else:
         chosen = heal_active.active_pair(paths, ident, args.active_pair)[0]
@@ -501,7 +501,10 @@ def _symlink_guard(paths, args, report, code):
                     bad.append(item)
     if not bad:
         return code
-    detail = ("; ".join("%s: %s is a symlink" % (s, p) for s, p in bad)
+    why = {} if not per_store else {
+        s: heal_active.loaded_pair_problem(paths, s, per_store[s]) for s, _ in bad}
+    detail = ("; ".join("%s: %s is %s" % (s, p, why.get(s) or "a symlink")
+                        for s, p in bad)
               + ". The app cannot save new session cards there (ENOTDIR). Quit "
               "the Claude app (Cmd+Q) and run `heal-active --apply`, then run "
               "finish again.")
