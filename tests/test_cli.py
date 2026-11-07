@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -173,17 +174,42 @@ class Login(Base):
         switch_to_target(self.h)
         self.assertEqual(self.h.run("sync", "--apply").returncode, 0)
         self.h.accounts(cli=A, app=B)
-        t0 = time.monotonic()
-        p = subprocess.Popen([sys.executable, ENTRY, "finish", "--wait-login", "8",
+        limit = 60                      # generous: the test never waits for it
+        p = subprocess.Popen([sys.executable, ENTRY, "finish", "--wait-login", str(limit),
                               "--json"], env=self.h.env(), stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True)
-        time.sleep(1.5)
-        self.h.accounts(cli=B, app=B)
-        out, _ = p.communicate(timeout=30)
-        elapsed = time.monotonic() - t0
-        self.assertEqual(p.returncode, 0, out)
-        self.assertGreaterEqual(json.loads(out)["login"]["waited_s"], 1.3)
-        self.assertLess(elapsed, 7.5)
+        # Both pipes are drained by threads (a full pipe cannot block the child).
+        # The accounts change only after the child has visibly entered the login
+        # wait loop: it prints "waiting for login (<reason>): ..." there.
+        waiting = threading.Event()
+        chunks = {"out": [], "err": []}
+
+        def drain(stream, key):
+            for line in stream:
+                chunks[key].append(line)
+                if key == "err" and "waiting for login (" in line:
+                    waiting.set()
+
+        readers = [threading.Thread(target=drain, args=(p.stdout, "out"), daemon=True),
+                   threading.Thread(target=drain, args=(p.stderr, "err"), daemon=True)]
+        for t in readers:
+            t.start()
+        try:
+            self.assertTrue(waiting.wait(60), "finish never entered the login wait: "
+                            + "".join(chunks["err"]))
+            self.h.accounts(cli=B, app=B)
+            p.wait(timeout=limit + 20)      # a hang guard only
+        finally:
+            if p.poll() is None:
+                p.kill()
+            for t in readers:
+                t.join(10)
+        out = "".join(chunks["out"])
+        self.assertEqual(p.returncode, 0, out + "".join(chunks["err"]))
+        login = json.loads(out)["login"]
+        self.assertIsNone(login["reason"])
+        self.assertGreater(login["waited_s"], 0)
+        self.assertLess(login["waited_s"], login["limit_s"])
 
     def test_never_logging_in_times_out_at_the_limit(self):
         build_source(self.h)
