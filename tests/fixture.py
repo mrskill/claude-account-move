@@ -1,4 +1,5 @@
 """Synthetic Claude storage for tests. Never touches a real home directory."""
+import io
 import json
 import os
 import subprocess
@@ -114,12 +115,30 @@ def tree_digest(root):
     return out
 
 
+class AskWatcher(io.StringIO):
+    """A stdout that calls `on_ask(text)` when auto prints its request to open
+    Claude (the first ask, or the one after a repair). The fake owner reacts to
+    what auto actually printed, never to a timer or to the end of a step."""
+
+    def __init__(self, on_ask):
+        io.StringIO.__init__(self)
+        self.on_ask = on_ask
+
+    def write(self, text):
+        n = io.StringIO.write(self, text)
+        from claude_account_move import ru_text as ru
+        for marker in (ru.START_ASK, ru.START_REPAIR_AGAIN):
+            if marker.split("%")[0] in text:
+                self.on_ask(marker)
+        return n
+
+
 class OwnerApp(object):
-    """The owner and the Claude app in the older auto tests. The app is closed
-    until auto has a verdict-grade finish and so asks for the start; only then
-    (a moment later, after auto has noted the end of main.log) one store-root load
-    line per store of the new pair is appended, and the app is running. A running
-    app is quit by the owner after a few polls (it must be, for the repair)."""
+    """The owner and the Claude app in the older auto tests. The app is closed;
+    when auto prints its ask to open Claude (watch it with AskWatcher), a moment
+    later one store-root load line per store of the new pair is appended, and the
+    app is running. A running app is quit by the owner after a few polls (it must
+    be, for the repair)."""
 
     QUIT_AFTER_POLLS = 3
 
@@ -155,13 +174,6 @@ class OwnerApp(object):
         t = threading.Thread(target=go, daemon=True)
         t.start()
         self.threads.append(t)
-
-    def after_finish(self, code, report):
-        """Call with every finish result: the owner opens the app once auto
-        has a finish that is not just waiting for names to be synced."""
-        from claude_account_move import auto_move
-        if self.idle() and (code == 0 or not (report and auto_move.syncable(report))):
-            self.start()
 
     def join(self):
         for t in self.threads:

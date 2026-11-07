@@ -537,23 +537,16 @@ class AutoStep(Base):
             return f
 
         app = fixture.OwnerApp(self.h, B, O2)    # opens the app only after auto asks
-        spy_finish = spy("cmd_finish")
-
-        def finish_then_open(ns):
-            code = spy_finish(ns)
-            app.after_finish(code, ns.capture[-1] if ns.capture else None)
-            return code
-
         env = dict(test_auto.ENVS)
         with mock.patch.dict(os.environ, env), contextlib.ExitStack() as es:
             self.assertTrue(hasattr(cli, "cmd_heal_active"), "cmd_heal_active missing")
             es.enter_context(mock.patch.object(cli, "cmd_heal_active",
                                                spy("cmd_heal_active")))
-            es.enter_context(mock.patch.object(cli, "cmd_finish", finish_then_open))
+            es.enter_context(mock.patch.object(cli, "cmd_finish", spy("cmd_finish")))
             es.enter_context(mock.patch.object(common, "claude_app_running", app.running))
             es.enter_context(mock.patch.object(auto_move, "wait_app_switch", login))
             es.enter_context(mock.patch.object(auto_move, "CLI_SETTLE_MIN_S", 0.05))
-            out = io.StringIO()
+            out = fixture.AskWatcher(lambda marker: app.start())
             es.enter_context(contextlib.redirect_stdout(out))
             es.enter_context(contextlib.redirect_stderr(io.StringIO()))
             code = cli.main(["auto", "--home", self.h.home, "--state-dir", self.h.state,

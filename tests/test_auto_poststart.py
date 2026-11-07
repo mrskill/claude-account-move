@@ -17,6 +17,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -26,7 +27,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-from fixture import CC, LAM, uid  # noqa: E402
+from fixture import AskWatcher, CC, LAM, uid  # noqa: E402
 from test_auto import Base  # noqa: E402  (only Base: its fixtures, no test cases)
 from test_cli import A, B, O1, O2, build_source  # noqa: E402
 
@@ -65,6 +66,7 @@ class FakeApp(object):
         self.last_epoch = 0            # newest log stamp this app wrote
         self.ahead = 1                 # seconds the stamps run ahead of the clock
         self.reopen = True             # the owner opens the app again after a repair
+        self.start_before_ask = False  # ... and the app starts between heal and ask
         self.rotate = False            # the app starts a fresh main.log (new file)
 
     def running(self):
@@ -154,6 +156,14 @@ class PostStart(Base):
         self.login_hooks = []
 
     # -- scenario helpers ----------------------------------------------------
+    def empty_lam_source(self):
+        d = build_source(self.h)
+        lam = os.path.join(self.h.support, LAM, A, O1)
+        for f in os.listdir(lam):               # the agent store has no cards at all
+            os.unlink(os.path.join(lam, f))
+        os.unlink(os.path.join(self.h.projects, uid(14) + ".jsonl"))
+        return d
+
     def symlinked_post_pair(self):
         """The app will load (B, O3); in both stores O3 is a link to the real O2
         (the shape of the live move: the loaded pair was a symlink)."""
@@ -167,7 +177,12 @@ class PostStart(Base):
 
     # -- the run -------------------------------------------------------------
     def run_ps(self, *extra, **kw):
-        self.out_buf = io.StringIO()       # a fresh output for every run of auto
+        # a fresh output for every run of auto; the owner opens the app when auto
+        # actually prints its ask (the first one, or the one after a repair)
+        def on_ask(marker):
+            if marker == ru.START_ASK or self.app.reopen:
+                self.app.start(self.post_pair)
+        self.out_buf = AskWatcher(on_ask)
         inner = kw.pop("wait", None) or self.login_with_names()
 
         def wait(*a):
@@ -192,20 +207,19 @@ class PostStart(Base):
                 ns.capture.append(rep)
             else:
                 code = real_finish(ns)
-            rep = ns.capture[-1] if ns.capture else None
-            # the owner opens the app once auto has a verdict-grade finish
-            if app.idle() and (code == EXIT_OK or not (rep and auto_move.syncable(rep))):
-                app.start(self.post_pair)
             return code
 
         def heal(ns):
             code = real_heal(ns)
             rep = ns.capture[-1] if ns.capture else None
             self.heal_log.append(dict(ns=ns, code=code, verdict=(rep or {}).get("verdict")))
-            if (app.reopen and app.starts and code == EXIT_OK and app.idle()
+            if (app.start_before_ask and app.starts and code == EXIT_OK
                     and (rep or {}).get("verdict") == "healed"):
-                app.settle()
-                app.start(self.post_pair)            # the owner opens the app again
+                # the app starts and quits again before auto prints its ask
+                pp = self.post_pair
+                pairs = pp if isinstance(pp, dict) else {CC: pp, LAM: pp}
+                ts = stamp(int(time.time()) + 1)
+                app.append([(CC,) + tuple(pairs[CC]), (LAM,) + tuple(pairs[LAM])], ts)
             return code
 
         real_sync = cli.cmd_sync
@@ -555,6 +569,76 @@ class StoppedMoveCanBeResumed(PostStart):
         found = self.resumable()
         self.assertTrue(found and found[0] == "resume",
                         "the stopped move looks finished to the resume logic: %r" % (found,))
+
+
+# ----------------------------------------------------------------- R10 ------
+class LoadedPairMustExist(PostStart):
+    """The pair a store loaded must be a real directory, cards or no cards."""
+
+    def check(self, make):
+        self.empty_lam_source()
+        missing = os.path.join(self.h.support, LAM, B, O3)
+        self.login_hooks.append(lambda: make(missing))
+        self.post_pair = {CC: (B, O2), LAM: (B, O3)}
+        code, out, err, _ = self.run_ps()
+        self.assertEqual(code, 3, out + err)
+        self.assertNotIn(ru.VERDICT_OK, out)
+        self.assertIn(LAM, out, "the reason does not name the store")
+        self.assertIn(O3, out, "the reason does not name the pair")
+        self.assertFalse(os.path.islink(missing), "heal must not touch it")
+        self.assertEqual(len([h for h in self.heal_log if h["verdict"] == "healed"]), 0)
+        return missing
+
+    def test_r10_missing_loaded_pair_of_an_empty_store_fails(self):
+        missing = self.check(lambda p: None)
+        self.assertFalse(os.path.lexists(missing), "the missing pair was created")
+
+    def test_r10_loaded_pair_that_is_a_file_fails(self):
+        def make(p):
+            with open(p, "w") as fh:
+                fh.write("not a directory")
+        missing = self.check(make)
+        self.assertTrue(os.path.isfile(missing))
+
+
+# ----------------------------------------------------------------- R11 ------
+class MarkIsTakenAtTheSecondAsk(PostStart):
+    def test_r11_a_start_between_the_heal_and_the_ask_is_not_the_start_after_the_ask(self):
+        build_source(self.h)
+        self.login_hooks.append(self.symlinked_post_pair)
+        self.app.start_before_ask = True     # the app starts and quits after the heal ...
+        self.app.reopen = False              # ... and is not opened after the ask
+        code, out, err, _ = self.run_ps("--wait-start", "1")
+        self.assertEqual(code, 3, out + err)
+        self.assertNotIn(ru.VERDICT_OK, out)
+        self.assertEqual(len(self.finish_log), 2, "the third finish ran without a start "
+                         "after the second ask")
+
+
+# ----------------------------------------------------------------- R12 ------
+class RepairNeverMovesAnotherStoresLoadedPair(PostStart):
+    def test_r12_shared_physical_root_refuses_the_whole_round(self):
+        """LAM's root is a link to CC's root. CC loads the real CC/B/O2; LAM loads
+        LAM/B/O3, which physically is CC/B/O3, a link to O2: healing it would move
+        CC's real, loaded O2."""
+        self.empty_lam_source()
+        lam_root = os.path.join(self.h.support, LAM)
+
+        def share_root():
+            for name in os.listdir(lam_root):
+                shutil.rmtree(os.path.join(lam_root, name))
+            os.rmdir(lam_root)
+            os.symlink(CC, lam_root)            # relative: LAM -> claude-code-sessions
+            link_pair(self.h, CC, O3, O2)
+        self.login_hooks.append(share_root)
+        self.post_pair = {CC: (B, O2), LAM: (B, O3)}
+        code, out, err, _ = self.run_ps()
+        self.assertTrue(self.real_dir(CC, O2),
+                        "CC's real, loaded pair was moved by the repair")
+        self.assertTrue(os.path.islink(os.path.join(self.h.support, CC, B, O3)))
+        self.assertEqual(code, 3, out + err)
+        self.assertNotIn(ru.VERDICT_OK, out)
+        self.assertEqual(len([h for h in self.heal_log if h["verdict"] == "healed"]), 0)
 
 
 if __name__ == "__main__":

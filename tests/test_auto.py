@@ -15,7 +15,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-from fixture import CC, LAM, Home, OwnerApp, tree_digest, uid  # noqa: E402
+from fixture import AskWatcher, CC, LAM, Home, OwnerApp, tree_digest, uid  # noqa: E402
 from test_cli import A, B, O1, O2, build_source, switch_to_target  # noqa: E402
 
 from claude_account_move import __version__  # noqa: E402
@@ -67,18 +67,13 @@ class Base(unittest.TestCase):
             return app.running() or mine
         wait = wait or self.user_logs_in()
         app = OwnerApp(self.h, B, O2)        # opens the app only after auto asks
-        real_finish = cli.cmd_finish
-
-        def finish(ns):
-            code = real_finish(ns)
-            app.after_finish(code, ns.capture[-1] if ns.capture else None)
-            return code
 
         def fake_login(cmd, timeout=None):
             self.login_calls.append(tuple(cmd))
             return cli_login(cmd) if cli_login else 0
 
-        out, err = io.StringIO(), io.StringIO()
+        out = AskWatcher(lambda marker: app.start())
+        err = AskWatcher(lambda marker: app.start())     # --json: the text goes to stderr
         with contextlib.ExitStack() as es:
             es.enter_context(mock.patch.object(common, "claude_app_running", running))
             es.enter_context(mock.patch.object(auto_move, "wait_app_switch", wait))
@@ -88,8 +83,7 @@ class Base(unittest.TestCase):
             if read_back:
                 es.enter_context(mock.patch.object(auto_move, "_read_back", read_back))
             m = {n: es.enter_context(mock.patch.object(cli, n, wraps=getattr(cli, n)))
-                 for n in ("cmd_prepare", "cmd_stamp", "cmd_sync")}
-            m["cmd_finish"] = es.enter_context(mock.patch.object(cli, "cmd_finish", wraps=finish))
+                 for n in ("cmd_prepare", "cmd_stamp", "cmd_finish", "cmd_sync")}
             es.enter_context(contextlib.redirect_stdout(out))
             es.enter_context(contextlib.redirect_stderr(err))
             code = cli.main(argv)
