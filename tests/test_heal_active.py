@@ -459,6 +459,65 @@ class SharedRoot(Base):
             check_healed(ch, s)
 
 
+class StoreRootProtected(Base):
+    """R13: the heal must not move or replace a physical path that is, lies inside
+    or contains ANOTHER store's root folder, whatever the plan holds: --from-log
+    plans one store only, so the other store has no row to compare with."""
+
+    check = SharedRoot.check            # the same refusal checks
+
+    def enotdir(self, store, acc, org):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        path = os.path.join(self.h.support, store, acc, org)
+        os.makedirs(os.path.join(self.h.home, "Library", "Logs", "Claude"), exist_ok=True)
+        with open(os.path.join(self.h.home, "Library", "Logs", "Claude", "main.log"), "a") as fh:
+            fh.write("%s [error] Failed to save session local_x: ENOTDIR: not a "
+                     "directory, mkdir '%s' at ensureStorageDir\n" % (ts, path))
+
+    def codex_layout(self):
+        """CC/A/O -> ../payload; CC/payload/A/O real; LAM -> CC/payload; a fresh
+        ENOTDIR line for CC/A/O only."""
+        cc = os.path.join(self.h.support, CC)
+        os.makedirs(os.path.join(cc, ACC))
+        os.makedirs(os.path.join(cc, "payload", ACC, ORG))
+        os.symlink(os.path.join("..", "payload"), os.path.join(cc, ACC, ORG))
+        os.symlink(os.path.join(CC, "payload"), os.path.join(self.h.support, LAM))
+        set_identity(self.h, ACC, ORG)
+        self.h.log((ACC, ORG))
+        self.enotdir(CC, ACC, ORG)
+
+    def test_from_log_apply_refuses_before_moving(self):
+        self.codex_layout()
+        before = self.digest()
+        self.check(self.heal("--from-log", "--apply", "--json"), before)
+
+    def test_from_log_dry_run_reports_the_refusal(self):
+        self.codex_layout()
+        before = self.digest()
+        self.check(self.heal("--from-log", "--json"), before)
+
+    def test_link_target_inside_the_other_stores_root_is_refused(self):
+        """LAM's root is CC/payload; CC/A/O -> ../payload/sub, a real folder inside
+        it: moving sub to CC/A/O would change the contents of LAM's root."""
+        cc = os.path.join(self.h.support, CC)
+        os.makedirs(os.path.join(cc, ACC))
+        os.makedirs(os.path.join(cc, "payload", "sub"))
+        os.symlink(os.path.join("..", "payload", "sub"), os.path.join(cc, ACC, ORG))
+        os.symlink(os.path.join(CC, "payload"), os.path.join(self.h.support, LAM))
+        set_identity(self.h, ACC, ORG)
+        self.h.log((ACC, ORG))
+        before = self.digest()
+        self.check(self.heal("--apply", "--json"), before)
+
+    def test_separate_roots_from_log_still_heals_guard(self):
+        """Not red before the fix: separate roots, --from-log heals the one store."""
+        ch = Chain(self.h)
+        self.enotdir(CC, ACC, ORG)
+        r = self.heal("--from-log", "--apply")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        check_healed(ch, CC)
+
+
 class IdentitySource(Base):
     def test_active_pair_follows_identity_not_a_constant(self):
         ch1 = Chain(self.h, acc=uid(0x91, 1), org=uid(0x92, 2))
