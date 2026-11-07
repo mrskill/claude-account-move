@@ -156,7 +156,7 @@ def build_parser():
                    "minutes that is still a symlink; allowed while the app runs "
                    "(for the launchd agent)")
     a = sub.add_parser("auto", help="the whole move in one run: prepare, stamp, wait for "
-                       "login, heal-active, finish, sync if needed (writes)")
+                       "login, heal-active, finish, app start check, sync if needed (writes)")
     add_common(a)
     a.add_argument("--new-move", action="store_true",
                    help="do not resume an unfinished move: start a new one")
@@ -164,6 +164,9 @@ def build_parser():
                    help="do not put the last-message time into session titles")
     a.add_argument("--wait-login", type=float, default=900.0,
                    help="seconds to wait for the new login (default 900)")
+    a.add_argument("--wait-start", type=float, default=300.0,
+                   help="seconds to wait for the app to start under the new account "
+                   "and load its store roots (default 300)")
     a.add_argument("--wait-close", type=float, default=600.0,
                    help="seconds to wait for the Claude app to be quit (default 600)")
     a.add_argument("--allow-same-account", action="store_true",

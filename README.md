@@ -21,7 +21,7 @@ Russian version: [README.ru.md](README.ru.md)
 | `sync` | optional repair | Copies session cards that are missing in the new account's folder. Dry run by default (it prints the files). `sync --apply` adds files and `sync --undo` removes exactly the files a journal proves were added. |
 | `stamp` | optional, see below | Puts the date and time of the last real message into the title of every session. Dry run by default (it lists "was -> will be"). `stamp --apply` writes, `stamp --undo` restores the cards byte for byte. |
 | `heal-active` | optional repair, app quit | If the active folder `<store>/<account>/<org>` is a symlink (the app reads it but every card write fails with ENOTDIR), turns it into a real directory: removes the link, moves the real folder there and leaves a link at its old path. The pair is taken from the app log (newest save, read or ENOTDIR line after the last account change), else the app account with an organization that exists in the store; when these disagree it refuses and names them (or pass `--active-pair`). Dry run by default, `--apply` writes, refuses while the app runs, all stores or none. It also refuses when a symlink inside the moved folder would change its target: every absolute link (wherever it points), and a relative link whose target, walked step by step from its own folder, leaves the folder, passes through another symlink or points at its own folder or a parent; only the last component may be a symlink or missing, so relative links that stay inside the folder and dangling relative links inside it are fine. The check runs again for each store just before the swap and refuses the whole run if it no longer passes. `heal-active --from-log --apply` heals every pair named by an ENOTDIR line of the last 10 minutes and may run while the app runs. `finish` fails (exit `3`) while the active folder is a symlink, `prepare` fails on a recent ENOTDIR line for a symlinked folder, unless the last later "Loaded N sessions from <store>/<account>/<org>" line in the same store names another pair (the app moved its writer there; reads, saves, loads in the other store, failed or deeper loads do not count, and a last load naming the same pair keeps the hit), and `auto` runs it before `finish`. |
-| `auto` | the whole move in one run | Quit-the-app wait, `prepare`, a write probe, `stamp --apply`, waits for the new login, `finish`, `sync --apply` only when needed, a plain-Russian summary. See "One-click move (auto)". |
+| `auto` | the whole move in one run | Quit-the-app wait, `prepare`, a write probe, `stamp --apply`, waits for the new login, `heal-active`, `finish`, `sync --apply` only when needed, asks to open the app and waits for its start under the new account, a second `finish` with the app running (the verdict; one repair round for a symlinked loaded pair), a plain-Russian summary. See "One-click move (auto)". |
 
 `sync --apply`, `sync --undo`, `stamp --apply`, `stamp --undo` and `heal-active --apply` are the only
 operations that write into the Claude storage.
@@ -117,7 +117,16 @@ in the launcher) unless the
 6. The program compares everything with the snapshot. If only cards missing in
    the new account's folder are wrong, it adds them (`sync --apply`, adds only)
    and compares once more.
-7. It prints a summary with numbers and denominators, where the snapshot and the
+7. The app picks the folder it writes into only when it starts under the new
+   account. So the program asks you to open Claude, waits (up to 5 minutes,
+   `--wait-start`) until the app log shows a fresh store-root load of the new
+   account in each store, and runs the comparison again with the app running:
+   that run is the verdict. If it fails only because the loaded folder is a
+   symlink, the program asks you to quit the app, heals exactly that pair,
+   asks you to open the app again and compares a third time (one repair round
+   at most). If the app never starts under the new account in time, it stops
+   with exit `3` and never reports success on an unmeasured folder.
+8. It prints a summary with numbers and denominators, where the snapshot and the
    journals are, the exact undo commands, and one verdict line in Russian, either
    "everything is in place" or "there is a problem: ...". Then press Enter to
    close the window. If sync
@@ -125,7 +134,7 @@ in the launcher) unless the
 
 From a terminal: `./claude-account-move auto [--state-dir DIR] [--home DIR]
 [--json] [--no-stamp] [--wait-login SECONDS] [--wait-close SECONDS]
-[--allow-same-account] [--active-pair ACCOUNT/ORG] [--pause]`. It stops at the first
+[--wait-start SECONDS] [--allow-same-account] [--active-pair ACCOUNT/ORG] [--pause]`. It stops at the first
 failure with a non-zero exit code: `3` for a failed step or a check that is not
 green, `6` when the login did not complete in time, `2` for input errors, `4`
 when the storage is missing. It writes only into the state directory, plus what

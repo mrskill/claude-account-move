@@ -10,7 +10,10 @@ Order (stops at the first failure with a plain Russian message):
      account, run the CLI login in this very window;
   6. finish; when only names missing in the new pair are wrong, sync --apply
      (adds only, journaled) and finish once more;
-  7. a summary in plain Russian and the verdict line.
+  7. ask to open the app, wait for its start under the new account (fresh
+     store-root loads in main.log), finish again with the app running: that
+     run is the verdict; one repair round when only active_pair_real fails;
+  8. a summary in plain Russian and the verdict line.
 
 Writes stay where they were: the state directory, and `stamp`/`sync` apply.
 The only new write into the storage is the probe file, removed at once.
@@ -26,6 +29,7 @@ import subprocess
 import time
 
 from . import common
+from . import heal_active
 from . import panel_snapshot as snap
 from . import ru_text as ru
 from . import store as st
@@ -36,6 +40,7 @@ from .common import (EXIT_FAIL, EXIT_INPUT, EXIT_NO_BASELINE, EXIT_LOGIN_TIMEOUT
 PROBE_NAME = ".claude-account-move-write-probe"   # never matches local_*.json
 CLOSE_POLL_S = 2.0
 LOGIN_POLL_S = 2.0
+START_POLL_S = 2.0
 CLI_SETTLE_MIN_S = 3.0      # how long to watch for the CLI account after a login run
 CLI_SETTLE_MAX_S = 15.0
 CLI_LOGIN_FLOOR_S = 1.0     # least time a CLI login run is given
@@ -54,11 +59,16 @@ def _poll(default, env):
         return default
 
 
-def _ns(args, **extra):
-    """Arguments for one of the cmd_* steps: quiet, reports collected."""
+def _ns(args, post_login=False, **extra):
+    """Arguments for one of the cmd_* steps: quiet, reports collected.
+
+    --active-pair names the pair of the account the move starts from, so only
+    the steps before the login may use it; after the login the pair of the NEW
+    account is resolved by the step itself (active_pair=None)."""
     base = dict(home=args.home, state_dir=args.state_dir, json=False,
                 heartbeat=args.heartbeat, sync_max_age_min=args.sync_max_age_min,
-                active_pair=args.active_pair, quiet=True, capture=[])
+                active_pair=None if post_login else args.active_pair,
+                quiet=True, capture=[])
     base.update(extra)
     return argparse.Namespace(**base)
 
@@ -137,6 +147,25 @@ def wait_app_closed(limit_s, poll_s, out):
             out.say(ru.APP_WAIT % max(0, int(deadline - time.monotonic())))
             last = tick
     return False
+
+
+def wait_app_start(paths, account, since, limit_s, poll_s):
+    """{store: (acc, org)} once every store has a fresh store-root load of
+    `account` (log stamp at or after `since`); None when the time is up."""
+    deadline = time.monotonic() + max(0.0, limit_s)
+    while True:
+        loads = heal_active.fresh_root_loads(paths, account, since)
+        if all(s in loads for s in STORES):
+            return loads
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(min(poll_s, max(0.01, deadline - time.monotonic())))
+
+
+def only_active_pair_failed(rep):
+    """True when the finish report failed on active_pair_real and nothing else."""
+    failed = [c["id"] for c in (rep or {}).get("checks") or [] if not c["ok"]]
+    return bool(failed) and all(i == "active_pair_real" for i in failed)
 
 
 def wait_app_switch(cli, paths, source, allow_same, limit_s, poll_s, out):
@@ -508,12 +537,14 @@ def cmd_auto(args, cli):
         # 5b. the active pair must be a real directory (the app cannot save into
         # a symlinked one); the app has to be quit for the move of the folder
         out.say(ru.HEAL_START)
-        hcode, hrep = run_step(cli.cmd_heal_active, _ns(args, apply=True, from_log=False))
+        hcode, hrep = run_step(cli.cmd_heal_active, _ns(args, post_login=True,
+                                                         apply=True, from_log=False))
         if hcode != EXIT_OK and (hrep or {}).get("verdict") == "app_running":
             out.say(ru.HEAL_QUIT)
             if wait_app_closed(args.wait_close, _poll(
                     CLOSE_POLL_S, "CLAUDE_ACCOUNT_MOVE_CLOSE_POLL_S"), out):
-                hcode, hrep = run_step(cli.cmd_heal_active, _ns(args, apply=True, from_log=False))
+                hcode, hrep = run_step(cli.cmd_heal_active, _ns(
+                    args, post_login=True, apply=True, from_log=False))
         step("heal_active", hcode == EXIT_OK, exit_code=hcode,
              verdict=(hrep or {}).get("verdict"))
         if hcode != EXIT_OK:
@@ -523,33 +554,109 @@ def cmd_auto(args, cli):
                 show_summary=True)
 
         # 6. finish (and sync when only deliverable names are missing)
-        out.say(ru.FINISH_START)
-
         def finish_once():
             return run_step(cli.cmd_finish, _ns(
-                args, wait_login=30.0, wait_sync=0.0, move_id=ctx["move_id"],
-                allow_same_account=args.allow_same_account, allow_unready_baseline=False, max_age_hours=72.0))
+                args, post_login=True, wait_login=30.0, wait_sync=0.0,
+                move_id=ctx["move_id"], allow_same_account=args.allow_same_account,
+                allow_unready_baseline=False, max_age_hours=72.0))
 
-        fcode, frep = finish_once()
-        if fcode == EXIT_FAIL and frep and syncable(frep):
-            out.say(ru.SYNC_START)
-            scode, srep2 = run_step(cli.cmd_sync, _ns(args, apply=True, undo=None))
-            ctx["sync_journal"] = (srep2 or {}).get("journal")
-            ctx["synced"] = bool((srep2 or {}).get("copied"))
-            step("sync", scode == EXIT_OK, exit_code=scode, copied=(srep2 or {}).get("copied"))
-            if scode != EXIT_OK:
-                ctx["finish"] = frep
-                ctx["problem"] = ru.PROBLEM_STEP
-                why = (srep2 or {}).get("reason") or (srep2 or {}).get("verdict")
-                return stop(scode, "sync_failed", ru.SYNC_FAIL % (scode, why),
-                            show_summary=True)
+        def finish_sync():
             fcode, frep = finish_once()
+            if fcode == EXIT_FAIL and frep and syncable(frep) and not ctx.get("synced_once"):
+                ctx["synced_once"] = True
+                out.say(ru.SYNC_START)
+                scode, srep2 = run_step(cli.cmd_sync, _ns(
+                    args, post_login=True, apply=True, undo=None))
+                ctx["sync_journal"] = (srep2 or {}).get("journal")
+                ctx["synced"] = ctx.get("synced") or bool((srep2 or {}).get("copied"))
+                step("sync", scode == EXIT_OK, exit_code=scode,
+                     copied=(srep2 or {}).get("copied"))
+                if scode != EXIT_OK:
+                    ctx["finish"] = frep
+                    ctx["problem"] = ru.PROBLEM_STEP
+                    why = (srep2 or {}).get("reason") or (srep2 or {}).get("verdict")
+                    return None, stop(scode, "sync_failed", ru.SYNC_FAIL % (scode, why),
+                                      show_summary=True)
+                fcode, frep = finish_once()
+            return (fcode, frep), None
+
+        out.say(ru.FINISH_START)
+        res, stopped = finish_sync()
+        if stopped is not None:
+            return stopped
+        fcode, frep = res
         ctx["finish"] = frep
+        step("finish_before_start", fcode == EXIT_OK, exit_code=fcode)
+        # What the app restores by itself at start (names, lagging copies) is
+        # measured again below; only a hard error of the step stops here.
+        if fcode not in (EXIT_OK, EXIT_FAIL, EXIT_WAIT):
+            ctx["problem"] = ru.PROBLEM_FINISH
+            return stop(fcode, "fail", ru.PROBLEM_FINISH, show_summary=True)
+
+        # 7. the app picks the folder it writes into only when it starts under
+        # the new account: wait for that start, then the verdict is a finish run
+        # with the app running (one repair round at most)
+        start_poll = _poll(START_POLL_S, "CLAUDE_ACCOUNT_MOVE_START_POLL_S")
+        new_acc = (read_identity(paths).get("app") or {}).get("value")
+
+        def open_and_wait(ask_text):
+            out.say(ask_text % int(args.wait_start))
+            since = int(time.time())
+            loads = wait_app_start(paths, new_acc, since, args.wait_start, start_poll)
+            if loads is None:
+                step("app_start", False)
+                ctx["problem"] = ru.PROBLEM_START
+                return None, stop(EXIT_FAIL, "app_not_started", ru.START_TIMEOUT,
+                                  show_summary=True)
+            step("app_start", True, loads=sorted("%s/%s/%s" % (s, a, o)
+                                                 for s, (a, o) in loads.items()))
+            out.say(ru.START_SEEN)
+            return loads, None
+
+        loads, stopped = open_and_wait(ru.START_ASK)
+        if stopped is not None:
+            return stopped
+        res, stopped = finish_sync()
+        if stopped is not None:
+            return stopped
+        fcode, frep = res
         step("finish", fcode == EXIT_OK, exit_code=fcode)
+        if fcode == EXIT_FAIL and only_active_pair_failed(frep):
+            # the app loaded a symlinked pair: heal exactly the pairs it loaded
+            out.say(ru.START_REPAIR)
+            if not wait_app_closed(args.wait_close, _poll(
+                    CLOSE_POLL_S, "CLAUDE_ACCOUNT_MOVE_CLOSE_POLL_S"), out):
+                step("app_closed", False)
+                ctx["finish"] = frep
+                ctx["problem"] = ru.PROBLEM_PAIR
+                return stop(EXIT_FAIL, "app_running", ru.APP_TIMEOUT, show_summary=True)
+            hcode = EXIT_OK
+            for acc, org in sorted(set(loads.values())):
+                hcode, hrep = run_step(cli.cmd_heal_active, _ns(
+                    args, post_login=True, apply=True, from_log=False,
+                    active_pair="%s/%s" % (acc, org)))
+                step("heal_active", hcode == EXIT_OK, exit_code=hcode,
+                     verdict=(hrep or {}).get("verdict"))
+                if hcode != EXIT_OK:
+                    ctx["finish"] = frep
+                    ctx["problem"] = ru.PROBLEM_STEP
+                    return stop(hcode, "heal_failed", ru.HEAL_FAIL % (
+                        hcode, (hrep or {}).get("reason") or (hrep or {}).get("verdict")),
+                        show_summary=True)
+            loads, stopped = open_and_wait(ru.START_REPAIR_AGAIN)
+            if stopped is not None:
+                return stopped
+            res, stopped = finish_sync()
+            if stopped is not None:
+                return stopped
+            fcode, frep = res
+            step("finish", fcode == EXIT_OK, exit_code=fcode)
+        ctx["finish"] = frep
         if fcode == EXIT_OK:
             code, verdict = EXIT_OK, "ok"
         else:
             ctx["problem"] = (ru.PROBLEM_FINISH_WAIT if fcode == EXIT_WAIT
+                              else ru.PROBLEM_PAIR if only_active_pair_failed(frep)
                               else ru.PROBLEM_FINISH)
             code, verdict = (EXIT_WAIT if fcode == EXIT_WAIT else EXIT_FAIL), "fail"
         print_summary(out, args, ctx)

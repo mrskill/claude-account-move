@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- `auto` verifies the move after the app has started under the new account.
+  Defect 1: `--active-pair` (the OLD account's pair) was copied into every step;
+  now only prepare, the write probe and stamp use it, and heal-active, finish
+  and sync after the login get `active_pair=None` (`_ns(post_login=True)`).
+  Defect 2: the app chooses its org folder only at start, so after finish `auto`
+  asks to open Claude, waits (`--wait-start`, default 300 s, env
+  `CLAUDE_ACCOUNT_MOVE_START_POLL_S`) for a fresh store-root load of the new
+  account in each store (`heal_active.fresh_root_loads`, same definition as
+  `_root_loads`), and the verdict is a second finish with the app running. If
+  that fails only on `active_pair_real`, one repair round (quit, heal the loaded
+  pair, reopen, third finish). No fresh load in time: exit 3, never success.
+  The first finish no longer stops `auto` on names the app restores at start.
 - `prepare` no longer fails on a stale ENOTDIR line. A recent ENOTDIR line for a
   symlinked pair is cleared only when the last later store-root load in the same
   store (`Loaded N sessions from <store>/<account>/<org>`, no

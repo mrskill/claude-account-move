@@ -537,6 +537,24 @@ def _root_loads(line):
             and line[m.end():m.end() + 1] != "/"]
 
 
+def fresh_root_loads(paths, acc, since):
+    """{store: (acc, org)} of the newest store-root load (same definition as
+    _root_loads) of account `acc` whose log stamp is at or after `since`
+    (epoch seconds, whole-second resolution like the log). Empty when none."""
+    acc = acc.lower() if acc else None
+    found = {}
+    if not acc:
+        return found
+    for line in _log_text(paths).splitlines():
+        ts = _ts(line)
+        if ts is None or ts < since:
+            continue
+        for store, a, o in _root_loads(line):
+            if a == acc:
+                found[store] = (a, o)
+    return found
+
+
 def recent_enotdir(paths, now=None, max_age_s=ENOTDIR_MAX_AGE_S):
     """[(store, path, line)] of ENOTDIR lines of the last 2 days in main.log
     (one read of the log) that name a sessions-store pair which is still a symlink.
