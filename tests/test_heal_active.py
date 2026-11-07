@@ -413,6 +413,52 @@ class Refusals(Base):
         self.assertNotIn("Traceback", r.stdout + r.stderr)
 
 
+class SharedRoot(Base):
+    """The LAM store root is a symlink to the CC store root: both heal rows are the
+    same physical folders. The heal refuses as a whole before moving anything
+    (dry run and apply alike), the way auto's repair does (repair_conflict)."""
+
+    def shared(self):
+        ch = Chain(self.h)
+        lam = os.path.join(self.h.support, LAM)
+        shutil.rmtree(lam)
+        os.symlink(CC, lam)                    # LAM -> claude-code-sessions
+        return ch
+
+    def check(self, r, before):
+        text = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 3, text)
+        self.assertNotIn("Traceback", text)
+        rep = json.loads(r.stdout)
+        self.assertEqual(rep["verdict"], "refused", rep)
+        reason = rep.get("reason") or ""
+        self.assertTrue(CC in reason or LAM in reason, "the reason names no store: " + reason)
+        self.assertIn(ORG, reason, "the reason names no path")
+        self.assertNotIn("rolled back", reason, "it moved first and rolled back")
+        self.assertEqual(self.digest(), before, "something was changed or touched")
+        self.assertFalse(os.path.exists(os.path.join(self.h.state, "heal-active-journal.json")))
+
+    def test_apply_refuses_before_moving_anything(self):
+        self.shared()
+        before = self.digest()
+        self.check(self.heal("--apply", "--json"), before)
+
+    def test_dry_run_reports_the_refusal_and_changes_nothing(self):
+        self.shared()
+        before = self.digest()
+        r = self.heal("--json")
+        self.check(r, before)
+        self.assertNotIn("dry run", (json.loads(r.stdout).get("reason") or "").lower())
+
+    def test_separate_roots_still_heal_guard(self):
+        """Not red before the fix: without a shared root nothing is refused."""
+        ch = Chain(self.h)
+        r = self.heal("--apply")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for s in STORES:
+            check_healed(ch, s)
+
+
 class IdentitySource(Base):
     def test_active_pair_follows_identity_not_a_constant(self):
         ch1 = Chain(self.h, acc=uid(0x91, 1), org=uid(0x92, 2))
