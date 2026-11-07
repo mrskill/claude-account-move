@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The overlap refusals compare physical identity, not path strings: on a
+  case-insensitive volume (macOS default) `payload` and `PAYLOAD` are one folder
+  although `realpath` keeps both spellings. New `common.inside_physical(a, b)`
+  (walks `a` and its parents, compares `(st_dev, st_ino)` with `b`; a missing
+  path is no conflict on its own) is used, next to the string check, in
+  `overlap_problem`, in the "link inside its target" refusal of the heal plan
+  and in `repair_conflict` (root and pair checks). The allow-checks that say
+  "must lie inside the allowed root" keep the string `inside`.
 - `heal-active` and the `auto` repair also protect the other store's root
   folder: a heal is refused (exit 3, `refused`, nothing moved) when a folder it
   would move or replace (by realpath) is, lies inside or contains another

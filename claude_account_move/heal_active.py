@@ -18,7 +18,7 @@ import sys
 import time
 
 from . import store as st
-from .common import STORES, UUID_RE, inside, write_json
+from .common import STORES, UUID_RE, inside, inside_physical, write_json
 
 ENOTDIR_MAX_AGE_S = 2 * 24 * 3600
 FROM_LOG_MAX_AGE_S = 10 * 60
@@ -252,7 +252,7 @@ def plan_store(paths, store, pair):
     elif not inside(target, root) or target == root:
         row.update(state="refuse", reason="the link resolves outside this store "
                    "(%s); outside the store %s, nothing is moved" % (target, root))
-    elif inside(a_real(a), target):
+    elif inside(a_real(a), target) or inside_physical(a_real(a), target):
         row.update(state="refuse", reason="the target %s contains the active path" % target)
     else:
         bad = relative_link_problem(target)
@@ -548,6 +548,12 @@ def loaded_pair_problem(paths, store, pair):
     return None if os.path.isdir(p) else "not a directory"
 
 
+def _overlaps(x, y):
+    """Either contains the other, by spelling or by physical identity."""
+    return (inside(x, y) or inside(y, x)
+            or inside_physical(x, y) or inside_physical(y, x))
+
+
 def repair_conflict(paths, loads, todo_stores):
     """(store, other store, path) of the first store in `todo_stores` whose heal
     would move or replace a physical path that is, lies inside or contains the
@@ -567,7 +573,7 @@ def repair_conflict(paths, loads, todo_stores):
                 continue
             root = os.path.realpath(os.path.join(paths.support, other))
             for t in touched:
-                if inside(t, root) or inside(root, t):
+                if _overlaps(t, root):
                     return store, other, t
         for other, p in loads.items():
             if other == store or loaded_pair_problem(paths, other, p) in (
@@ -575,7 +581,7 @@ def repair_conflict(paths, loads, todo_stores):
                 continue
             real = os.path.realpath(pair_path(paths, other, p))
             for t in touched:
-                if inside(t, real) or inside(real, t):
+                if _overlaps(t, real):
                     return store, other, t
     return None
 
