@@ -15,7 +15,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-from fixture import CC, LAM, Home, tree_digest, uid  # noqa: E402
+from fixture import CC, LAM, Home, app_started, tree_digest, uid  # noqa: E402
 from test_cli import A, B, O1, O2, build_source, switch_to_target  # noqa: E402
 
 from claude_account_move import __version__  # noqa: E402
@@ -56,9 +56,19 @@ class Base(unittest.TestCase):
     def run_auto(self, *extra, app_running=None, wait=None, cli_login=None,
                  read_back=None, settle=0.05, real_login=False):
         """(exit code, stdout, stderr, mocks). Everything outside is replaced."""
-        argv = ["auto", "--home", self.h.home, "--state-dir", self.h.state] + list(extra)
+        argv = ["auto", "--home", self.h.home, "--state-dir", self.h.state]
+        if "--wait-start" not in extra:
+            argv += ["--wait-start", "5"]
+        argv += list(extra)
         running = app_running if app_running is not None else (lambda: False)
-        wait = wait or self.user_logs_in()
+        inner = wait or self.user_logs_in()
+
+        def wait(*a):
+            ident = inner(*a)
+            app_started(self.h, B, O2)       # the owner opens the app when auto asks
+            if hasattr(self, "after_login"):    # the log line is part of the login state
+                self.after_login = tree_digest_outside_support(self.h)
+            return ident
 
         def fake_login(cmd, timeout=None):
             self.login_calls.append(tuple(cmd))
@@ -108,7 +118,7 @@ class Happy(Base):
         self.assertEqual(out.strip().splitlines()[-1], ru.VERDICT_OK)
         for n in ("cmd_prepare", "cmd_stamp", "cmd_sync"):
             self.assertEqual(m[n].call_count, 1, n)
-        self.assertEqual(m["cmd_finish"].call_count, 2)     # once again after sync
+        self.assertEqual(m["cmd_finish"].call_count, 3)     # before the start, again after sync, after the start
         self.assertIn(ru.OF % (3, 3), out)                  # numbers with denominators
         self.assertIn("stamp --undo", out)
         self.assertIn("sync --undo", out)
@@ -123,7 +133,7 @@ class Happy(Base):
         code, out, _, m = self.run_auto(wait=self.user_logs_in(also_sync=True))
         self.assertEqual(code, 0, out)
         self.assertEqual(m["cmd_sync"].call_count, 0)
-        self.assertEqual(m["cmd_finish"].call_count, 1)
+        self.assertEqual(m["cmd_finish"].call_count, 2)     # before the start, after the start
         self.assertNotIn("sync --undo", out)
 
     def test_no_stamp_flag(self):

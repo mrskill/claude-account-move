@@ -44,6 +44,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, ROOT)
+import fixture  # noqa: E402
 from fixture import CC, LAM, Home, tree_digest, uid  # noqa: E402
 from test_cli import A, B, O1, O2, build_source, parse, switch_to_target  # noqa: E402
 
@@ -525,6 +526,7 @@ class AutoStep(Base):
                 os.rename(a, real)
                 os.symlink(real, a)
             events.append("login")
+            fixture.app_started(self.h, B, O2)   # the owner opens the app when asked
             return read_identity(Paths(self.h.home, self.h.state)), None
 
         def spy(name):
@@ -548,7 +550,8 @@ class AutoStep(Base):
             out = io.StringIO()
             es.enter_context(contextlib.redirect_stdout(out))
             es.enter_context(contextlib.redirect_stderr(io.StringIO()))
-            code = cli.main(["auto", "--home", self.h.home, "--state-dir", self.h.state])
+            code = cli.main(["auto", "--home", self.h.home, "--state-dir", self.h.state,
+                             "--wait-start", "5"])
         self.assertIn("cmd_heal_active", events)
         self.assertLess(events.index("login"), events.index("cmd_heal_active"))
         self.assertLess(events.index("cmd_heal_active"), events.index("cmd_finish"))

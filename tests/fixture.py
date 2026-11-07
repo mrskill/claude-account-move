@@ -112,3 +112,16 @@ def tree_digest(root):
             else:
                 out[p] = ("dir", st.st_mode, st.st_mtime_ns)
     return out
+
+
+def app_started(h, acc, org, ahead_s=60):
+    """The owner opens the app under `acc`: one store-root load line per store is
+    appended to the fake main.log. The stamp is `ahead_s` seconds ahead, so it is
+    newer than the moment auto asks, whenever the test reaches that point."""
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + ahead_s))
+    d = os.path.join(h.home, "Library", "Logs", "Claude")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "main.log"), "a") as fh:
+        for store in (CC, LAM):
+            fh.write("%s info: Loaded 3 persisted sessions from %s\n"
+                     % (ts, os.path.join(h.support, store, acc, org)))
