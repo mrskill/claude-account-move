@@ -413,6 +413,151 @@ class Refusals(Base):
         self.assertNotIn("Traceback", r.stdout + r.stderr)
 
 
+class SharedRoot(Base):
+    """The LAM store root is a symlink to the CC store root: both heal rows are the
+    same physical folders. The heal refuses as a whole before moving anything
+    (dry run and apply alike), the way auto's repair does (repair_conflict)."""
+
+    def shared(self):
+        ch = Chain(self.h)
+        lam = os.path.join(self.h.support, LAM)
+        shutil.rmtree(lam)
+        os.symlink(CC, lam)                    # LAM -> claude-code-sessions
+        return ch
+
+    def check(self, r, before):
+        text = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 3, text)
+        self.assertNotIn("Traceback", text)
+        rep = json.loads(r.stdout)
+        self.assertEqual(rep["verdict"], "refused", rep)
+        reason = rep.get("reason") or ""
+        self.assertTrue(CC in reason or LAM in reason, "the reason names no store: " + reason)
+        self.assertIn(ORG, reason, "the reason names no path")
+        self.assertNotIn("rolled back", reason, "it moved first and rolled back")
+        self.assertEqual(self.digest(), before, "something was changed or touched")
+        self.assertFalse(os.path.exists(os.path.join(self.h.state, "heal-active-journal.json")))
+
+    def test_apply_refuses_before_moving_anything(self):
+        self.shared()
+        before = self.digest()
+        self.check(self.heal("--apply", "--json"), before)
+
+    def test_dry_run_reports_the_refusal_and_changes_nothing(self):
+        self.shared()
+        before = self.digest()
+        r = self.heal("--json")
+        self.check(r, before)
+        self.assertNotIn("dry run", (json.loads(r.stdout).get("reason") or "").lower())
+
+    def test_separate_roots_still_heal_guard(self):
+        """Not red before the fix: without a shared root nothing is refused."""
+        ch = Chain(self.h)
+        r = self.heal("--apply")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for s in STORES:
+            check_healed(ch, s)
+
+
+class StoreRootProtected(Base):
+    """R13: the heal must not move or replace a physical path that is, lies inside
+    or contains ANOTHER store's root folder, whatever the plan holds: --from-log
+    plans one store only, so the other store has no row to compare with."""
+
+    check = SharedRoot.check            # the same refusal checks
+
+    def enotdir(self, store, acc, org):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        path = os.path.join(self.h.support, store, acc, org)
+        os.makedirs(os.path.join(self.h.home, "Library", "Logs", "Claude"), exist_ok=True)
+        with open(os.path.join(self.h.home, "Library", "Logs", "Claude", "main.log"), "a") as fh:
+            fh.write("%s [error] Failed to save session local_x: ENOTDIR: not a "
+                     "directory, mkdir '%s' at ensureStorageDir\n" % (ts, path))
+
+    def codex_layout(self):
+        """CC/A/O -> ../payload; CC/payload/A/O real; LAM -> CC/payload; a fresh
+        ENOTDIR line for CC/A/O only."""
+        cc = os.path.join(self.h.support, CC)
+        os.makedirs(os.path.join(cc, ACC))
+        os.makedirs(os.path.join(cc, "payload", ACC, ORG))
+        os.symlink(os.path.join("..", "payload"), os.path.join(cc, ACC, ORG))
+        os.symlink(os.path.join(CC, "payload"), os.path.join(self.h.support, LAM))
+        set_identity(self.h, ACC, ORG)
+        self.h.log((ACC, ORG))
+        self.enotdir(CC, ACC, ORG)
+
+    def test_from_log_apply_refuses_before_moving(self):
+        self.codex_layout()
+        before = self.digest()
+        self.check(self.heal("--from-log", "--apply", "--json"), before)
+
+    def test_from_log_dry_run_reports_the_refusal(self):
+        self.codex_layout()
+        before = self.digest()
+        self.check(self.heal("--from-log", "--json"), before)
+
+    def test_link_target_inside_the_other_stores_root_is_refused(self):
+        """LAM's root is CC/payload; CC/A/O -> ../payload/sub, a real folder inside
+        it: moving sub to CC/A/O would change the contents of LAM's root."""
+        cc = os.path.join(self.h.support, CC)
+        os.makedirs(os.path.join(cc, ACC))
+        os.makedirs(os.path.join(cc, "payload", "sub"))
+        os.symlink(os.path.join("..", "payload", "sub"), os.path.join(cc, ACC, ORG))
+        os.symlink(os.path.join(CC, "payload"), os.path.join(self.h.support, LAM))
+        set_identity(self.h, ACC, ORG)
+        self.h.log((ACC, ORG))
+        before = self.digest()
+        self.check(self.heal("--apply", "--json"), before)
+
+    def test_separate_roots_from_log_still_heals_guard(self):
+        """Not red before the fix: separate roots, --from-log heals the one store."""
+        ch = Chain(self.h)
+        self.enotdir(CC, ACC, ORG)
+        r = self.heal("--from-log", "--apply")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        check_healed(ch, CC)
+
+
+def volume_is_case_insensitive():
+    """Probe the temp volume: create `x`, ask for `X`."""
+    d = tempfile.mkdtemp(prefix="cam-case-")
+    try:
+        open(os.path.join(d, "x"), "w").close()
+        return os.path.exists(os.path.join(d, "X"))
+    finally:
+        shutil.rmtree(d, True)
+
+
+@unittest.skipUnless(volume_is_case_insensitive(), "case-sensitive volume")
+class CaseVariantRoot(Base):
+    """R14: `payload` and `PAYLOAD` are one folder on a case-insensitive volume;
+    realpath keeps both spellings, so a string compare misses the overlap."""
+
+    check = SharedRoot.check
+    enotdir = StoreRootProtected.enotdir
+
+    def layout(self):
+        """CC/A/O -> ../payload; CC/payload/A/O real; LAM -> CC/PAYLOAD."""
+        cc = os.path.join(self.h.support, CC)
+        os.makedirs(os.path.join(cc, ACC))
+        os.makedirs(os.path.join(cc, "payload", ACC, ORG))
+        os.symlink(os.path.join("..", "payload"), os.path.join(cc, ACC, ORG))
+        os.symlink(os.path.join(CC, "PAYLOAD"), os.path.join(self.h.support, LAM))
+        set_identity(self.h, ACC, ORG)
+        self.h.log((ACC, ORG))
+
+    def test_plain_apply_refuses_before_moving(self):
+        self.layout()
+        before = self.digest()
+        self.check(self.heal("--apply", "--json"), before)
+
+    def test_from_log_apply_refuses_before_moving(self):
+        self.layout()
+        self.enotdir(CC, ACC, ORG)
+        before = self.digest()
+        self.check(self.heal("--from-log", "--apply", "--json"), before)
+
+
 class IdentitySource(Base):
     def test_active_pair_follows_identity_not_a_constant(self):
         ch1 = Chain(self.h, acc=uid(0x91, 1), org=uid(0x92, 2))

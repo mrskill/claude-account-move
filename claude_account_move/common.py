@@ -55,6 +55,32 @@ def inside(child, parent):
     return child == parent or child.startswith(parent.rstrip(os.sep) + os.sep)
 
 
+def inside_physical(a, b):
+    """True when `a` is the same folder as `b` or lies inside it, by physical
+    identity ((st_dev, st_ino)), not by spelling: on a case-insensitive volume
+    `payload` and `PAYLOAD` are one folder although the strings differ. Walks `a`
+    and its parent folders; a path that does not exist is skipped (never a
+    conflict on its own) but its existing parents still count. The last component
+    is not followed if it is a symlink (the link is a place of its own)."""
+    try:
+        sb = os.stat(b)
+    except OSError:
+        return False
+    want = (sb.st_dev, sb.st_ino)
+    cur = a
+    while True:
+        try:
+            st = os.lstat(cur)      # a final symlink is the link itself
+            if (st.st_dev, st.st_ino) == want:
+                return True
+        except OSError:
+            pass
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return False
+        cur = parent
+
+
 def overlap_problem(path, paths):
     """Why a resolved write destination is unsafe, or None."""
     real_path = os.path.realpath(path)
@@ -62,7 +88,8 @@ def overlap_problem(path, paths):
                  paths.cli_config, paths.logs]
     for p in protected:
         real = os.path.realpath(p)
-        if inside(real_path, real) or inside(real, real_path):
+        if (inside(real_path, real) or inside(real, real_path)
+                or inside_physical(real_path, real) or inside_physical(real, real_path)):
             return "state path %s overlaps protected path %s" % (real_path, real)
     return None
 
