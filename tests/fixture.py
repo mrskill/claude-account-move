@@ -114,14 +114,55 @@ def tree_digest(root):
     return out
 
 
-def app_started(h, acc, org, ahead_s=60):
-    """The owner opens the app under `acc`: one store-root load line per store is
-    appended to the fake main.log. The stamp is `ahead_s` seconds ahead, so it is
-    newer than the moment auto asks, whenever the test reaches that point."""
-    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + ahead_s))
-    d = os.path.join(h.home, "Library", "Logs", "Claude")
-    os.makedirs(d, exist_ok=True)
-    with open(os.path.join(d, "main.log"), "a") as fh:
-        for store in (CC, LAM):
-            fh.write("%s info: Loaded 3 persisted sessions from %s\n"
-                     % (ts, os.path.join(h.support, store, acc, org)))
+class OwnerApp(object):
+    """The owner and the Claude app in the older auto tests. The app is closed
+    until auto has a verdict-grade finish and so asks for the start; only then
+    (a moment later, after auto has noted the end of main.log) one store-root load
+    line per store of the new pair is appended, and the app is running. A running
+    app is quit by the owner after a few polls (it must be, for the repair)."""
+
+    QUIT_AFTER_POLLS = 3
+
+    def __init__(self, h, acc, org, delay=0.02):
+        self.h, self.acc, self.org, self.delay = h, acc, org, delay
+        self.open = False
+        self.polls = 0
+        self.threads = []
+
+    def running(self):
+        if self.open:
+            self.polls += 1
+            if self.polls > self.QUIT_AFTER_POLLS:
+                self.open = False
+        return self.open
+
+    def idle(self):
+        return not self.open and not any(t.is_alive() for t in self.threads)
+
+    def start(self):
+        def go():
+            time.sleep(self.delay)
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            d = os.path.join(self.h.home, "Library", "Logs", "Claude")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "main.log"), "a") as fh:
+                for store in (CC, LAM):
+                    fh.write("%s info: Loaded 3 persisted sessions from %s\n" % (
+                        ts, os.path.join(self.h.support, store, self.acc, self.org)))
+            self.polls = 0
+            self.open = True
+        import threading
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        self.threads.append(t)
+
+    def after_finish(self, code, report):
+        """Call with every finish result: the owner opens the app once auto
+        has a finish that is not just waiting for names to be synced."""
+        from claude_account_move import auto_move
+        if self.idle() and (code == 0 or not (report and auto_move.syncable(report))):
+            self.start()
+
+    def join(self):
+        for t in self.threads:
+            t.join(5)

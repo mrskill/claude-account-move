@@ -526,7 +526,6 @@ class AutoStep(Base):
                 os.rename(a, real)
                 os.symlink(real, a)
             events.append("login")
-            fixture.app_started(self.h, B, O2)   # the owner opens the app when asked
             return read_identity(Paths(self.h.home, self.h.state)), None
 
         def spy(name):
@@ -537,14 +536,21 @@ class AutoStep(Base):
                 return real(*a, **k)
             return f
 
+        app = fixture.OwnerApp(self.h, B, O2)    # opens the app only after auto asks
+        spy_finish = spy("cmd_finish")
+
+        def finish_then_open(ns):
+            code = spy_finish(ns)
+            app.after_finish(code, ns.capture[-1] if ns.capture else None)
+            return code
+
         env = dict(test_auto.ENVS)
         with mock.patch.dict(os.environ, env), contextlib.ExitStack() as es:
             self.assertTrue(hasattr(cli, "cmd_heal_active"), "cmd_heal_active missing")
             es.enter_context(mock.patch.object(cli, "cmd_heal_active",
                                                spy("cmd_heal_active")))
-            es.enter_context(mock.patch.object(cli, "cmd_finish", spy("cmd_finish")))
-            es.enter_context(mock.patch.object(common, "claude_app_running",
-                                               lambda: False))
+            es.enter_context(mock.patch.object(cli, "cmd_finish", finish_then_open))
+            es.enter_context(mock.patch.object(common, "claude_app_running", app.running))
             es.enter_context(mock.patch.object(auto_move, "wait_app_switch", login))
             es.enter_context(mock.patch.object(auto_move, "CLI_SETTLE_MIN_S", 0.05))
             out = io.StringIO()
@@ -556,6 +562,7 @@ class AutoStep(Base):
         self.assertLess(events.index("login"), events.index("cmd_heal_active"))
         self.assertLess(events.index("cmd_heal_active"), events.index("cmd_finish"))
         self.assertEqual(code, 0, out.getvalue())
+        app.join()
         for s in STORES:
             self.assertFalse(os.path.islink(os.path.join(self.h.support, s, B, O2)))
 

@@ -15,7 +15,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-from fixture import CC, LAM, Home, app_started, tree_digest, uid  # noqa: E402
+from fixture import CC, LAM, Home, OwnerApp, tree_digest, uid  # noqa: E402
 from test_cli import A, B, O1, O2, build_source, switch_to_target  # noqa: E402
 
 from claude_account_move import __version__  # noqa: E402
@@ -60,15 +60,19 @@ class Base(unittest.TestCase):
         if "--wait-start" not in extra:
             argv += ["--wait-start", "5"]
         argv += list(extra)
-        running = app_running if app_running is not None else (lambda: False)
-        inner = wait or self.user_logs_in()
+        custom = app_running if app_running is not None else (lambda: False)
 
-        def wait(*a):
-            ident = inner(*a)
-            app_started(self.h, B, O2)       # the owner opens the app when auto asks
-            if hasattr(self, "after_login"):    # the log line is part of the login state
-                self.after_login = tree_digest_outside_support(self.h)
-            return ident
+        def running():
+            mine = custom()
+            return app.running() or mine
+        wait = wait or self.user_logs_in()
+        app = OwnerApp(self.h, B, O2)        # opens the app only after auto asks
+        real_finish = cli.cmd_finish
+
+        def finish(ns):
+            code = real_finish(ns)
+            app.after_finish(code, ns.capture[-1] if ns.capture else None)
+            return code
 
         def fake_login(cmd, timeout=None):
             self.login_calls.append(tuple(cmd))
@@ -84,10 +88,12 @@ class Base(unittest.TestCase):
             if read_back:
                 es.enter_context(mock.patch.object(auto_move, "_read_back", read_back))
             m = {n: es.enter_context(mock.patch.object(cli, n, wraps=getattr(cli, n)))
-                 for n in ("cmd_prepare", "cmd_stamp", "cmd_finish", "cmd_sync")}
+                 for n in ("cmd_prepare", "cmd_stamp", "cmd_sync")}
+            m["cmd_finish"] = es.enter_context(mock.patch.object(cli, "cmd_finish", wraps=finish))
             es.enter_context(contextlib.redirect_stdout(out))
             es.enter_context(contextlib.redirect_stderr(err))
             code = cli.main(argv)
+        app.join()
         return code, out.getvalue(), err.getvalue(), m
 
     def support_leftovers(self):
@@ -106,7 +112,8 @@ def slurp(path, mode="rb"):
 
 def tree_digest_outside_support(h):
     d = tree_digest(h.home)
-    return {k: v for k, v in d.items() if not k.startswith(h.support)}
+    logs = os.path.join(h.home, "Library", "Logs")       # the app's own log is not auto's write
+    return {k: v for k, v in d.items() if not k.startswith((h.support, logs))}
 
 
 class Happy(Base):

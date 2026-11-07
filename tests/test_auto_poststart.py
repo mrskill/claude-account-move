@@ -63,6 +63,9 @@ class FakeApp(object):
         self.silent = False            # the owner never opens the app
         self.threads = []
         self.last_epoch = 0            # newest log stamp this app wrote
+        self.ahead = 1                 # seconds the stamps run ahead of the clock
+        self.reopen = True             # the owner opens the app again after a repair
+        self.rotate = False            # the app starts a fresh main.log (new file)
 
     def running(self):
         if self.open:
@@ -94,14 +97,20 @@ class FakeApp(object):
             time.sleep(self.delay)
             if self.before_load:
                 self.before_load(self.starts)
-            self.last_epoch = int(time.time()) + 1   # newer than the ask, a second ahead
+            if self.rotate:                         # a rotated log: a new, shorter file
+                tmp = self.log_path + ".new"
+                open(tmp, "w").close()
+                os.replace(tmp, self.log_path)
+            self.last_epoch = int(time.time()) + self.ahead
             ts = stamp(self.last_epoch)
             if self.decoy_old_first:
                 self.append([(CC, A, O1), (LAM, A, O1)], ts)
                 time.sleep(self.delay)
-            self.append([(CC, pair[0], pair[1])], ts)
+            # one pair for both stores, or a {store: pair} map (stores may differ)
+            pairs = pair if isinstance(pair, dict) else {CC: pair, LAM: pair}
+            self.append([(CC,) + tuple(pairs[CC])], ts)
             time.sleep(self.delay)               # the second store loads later
-            self.append([(LAM, pair[0], pair[1])], ts)
+            self.append([(LAM,) + tuple(pairs[LAM])], ts)
             self.polls = 0
             self.open = True
 
@@ -158,6 +167,7 @@ class PostStart(Base):
 
     # -- the run -------------------------------------------------------------
     def run_ps(self, *extra, **kw):
+        self.out_buf = io.StringIO()       # a fresh output for every run of auto
         inner = kw.pop("wait", None) or self.login_with_names()
 
         def wait(*a):
@@ -192,7 +202,7 @@ class PostStart(Base):
             code = real_heal(ns)
             rep = ns.capture[-1] if ns.capture else None
             self.heal_log.append(dict(ns=ns, code=code, verdict=(rep or {}).get("verdict")))
-            if (app.starts and code == EXIT_OK and app.idle()
+            if (app.reopen and app.starts and code == EXIT_OK and app.idle()
                     and (rep or {}).get("verdict") == "healed"):
                 app.settle()
                 app.start(self.post_pair)            # the owner opens the app again
@@ -415,6 +425,136 @@ class NamesTheAppRestoresDoNotStopAuto(PostStart):
         self.assertEqual(code, 0, out + err)
         self.assertGreaterEqual(len(self.finish_log), 2)
         self.assertTrue(self.finish_log[-1]["open"])
+
+
+def link_in(h, store, org, to_org):
+    link_pair(h, store, org, to_org)
+
+
+# ------------------------------------------------------------- R6, R7 ------
+class PerStorePairs(PostStart):
+    """The app may load a different organization in each store."""
+
+    def test_r6_each_store_is_judged_by_the_pair_it_loaded(self):
+        """CC loads (B, O3), a link to O2; LAM then loads (B, O2), a real folder.
+        One shared pair ("the last mention": O2) would pass; CC's loaded pair
+        is a symlink and must be found and healed."""
+        build_source(self.h)
+        self.login_hooks.append(lambda: link_in(self.h, CC, O3, O2))
+        self.post_pair = {CC: (B, O3), LAM: (B, O2)}
+        code, out, err, _ = self.run_ps()
+        self.assertTrue(self.real_dir(CC, O3),
+                        "the pair CC loaded is still a symlink, the move was reported ok")
+        self.assertTrue(self.real_dir(LAM, O2), "LAM's loaded pair was touched")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(len(self.finish_log), 3,
+                         "finish before start, after start (fails), after the repair")
+
+    def test_r7_repair_touches_only_the_store_whose_loaded_pair_is_a_link(self):
+        """CC loads (B, O2), real. LAM loads (B, O3), a link to O2; CC also has an
+        O3 link that nobody loaded. Healing O3 in both stores would turn CC's
+        real, loaded O2 into a link."""
+        build_source(self.h)
+
+        def links():
+            link_in(self.h, LAM, O3, O2)
+            link_in(self.h, CC, O3, O2)
+        self.login_hooks.append(links)
+        self.post_pair = {CC: (B, O2), LAM: (B, O3)}
+        code, out, err, _ = self.run_ps()
+        self.assertTrue(self.real_dir(LAM, O3), "LAM's loaded pair was not healed")
+        self.assertTrue(self.real_dir(CC, O2),
+                        "CC's loaded, real pair was turned into a symlink by the repair")
+        self.assertTrue(os.path.islink(os.path.join(self.h.support, CC, B, O3)),
+                        "CC's unloaded O3 link was touched")
+        self.assertEqual(code, 0, out + err)
+
+
+# ------------------------------------------------------------------ R8 ------
+class FreshMeansAppendedAfterTheAsk(PostStart):
+    def test_r8_lines_already_in_the_log_never_count_even_if_stamped_later(self):
+        build_source(self.h)
+        ahead = stamp(int(time.time()) + 600)       # stamped after the ask, written before it
+        self.login_hooks.append(lambda: self.app.append(
+            [(CC, B, O2), (LAM, B, O2)], ahead))
+        self.app.silent = True
+        code, out, err, _ = self.run_ps("--wait-start", "0.4")
+        self.assertEqual(code, 3, out + err)
+        self.assertNotIn(ru.VERDICT_OK, out)
+        self.assertEqual(len(self.finish_log), 1, "finish ran on an unmeasured pair")
+
+    def test_r8_after_the_repair_old_lines_do_not_count_either(self):
+        build_source(self.h)
+        self.login_hooks.append(self.symlinked_post_pair)
+        self.app.ahead = 5                           # first-start lines stamped well ahead
+        self.app.reopen = False                      # the owner does not open the app again
+        code, out, err, _ = self.run_ps("--wait-start", "1")
+        self.assertEqual(code, 3, out + err)
+        self.assertNotIn(ru.VERDICT_OK, out)
+        self.assertEqual(len(self.finish_log), 2, "the third finish ran without a new start")
+
+    def test_r8_guard_a_rotated_log_counts_as_all_new(self):
+        """Not red before the fix: a fresh, shorter main.log (new file) is accepted."""
+        build_source(self.h)
+        self.login_hooks.append(lambda: self.app.append(
+            [(CC, B, O2)] * 40, "2026-01-01 00:00:02"))      # a long old log
+        self.app.rotate = True
+        code, out, err, _ = self.run_ps("--wait-start", "3")
+        self.assertEqual(code, 0, out + err)
+
+
+# ------------------------------------------------------------------ R9 ------
+class StoppedMoveCanBeResumed(PostStart):
+    def resumable(self):
+        from claude_account_move.common import Paths, read_identity
+        paths = Paths(self.h.home, self.h.state)
+        acc = read_identity(paths)["app"]["value"]
+        return auto_move.find_unfinished_move(paths, acc)
+
+    def test_r9_start_timeout_leaves_the_move_unfinished_and_a_rerun_resumes_it(self):
+        build_source(self.h)
+        self.app.silent = True
+        code, out, err, _ = self.run_ps("--wait-start", "0.4")
+        self.assertEqual(code, 3, out + err)
+        found = self.resumable()
+        self.assertTrue(found and found[0] == "resume",
+                        "the stopped move looks finished to the resume logic: %r" % (found,))
+        move_id = found[1]
+        # the owner runs auto again and this time opens the app when asked
+        self.app.silent = False
+        self.login_hooks[:] = []
+        keep = self.finish_log[:]
+        from claude_account_move.common import Paths, read_identity
+
+        def no_login(*a):
+            return read_identity(Paths(self.h.home, self.h.state)), None
+        code, out, err, calls = self.run_ps(wait=no_login)
+        self.assertEqual(calls["cmd_prepare"].call_count, 0, "a new move was prepared")
+        self.assertIn(ru.RESUME_MOVE.split("%s")[0], out)
+        self.assertEqual(code, 0, out + err)
+        self.assertTrue(self.finish_log[len(keep):][-1]["open"])
+        self.assertTrue(os.path.isdir(os.path.join(self.h.state, "moves", move_id)))
+
+    def test_r9_second_active_pair_failure_leaves_the_move_unfinished(self):
+        build_source(self.h)
+        self.login_hooks.append(self.symlinked_post_pair)
+
+        def relink(start_no):
+            for store in (CC, LAM):
+                d = os.path.join(self.h.support, store, B)
+                o3 = os.path.join(d, O3)
+                if os.path.islink(o3):
+                    continue
+                o2 = os.path.join(d, O2)
+                os.unlink(o2)
+                os.rename(o3, o2)
+                os.symlink(O2, o3)
+        self.app.before_load = relink
+        code, out, err, _ = self.run_ps()
+        self.assertEqual(code, 3, out + err)
+        found = self.resumable()
+        self.assertTrue(found and found[0] == "resume",
+                        "the stopped move looks finished to the resume logic: %r" % (found,))
 
 
 if __name__ == "__main__":
