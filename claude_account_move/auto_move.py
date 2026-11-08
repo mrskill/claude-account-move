@@ -21,6 +21,7 @@ The steps are the existing cmd_* functions of cli.py run quietly; their
 reports are collected through args.capture. Texts: ru_text.py.
 """
 import argparse
+import math
 import os
 import re
 import secrets
@@ -149,18 +150,28 @@ def wait_app_closed(limit_s, poll_s, out):
     return False
 
 
-def wait_app_start(paths, account, mark, limit_s, poll_s):
+def wait_app_start(paths, account, mark, limit_s, poll_s, out):
     """{store: (acc, org)} once every store has a store-root load of `account`
     appended to main.log after `mark` (heal_active.log_mark); None when the
-    time is up."""
-    deadline = time.monotonic() + max(0.0, limit_s)
+    time is up. Prints a countdown at the start and every 30 s (like
+    wait_app_closed); the seconds left are rounded up and never printed at 0."""
+    t0 = time.monotonic()
+    deadline = t0 + max(0.0, limit_s)
+    last = -1
     while True:
         loads = heal_active.fresh_root_loads(paths, account, mark)
         if all(s in loads for s in STORES):
             return loads
-        if time.monotonic() >= deadline:
+        now = time.monotonic()           # one reading for every decision below
+        if now >= deadline:
             return None
-        time.sleep(min(poll_s, max(0.01, deadline - time.monotonic())))
+        left = deadline - now
+        tick = int((now - t0) // 30)
+        if tick != last:
+            if math.ceil(left) > 0:
+                out.say(ru.START_WAIT % math.ceil(left))
+            last = tick
+        time.sleep(min(poll_s, max(0.01, left)))
 
 
 def only_active_pair_failed(rep):
@@ -620,7 +631,8 @@ def cmd_auto(args, cli):
             # appended after this mark (taken as the ask is printed) count
             mark = heal_active.log_mark(paths)
             out.say(ask_text % int(args.wait_start))
-            loads = wait_app_start(paths, new_acc, mark, args.wait_start, start_poll)
+            loads = wait_app_start(paths, new_acc, mark, args.wait_start, start_poll,
+                                   out)
             if loads is None:
                 step("app_start", False)
                 ctx["problem"] = ru.PROBLEM_START
