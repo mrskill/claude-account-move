@@ -223,7 +223,7 @@ RESUME_MAX_AGE_ENV = "CLAUDE_ACCOUNT_MOVE_RESUME_MAX_AGE_H"   # tests only
 def _resume_max_age_h():
     try:
         v = float(os.environ.get(RESUME_MAX_AGE_ENV, ""))
-        if v > 0:
+        if math.isfinite(v) and v > 0:
             return v
     except ValueError:
         pass
@@ -239,6 +239,18 @@ def failed_auto_report_age_h(mdir):
         return None
     try:
         return max(0.0, (time.time() - os.path.getmtime(path)) / 3600.0)
+    except OSError:
+        return None
+
+
+def resume_age_h(mdir):
+    """Age in hours of a move that resumes: the failed auto report when there is
+    one, else the mtime of before.json. None when neither can be read."""
+    age = failed_auto_report_age_h(mdir)
+    if age is not None:
+        return age
+    try:
+        return max(0.0, (time.time() - os.path.getmtime(os.path.join(mdir, "before.json"))) / 3600.0)
     except OSError:
         return None
 
@@ -499,8 +511,10 @@ def cmd_auto(args, cli):
         if resumed:
             ctx["move_id"], ctx["move_dir"], source = resumed
             step("resume", True, move_id=ctx["move_id"])
-            age_h = failed_auto_report_age_h(ctx["move_dir"]) or 0.0
-            out.say(ru.RESUME_MOVE % (source, current, int(age_h + 0.5), ctx["move_dir"]))
+            age_h = resume_age_h(ctx["move_dir"])
+            age_txt = (ru.RESUME_AGE_UNKNOWN if age_h is None
+                       else ru.RESUME_AGE % int(age_h + 0.5))
+            out.say(ru.RESUME_MOVE % (source, current, age_txt, ctx["move_dir"]))
         else:
             landed = None if args.new_move or not current else find_landed_move(paths)
             if landed:
