@@ -15,6 +15,7 @@ import os
 import time
 import sys
 import re
+from datetime import datetime
 
 from .common import (CARD_PREFIX, STORES, TOMB_PREFIX, TRANSCRIPT_RE, UUID_RE,
                      inside, iso_to_ms)
@@ -343,20 +344,137 @@ def transcripts(paths, progress=None):
     return out
 
 
-def app_pairs(paths, account=None):
-    """Pairs named in the app log, in order of appearance (acc, org)."""
+LOG_TAIL_BYTES = 64 * 1024 * 1024
+# "2026-10-08 19:44:12 ..." or "[2026-10-08 19:44:12.123] ..." at the line start
+LOG_TS_RE = re.compile(r"^\s*\[?(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
+
+
+def _read_log_tail(path):
+    """(text, None), or (None, "missing") or (None, "unreadable")."""
     try:
-        with open(paths.main_log, "rb") as fh:
+        with open(path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
-            fh.seek(max(0, size - 64 * 1024 * 1024))
-            text = fh.read().decode("utf-8", "ignore")
+            fh.seek(max(0, size - LOG_TAIL_BYTES))
+            return fh.read(LOG_TAIL_BYTES).decode("utf-8", "ignore"), None
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError:
+        return None, "unreadable"
+
+
+def _last_mention(text, account):
+    """(acc, org, line) of the last line that names a pair, or None.
+
+    With `account`, only that account's mentions count; the last mention in a
+    line wins, and so does the last line.
+    """
+    want = account.lower() if account else None
+    found = None
+    for line in text.splitlines():
+        hits = [(a.lower(), o.lower()) for a, o in PAIR_RE.findall(line)]
+        if want:
+            hits = [h for h in hits if h[0] == want]
+        if hits:
+            found = (hits[-1][0], hits[-1][1], line)
+    return found
+
+
+def _rotated_names(main_log):
+    """Names main1.log, main2.log, ... beside main.log, numeric order (main1 newest).
+
+    None when the folder exists but cannot be listed; [] when it does not exist.
+    """
+    stem, ext = os.path.splitext(os.path.basename(main_log))
+    rx = re.compile(r"^%s(\d+)%s$" % (re.escape(stem), re.escape(ext)))
+    try:
+        names = os.listdir(os.path.dirname(main_log))
+    except FileNotFoundError:
+        return []
     except OSError:
         return None
-    hits = [(a.lower(), o.lower()) for a, o in PAIR_RE.findall(text)]
-    if account:
-        hits = [h for h in hits if h[0] == account.lower()]
-    return hits
+    nums = sorted(int(m.group(1)) for m in (rx.match(n) for n in names) if m)
+    return ["%s%d%s" % (stem, n, ext) for n in nums]
+
+
+def _log_candidates(main):
+    """main.log first, then the rotated logs; None once when the folder cannot be listed.
+
+    Lazy: the folder is listed only when main.log named no pair.
+    """
+    yield main
+    names = _rotated_names(main)
+    if names is None:
+        yield None
+        return
+    for n in names:
+        yield os.path.join(os.path.dirname(main), n)
+
+
+def _mention_time(path, line, now):
+    """Source description: the line's own time when it parses, else the file mtime."""
+    when, how = None, "file_mtime"
+    m = LOG_TS_RE.match(line)
+    if m:
+        try:
+            y, mo, d, h, mi, s = [int(x) for x in m.groups()]
+            when, how = datetime(y, mo, d, h, mi, s).timestamp(), "log_line"
+        except (ValueError, OverflowError, OSError):
+            when = None
+    if when is None:
+        try:
+            when = os.stat(path).st_mtime
+        except OSError:
+            when = None
+    out = {"file": os.path.basename(path), "time_from": how}
+    if when is None:
+        out.update(mention_time=None, age_hours=None, time_from="unknown")
+        return out
+    out["mention_time"] = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M:%S")
+    out["age_hours"] = round(max(0.0, (now - when) / 3600.0), 1)
+    return out
+
+
+def find_pair_mention(paths, account=None, now=None):
+    """Most recent app-log mention of a pair: (found, problem).
+
+    found is {"pair": (acc, org), "source": {...}} or None. main.log is read
+    first; only when it names no pair (for `account`, when given) do the
+    rotated logs main1.log, main2.log, ... follow in numeric order, the first
+    file with a mention wins. A missing file is skipped. A file that exists but
+    cannot be read stops the search with problem "unreadable": it could hold a
+    newer mention, so nothing older is used. problem is "no_logs" when no log
+    file exists and "not_found" when the files that exist name no pair.
+    """
+    now = time.time() if now is None else now
+    main = paths.main_log
+    seen_any = False
+    for path in _log_candidates(main):
+        if path is None:
+            return None, {"problem": "unreadable",
+                          "file": os.path.basename(os.path.dirname(main))}
+        text, err = _read_log_tail(path)
+        if err == "unreadable":
+            return None, {"problem": "unreadable", "file": os.path.basename(path)}
+        if err is None:
+            seen_any = True
+            hit = _last_mention(text, account)
+            if hit:
+                return ({"pair": (hit[0], hit[1]),
+                         "source": _mention_time(path, hit[2], now)}, None)
+    return None, {"problem": "not_found" if seen_any else "no_logs"}
+
+
+def describe_source(src):
+    """One plain sentence for a pair_source dict."""
+    if not src or not src.get("file"):
+        return ""
+    if src.get("mention_time") is None:
+        return "pair named in %s (mention time unknown)" % src["file"]
+    how = ("time from the log line" if src["time_from"] == "log_line"
+           else "log line has no time: file modification time used")
+    return "pair named in %s, mention at %s, %.1f h ago (%s)" % (
+        src["file"], src["mention_time"], src["age_hours"], how)
 
 
 class PairError(Exception):
@@ -427,16 +545,21 @@ def auto_pair(index, account, command="prepare", now_ms=None):
 
 
 def live_pair(paths, account=None, override=None, index=None, notes=None,
-              auto_account=None, command="prepare"):
+              auto_account=None, command="prepare", source=None):
     """CONFIRMED (acc, org) the app writes into, or None.
 
     Confirmed means: named by the app log (the last mention wins; with
-    `account`, only that account's mentions count) or given as an explicit
+    `account`, only that account's mentions count; when main.log names none,
+    the rotated logs main1.log, main2.log, ... are read in that order, see
+    find_pair_mention) or given as an explicit
     override, which must be well formed and, when an account is expected, must
     belong to it. When neither exists, and `index` is given, a proposal from
     auto_pair is described in plain words in `notes` (a list) but None is
     returned: a guess never enables a write and never lets a move be reported
     as successful.
+
+    `source`, a dict, is filled with the log file, the mention time, its age in
+    hours and how the time was obtained when the pair comes from a log.
     """
     if override:
         parts = parse_override(override)
@@ -444,12 +567,17 @@ def live_pair(paths, account=None, override=None, index=None, notes=None,
             raise PairError("--active-pair account %s differs from the expected "
                             "account %s" % (parts[0], account.lower()))
         return parts
-    hits = app_pairs(paths, account)
-    if not hits:
+    found, problem = find_pair_mention(paths, account)
+    if not found:
+        if notes is not None and problem["problem"] == "unreadable":
+            notes.append("the app log %s exists but cannot be read, so older "
+                         "logs were not used." % problem["file"])
         if index is not None and notes is not None:
             notes.append(auto_pair(index, account or auto_account, command)[1])
         return None
-    return hits[-1]
+    if source is not None:
+        source.update(found["source"])
+    return found["pair"]
 
 
 def has_pairs(paths):

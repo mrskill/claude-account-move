@@ -97,6 +97,24 @@ class Home(object):
                 fh.write("2026-01-01 info: path %s/%s/%s/local_x.json\n"
                          % (CC, acc, org))
 
+    def log_file(self, name, lines, mtime=None):
+        """Write Library/Logs/Claude/<name> (main.log, main1.log, ...) with the
+        given raw lines; `mtime` sets the file modification time (epoch s)."""
+        d = os.path.join(self.home, "Library", "Logs", "Claude")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, name)
+        with open(p, "w") as fh:
+            fh.write("".join(line + "\n" for line in lines))
+        if mtime is not None:
+            os.utime(p, (mtime, mtime))
+        return p
+
+
+def mention(acc, org, ts="2026-01-01 10:00:00"):
+    """One app-log line naming a pair, optionally prefixed by a timestamp."""
+    body = "info: path %s/%s/%s/local_x.json" % (CC, acc, org)
+    return "%s %s" % (ts, body) if ts else body
+
 
 def tree_digest(root):
     """Content, mode, mtime and link targets of every entry under root."""

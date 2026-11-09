@@ -270,9 +270,10 @@ def _cmd_prepare(args, out):
         pg.step("building the snapshot")
         before = snap.build_before(paths, index, tmap, identity)
         pg.step("running checks")
+        pair_source = {}
         checks, active = pre.run_checks(paths, index, tmap, args.heartbeat,
                                         args.sync_max_age_min, args.active_pair,
-                                        identity=identity)
+                                        identity=identity, pair_source=pair_source)
         failed = [c["id"] for c in checks if not c["ok"]]
         if failed and set(failed) <= {"sync_agent"} and time.monotonic() < deadline:
             out.say("waiting for the sync job heartbeat ...")
@@ -312,6 +313,7 @@ def _cmd_prepare(args, out):
                 for c in checks],
         accounts={"cli": identity["cli"]["value"], "app": identity["app"]["value"]},
         observation=index.obs.as_dict(), write_verified=False,
+        pair_source=pair_source or None,
         pairs_physical=sum(len(s.dirs) for s in index.stores.values()),
         transcripts=len(tmap), cards_copied=copied)
     emit(args, out, rep, mdir)
