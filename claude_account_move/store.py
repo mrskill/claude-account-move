@@ -221,12 +221,13 @@ def _read_dir(real, obs, tick=None):
     return info
 
 
-def _candidate_dirs(base, base_real, obs=None):
+def _candidate_dirs(base, base_real, obs=None, outside=None):
     """Yield (acc, org, path, real, kind) for each org dir of one store.
 
     The single walk shared by scan() and _count_cards(), so the two cannot
     diverge. obs, when given, records errors and exclusions; OSError is
-    handled per listing, never around the whole walk.
+    handled per listing, never around the whole walk. outside, when given, is
+    a list that receives the real path of each dir excluded as outside.
     """
     try:
         accs = sorted(os.listdir(base))
@@ -264,6 +265,8 @@ def _candidate_dirs(base, base_real, obs=None):
             if not inside(real, base_real):
                 if obs is not None:
                     obs.excluded_outside += 1
+                if outside is not None:
+                    outside.append(real)
                 continue
             kind = "link" if (os.path.islink(po) or os.path.islink(pa)) \
                 else "dir"

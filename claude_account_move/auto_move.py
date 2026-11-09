@@ -31,6 +31,7 @@ import time
 
 from . import common
 from . import heal_active
+from . import pre_move_check as pre
 from . import panel_snapshot as snap
 from . import ru_text as ru
 from . import store as st
@@ -519,6 +520,23 @@ def cmd_auto(args, cli):
             landed = None if args.new_move or not current else find_landed_move(paths)
             if landed:
                 out.say(ru.LANDED_MOVE_SKIPPED % (landed[0], int(landed[1] + 0.5)))
+            # 1b. cards of sessions deleted in the panel would fail the zombies check
+            if not getattr(args, "no_quarantine", False):
+                zok, _ = pre.check_zombies(st.scan(paths))
+                if not zok:
+                    qcode, qrep = run_step(cli.cmd_quarantine_zombies,
+                                           _ns(args, apply=True, undo=None))
+                    qrep = qrep or {}
+                    step("quarantine", qcode == EXIT_OK, moved=qrep.get("moved"))
+                    if qcode != EXIT_OK:
+                        return stop(qcode if qcode != EXIT_OK else EXIT_FAIL, "quarantine_failed",
+                                    ru.ZOMBIES_FAILED % (qrep.get("journal") or "-",
+                                                         paths.state,
+                                                         qrep.get("reason") or "; ".join(
+                                                             p["path"] for p in qrep.get("problems") or [])
+                                                         or qrep.get("verdict") or "?"),
+                                    journal=qrep.get("journal"))
+                    out.say(ru.ZOMBIES_MOVED % (qrep.get("moved", 0), qrep.get("backup")))
             # 2. prepare
             out.say(ru.PREPARE_START)
             code, rep = run_step(cli.cmd_prepare, _ns(args, wait_sync=0.0, full_copy=False))

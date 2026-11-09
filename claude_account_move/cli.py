@@ -29,6 +29,7 @@ from . import common
 from . import heal_active
 from . import post_move_verify as verify
 from . import progress as prog
+from . import quarantine_zombies as qz
 from . import repair_cards
 from . import stamp_titles
 from . import sync_cards
@@ -155,11 +156,18 @@ def build_parser():
                    help="heal every pair named by an ENOTDIR line of the last 10 "
                    "minutes that is still a symlink; allowed while the app runs "
                    "(for the launchd agent)")
+    q = sub.add_parser("quarantine-zombies", help="move aside the cards of sessions deleted in the panel "
+                       "(dry run; writes with --apply; never deletes)")
+    add_common(q)
+    q.add_argument("--apply", action="store_true", help="really move (default: dry run)")
+    q.add_argument("--undo", metavar="JOURNAL", help="put the cards a journal moved back")
     a = sub.add_parser("auto", help="the whole move in one run: prepare, stamp, wait for "
                        "login, heal-active, finish, app start check, sync if needed (writes)")
     add_common(a)
     a.add_argument("--new-move", action="store_true",
                    help="do not resume an unfinished move: start a new one")
+    a.add_argument("--no-quarantine", action="store_true",
+                   help="do not move aside the cards of sessions deleted in the panel")
     a.add_argument("--no-stamp", action="store_true",
                    help="do not put the last-message time into session titles")
     a.add_argument("--wait-login", type=float, default=900.0,
@@ -885,6 +893,78 @@ def cmd_repair(args):
     return code
 
 
+def cmd_quarantine_zombies(args):
+    started = time.monotonic()
+    out = Out.of(args)
+    paths = make_paths(args)
+    name = "quarantine-zombies"
+    prob = state_dir_problem(paths)
+    if prob:
+        return fail(args, out, name, started, EXIT_INPUT, "input_error", "error: " + prob)
+    if args.apply or args.undo:
+        if common.claude_app_running():
+            return fail(args, out, name, started, EXIT_FAIL, "app_running",
+                        "Quit the Claude app first (Cmd+Q), then run this command "
+                        "again: the cards are files the app keeps open."
+                        + common.app_blockers_note())
+    if args.undo:
+        try:
+            with write_lock(paths):
+                res = qz.undo(paths, args.undo)
+        except qz.JournalError as exc:
+            return fail(args, out, name, started, EXIT_FAIL, "journal_rejected",
+                        "journal rejected: %s" % exc)
+        out.say("restored %(restored)d cards, left in the backup %(kept)d "
+                "(the source path is taken), failed %(failed)d" % res)
+        for p in res["kept_paths"]:
+            out.say("  source path is taken, card stays in the backup: %s" % p)
+        code = EXIT_OK if not (res["kept"] or res["failed"]) else EXIT_FAIL
+        emit(args, out, _report(name, code, "undo", started, undo=res, write_verified=False))
+        return code
+    if not os.path.isdir(paths.support):
+        return fail(args, out, name, started, EXIT_NO_STORE, "no_store",
+                    "storage not found: %s" % paths.support)
+    index = st.scan(paths)
+    if args.apply and not index.obs.complete():
+        return fail(args, out, name, started, EXIT_FAIL, "incomplete_observation",
+                    "storage could not be read completely (%d unreadable cards, "
+                    "%d errors): refusing to move cards from partial input"
+                    % (index.obs.unreadable_cards, len(index.obs.errors)),
+                    observation=index.obs.as_dict())
+    items, problems = qz.plan(paths, index)
+    for it in items:
+        out.say("zombie card: %s" % it["source"])
+    for pr in problems:
+        out.say("PROBLEM, not moved (%s): %s" % (pr["why"], pr["path"]))
+    base = dict(cards=[i["source"] for i in items], problems=problems,
+                dry_run=not args.apply, write_verified=False)
+    if not args.apply:
+        out.say("dry run: nothing moved. Add --apply to move %d cards aside." % len(items))
+        code = EXIT_FAIL if problems else EXIT_OK
+        emit(args, out, _report(name, code, "dry_run", started, **base))
+        return code
+    if not items:
+        code = EXIT_FAIL if problems else EXIT_OK
+        out.say("nothing to move")
+        emit(args, out, _report(name, code, "problems" if problems else "nothing_to_do",
+                                started, **base))
+        return code
+    try:
+        with write_lock(paths):
+            res = qz.apply_plan(paths, items)
+    except OSError as exc:
+        return fail(args, out, name, started, EXIT_INTERNAL, "internal_error",
+                    "cannot write the journal or move the cards (state directory %s): %s"
+                    % (paths.state, exc))
+    out.say("moved %(moved)d, failed %(failed)d; backup folder: %(backup)s" % res)
+    out.say("journal: %s (`quarantine-zombies --undo JOURNAL` puts the cards back)"
+            % res["journal"])
+    code = EXIT_FAIL if (res["failed"] or problems) else EXIT_OK
+    base.update(backup=res["backup"], moved=res["moved"], failed=res["failed"])
+    emit(args, out, _report(name, code, "applied", started, journal=res["journal"], **base))
+    return code
+
+
 def cmd_stamp(args):
     started = time.monotonic()
     out = Out.of(args)
@@ -1004,7 +1084,8 @@ def _run(args):
     try:
         return {"prepare": cmd_prepare, "finish": cmd_finish,
                 "sync": cmd_sync, "repair": cmd_repair, "stamp": cmd_stamp,
-                "heal-active": cmd_heal_active, "auto": cmd_auto}[args.command](args)
+                "heal-active": cmd_heal_active, "auto": cmd_auto,
+                "quarantine-zombies": cmd_quarantine_zombies}[args.command](args)
     except st.PairError as exc:
         return fail(args, Out.of(args), args.command, started, EXIT_INPUT,
                     "input_error", "error: %s" % exc)
