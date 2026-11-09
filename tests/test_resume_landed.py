@@ -6,6 +6,7 @@ RESUME_MAX_AGE_H (6 hours, by file mtime) is landed: find_unfinished_move gives
 None. A younger report still resumes. The resume line names the source account,
 the account the app has now and the age in hours. Fake HOME only.
 """
+import json
 import os
 import re
 import sys
@@ -20,6 +21,7 @@ from test_auto import Base  # noqa: E402  (only Base: its fixtures, no test case
 from test_cli import A, B, build_source  # noqa: E402
 
 from claude_account_move import auto_move  # noqa: E402
+from claude_account_move import ru_text as ru  # noqa: E402
 from claude_account_move.common import Paths, read_identity  # noqa: E402
 
 ENV_LIMIT = "CLAUDE_ACCOUNT_MOVE_RESUME_MAX_AGE_H"
@@ -132,6 +134,98 @@ class ResumeMessage(ResumeBase):
         self.assertIn(A, line, "the source account is missing: " + line)
         self.assertIn(B, line, "the account the app has now is missing: " + line)
         self.assertRegex(line, r"\b2\b", "the age in hours is missing: " + line)
+
+
+class EnvFallback(ResumeBase):
+    def test_r19_non_finite_env_values_fall_back_to_six_hours(self):
+        mdir = self.stopped_move()
+        self.age(mdir, 41)
+        for bad in ("inf", "Infinity", "1e309", "nan", "-inf", "0", "-3", "abc"):
+            with self.subTest(env=bad):
+                os.environ[ENV_LIMIT] = bad
+                self.assertIsNone(self.found(), "env %r is taken as a limit" % bad)
+
+    def test_r19_fallback_still_resumes_a_young_report(self):
+        mdir = self.stopped_move()
+        self.age(mdir, 2)
+        for bad in ("inf", "Infinity", "1e309", "nan"):
+            with self.subTest(env=bad):
+                os.environ[ENV_LIMIT] = bad
+                found = self.found()
+                self.assertTrue(found and found[0] == "resume", repr(found))
+
+
+class ResumeAgeWithoutAutoReport(ResumeBase):
+    def no_auto_report(self):
+        mdir = self.stopped_move()
+        os.unlink(os.path.join(mdir, "report-auto.json"))
+        fin = os.path.join(mdir, "report-finish.json")
+        if os.path.isfile(fin):
+            with open(fin) as fh:
+                self.assertNotEqual(json.load(fh).get("exit_code"), 0)
+        found = self.found()
+        self.assertTrue(found and found[0] == "resume", repr(found))
+        return mdir
+
+    def resume_line(self, out, mdir):
+        lines = [ln for ln in out.splitlines() if mdir in ln]
+        self.assertTrue(lines, "no resume line names the move dir: " + out)
+        return lines[0]
+
+    def test_r20_age_comes_from_before_json_mtime(self):
+        mdir = self.no_auto_report()
+        t = time.time() - 2 * HOUR
+        os.utime(os.path.join(mdir, "before.json"), (t, t))
+        code, out, _, m = self.run_auto(wait=self.user_logs_in())
+        self.assertEqual(m["cmd_prepare"].call_count, 0)
+        line = self.resume_line(out, mdir)
+        self.assertRegex(line, r"\b2\b", "age from before.json is missing: " + line)
+        self.assertNotRegex(line, r"\b0 \u0447", "age printed as 0 h: " + line)
+
+    def test_r20_unreadable_before_json_age_is_unknown_never_zero(self):
+        mdir = self.no_auto_report()
+        real = os.path.getmtime
+
+        def getmtime(path):
+            if str(path).endswith("before.json"):
+                raise OSError("no mtime")
+            return real(path)
+        with mock.patch("os.path.getmtime", getmtime):
+            code, out, _, m = self.run_auto(wait=self.user_logs_in())
+        self.assertEqual(m["cmd_prepare"].call_count, 0)
+        line = self.resume_line(out, mdir)
+        self.assertIn(u"\u0432\u043e\u0437\u0440\u0430\u0441\u0442 \u043d\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u0435\u043d", line)
+        self.assertNotRegex(line, r"\b0 \u0447")
+
+
+class LiveIncidentLayout(ResumeBase):
+    """08.11 move seen on 10.11: finish exit 0, a newer failed auto report, the
+    app on the move's target (the new account B), the source was A."""
+
+    def incident(self, hours):
+        mdir = self.stopped_move()
+        fin = os.path.join(mdir, "report-finish.json")
+        with open(fin, "w") as fh:
+            json.dump({"exit_code": 0, "verdict": "ok"}, fh)
+        self.age(mdir, hours)
+        return mdir
+
+    @staticmethod
+    def resume_prefix():
+        return " ".join(ru.RESUME_MOVE.split(" ")[:3])
+
+    def test_r21_aged_incident_runs_prepare_and_prints_no_resume_line(self):
+        mdir = self.incident(41)
+        self.assertIsNone(self.found())
+        code, out, _, m = self.run_auto(wait=self.user_logs_in())
+        self.assertGreaterEqual(m["cmd_prepare"].call_count, 1, out)
+        self.assertNotIn(self.resume_prefix(), out)
+
+    def test_r21_young_incident_still_resumes(self):
+        mdir = self.incident(2)
+        code, out, _, m = self.run_auto(wait=self.user_logs_in())
+        self.assertEqual(m["cmd_prepare"].call_count, 0, out)
+        self.assertIn(self.resume_prefix(), out)
 
 
 if __name__ == "__main__":
