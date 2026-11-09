@@ -11,8 +11,12 @@ a file, never touches a path that resolves outside the support folder, and is
 journaled before it happens. `undo` puts a card back only where its source path
 is free.
 """
+import ctypes
+import ctypes.util
+import errno
 import json
 import os
+import sys
 import time
 import uuid
 
@@ -26,6 +30,60 @@ BACKUP_PREFIX = "zombie-cards-"
 
 class JournalError(Exception):
     pass
+
+
+class ApplyError(OSError):
+    """A journal write failed during apply. `journal` is the journal path when
+    the file exists, so the caller can always name it."""
+
+    def __init__(self, message, journal=None, backup=None):
+        OSError.__init__(self, message)
+        self.journal = journal
+        self.backup = backup
+
+
+RENAME_EXCL = 0x4          # macOS renamex_np flag: fail when the target exists
+RENAME_NOREPLACE = 1       # Linux renameat2 flag
+AT_FDCWD = -100
+_SYS_RENAMEAT2 = {"x86_64": 316, "aarch64": 276, "arm64": 276, "i386": 353,
+                  "i686": 353, "armv7l": 382, "riscv64": 276, "ppc64le": 357,
+                  "s390x": 347}
+
+
+def rename_noreplace(src, dst):
+    """Move src to dst in ONE atomic kernel call that fails with
+    FileExistsError when dst exists. There is no fallback: where the call is not
+    available the move fails with a clear error."""
+    libc = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
+    bs, bd = os.fsencode(src), os.fsencode(dst)
+    if sys.platform == "darwin":
+        fn = getattr(libc, "renamex_np", None)
+        if fn is None:
+            raise OSError("no atomic no-replace rename on this system (renamex_np missing)")
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rc = fn(bs, bd, RENAME_EXCL)
+    elif sys.platform.startswith("linux"):
+        fn = getattr(libc, "renameat2", None)
+        if fn is not None:
+            fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                           ctypes.c_char_p, ctypes.c_uint]
+            rc = fn(AT_FDCWD, bs, AT_FDCWD, bd, RENAME_NOREPLACE)
+        else:
+            import platform
+            nr = _SYS_RENAMEAT2.get(platform.machine())
+            if nr is None:
+                raise OSError("no atomic no-replace rename on this system (unknown renameat2 number)")
+            rc = libc.syscall(ctypes.c_long(nr), ctypes.c_int(AT_FDCWD), bs,
+                              ctypes.c_int(AT_FDCWD), bd, ctypes.c_uint(RENAME_NOREPLACE))
+    else:
+        raise OSError("no atomic no-replace rename on this system (%s)" % sys.platform)
+    if rc != 0:
+        e = ctypes.get_errno()
+        if e == errno.EEXIST:
+            raise FileExistsError(e, os.strerror(e), dst)
+        if e in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+            raise OSError(e, "atomic no-replace rename not supported here: " + os.strerror(e), dst)
+        raise OSError(e, os.strerror(e), src)
 
 
 def _outside_dirs(paths):
@@ -65,8 +123,6 @@ def plan(paths, index):
         if s is None:
             continue
         dead = s.tombstone_ids()
-        if not dead:
-            continue
         for real_dir, d in sorted(s.dirs.items()):
             for n in sorted(d["cards"]):
                 sid = n[len(CARD_PREFIX):-len(".json")]
@@ -83,17 +139,20 @@ def plan(paths, index):
                     items.append({"store": store, "sid": sid, "source": real,
                                   "rel": os.path.relpath(real, support_real)})
         for st_name, real_dir in sorted(_outside_dirs(paths)):
-            if st_name != store:
-                continue
-            if inside(real_dir, support_real):
+            if st_name != store or inside(real_dir, support_real):
                 continue                    # inside the support folder: not counted by the check
             try:
                 names = sorted(os.listdir(real_dir))
             except OSError:
                 continue
+            dead_here = set(dead)
+            for n in names:
+                p = os.path.join(real_dir, n)
+                if n.startswith(st.TOMB_PREFIX) and os.path.isfile(p) and not os.path.islink(p):
+                    dead_here.add(n[len(st.TOMB_PREFIX):])
             for n in names:
                 if n.startswith(CARD_PREFIX) and n.endswith(".json") \
-                        and n[len(CARD_PREFIX):-len(".json")] in dead:
+                        and n[len(CARD_PREFIX):-len(".json")] in dead_here:
                     problem(os.path.realpath(os.path.join(real_dir, n)), "outside")
     items.sort(key=lambda i: i["source"])
     return items, problems
@@ -113,7 +172,8 @@ def _unique_backup(paths):
 
 
 def apply_plan(paths, items):
-    """Move every item. Returns {"backup","journal","moved","failed","entries"}."""
+    """Move every item. Returns {"backup","journal","moved","failed","entries"}.
+    A journal write failure raises ApplyError carrying the journal path."""
     support_real = os.path.realpath(paths.support)
     backup = safe_subdir(paths, _unique_backup(paths))
     backup_real = os.path.realpath(backup)
@@ -122,7 +182,16 @@ def apply_plan(paths, items):
         time.strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:8]))
     doc = {"schema": JOURNAL_SCHEMA, "support": support_real, "backup": backup,
            "entries": []}
-    write_json(journal, doc)
+
+    def jwrite():
+        try:
+            write_json(journal, doc)
+        except OSError as exc:
+            raise ApplyError("journal write failed: %s" % exc,
+                             journal=journal if os.path.lexists(journal) else None,
+                             backup=backup)
+
+    jwrite()
     moved = failed = 0
     for it in items:
         src = it["source"]
@@ -130,20 +199,27 @@ def apply_plan(paths, items):
         entry = {"source": src, "destination": dest, "sha256": None, "size": None,
                  "status": "planned"}
         doc["entries"].append(entry)
+        ready = False
         try:
             if os.path.islink(src) or not os.path.isfile(src) \
                     or not inside(os.path.realpath(src), support_real):
                 raise OSError("source is not a plain file inside the support folder")
-            if os.path.lexists(dest):
-                raise OSError("destination exists, never overwritten")
             entry["sha256"] = sha256_file(src)
             entry["size"] = os.path.getsize(src)
-            entry["status"] = "moving"
-            write_json(journal, doc)            # journaled before the move
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             if not inside(os.path.realpath(os.path.dirname(dest)), backup_real):
                 raise OSError("destination resolves outside the backup folder")
-            os.rename(src, dest)
+            entry["status"] = "moving"
+            ready = True
+        except OSError as exc:
+            entry["status"] = "failed"
+            entry["error"] = str(exc)
+            failed += 1
+        jwrite()                                # journaled before the move
+        if not ready:
+            continue
+        try:
+            rename_noreplace(src, dest)         # atomic, never replaces
             if os.path.lexists(src) or not os.path.isfile(dest) \
                     or sha256_file(dest) != entry["sha256"]:
                 raise OSError("verification after the move failed")
@@ -153,7 +229,7 @@ def apply_plan(paths, items):
             entry["status"] = "failed"
             entry["error"] = str(exc)
             failed += 1
-        write_json(journal, doc)
+        jwrite()
     return {"backup": backup, "journal": journal, "moved": moved,
             "failed": failed, "entries": doc["entries"]}
 
@@ -170,7 +246,8 @@ def _existing_ancestor_real(path):
 
 def undo(paths, journal):
     """Put cards back where the journal says, never over an existing file.
-    Returns {"restored","kept","failed","kept_paths"}."""
+    Entries left as moving or failed are settled too. Returns
+    {"restored","kept","failed","skipped","kept_paths","failed_paths"}."""
     try:
         with open(journal, encoding="utf-8") as fh:
             doc = json.load(fh)
@@ -181,32 +258,51 @@ def undo(paths, journal):
         raise JournalError("not a zombie-cards journal")
     support_real = os.path.realpath(paths.support)
     state_real = os.path.realpath(paths.state)
-    restored, kept, failed, kept_paths = 0, 0, 0, []
+    restored = kept = failed = skipped = 0
+    kept_paths, failed_paths = [], []
+
+    def bad(path):
+        failed_paths.append(path)
+
     for e in doc["entries"]:
-        if not isinstance(e, dict) or e.get("status") != "moved":
+        if not isinstance(e, dict) or e.get("status") not in ("moved", "moving", "failed"):
             continue
+        status = e["status"]
         src, dest = e.get("source"), e.get("destination")
         if not isinstance(src, str) or not isinstance(dest, str):
             failed += 1
+            bad(str(src))
             continue
         if not inside(os.path.realpath(src), support_real) \
-                or not inside(os.path.realpath(dest), state_real) \
-                or os.path.islink(dest) or not os.path.isfile(dest):
+                or not inside(os.path.realpath(dest), state_real):
             failed += 1
+            bad(src)
+            continue
+        dest_ok = os.path.isfile(dest) and not os.path.islink(dest)
+        if not dest_ok:
+            if status != "moved" and os.path.lexists(src):
+                skipped += 1                # the move never happened: nothing to undo
+            else:
+                failed += 1                 # the card is in neither place
+                bad(src)
             continue
         if os.path.lexists(src):
             kept += 1
             kept_paths.append(src)
             continue
         try:
-            if sha256_file(dest) != e.get("sha256"):
-                raise OSError("backup copy changed")
+            if e.get("sha256") is None or sha256_file(dest) != e.get("sha256"):
+                raise OSError("backup copy does not match the journal")
             if not inside(_existing_ancestor_real(os.path.dirname(src)), support_real):
                 raise OSError("target folder resolves outside the support folder")
             os.makedirs(os.path.dirname(src), exist_ok=True)
-            os.rename(dest, src)
+            rename_noreplace(dest, src)
             restored += 1
+        except FileExistsError:
+            kept += 1
+            kept_paths.append(src)
         except OSError:
             failed += 1
+            bad(src)
     return {"restored": restored, "kept": kept, "failed": failed,
-            "kept_paths": kept_paths}
+            "skipped": skipped, "kept_paths": kept_paths, "failed_paths": failed_paths}

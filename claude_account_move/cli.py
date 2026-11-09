@@ -157,7 +157,12 @@ def build_parser():
                    "minutes that is still a symlink; allowed while the app runs "
                    "(for the launchd agent)")
     q = sub.add_parser("quarantine-zombies", help="move aside the cards of sessions deleted in the panel "
-                       "(dry run; writes with --apply; never deletes)")
+                       "(dry run; writes with --apply; never deletes)",
+                       description="Move aside the cards of sessions deleted in the panel, with a "
+                       "journal and an undo. Never deletes. Known limit: a concurrent swap of a "
+                       "directory by another process between check and move is out of scope; the "
+                       "Claude app must be closed, and the support and state folders must belong "
+                       "to the user alone.")
     add_common(q)
     q.add_argument("--apply", action="store_true", help="really move (default: dry run)")
     q.add_argument("--undo", metavar="JOURNAL", help="put the cards a journal moved back")
@@ -918,6 +923,8 @@ def cmd_quarantine_zombies(args):
                 "(the source path is taken), failed %(failed)d" % res)
         for p in res["kept_paths"]:
             out.say("  source path is taken, card stays in the backup: %s" % p)
+        for p in res["failed_paths"]:
+            out.say("  cannot be settled (card in neither place, or changed): %s" % p)
         code = EXIT_OK if not (res["kept"] or res["failed"]) else EXIT_FAIL
         emit(args, out, _report(name, code, "undo", started, undo=res, write_verified=False))
         return code
@@ -952,6 +959,13 @@ def cmd_quarantine_zombies(args):
     try:
         with write_lock(paths):
             res = qz.apply_plan(paths, items)
+    except qz.ApplyError as exc:
+        return fail(args, out, name, started, EXIT_FAIL, "journal_write_failed",
+                    "cannot write the journal, stopped (state directory %s, journal %s): %s "
+                    "Cards already moved stay in %s; `quarantine-zombies --undo JOURNAL` "
+                    "settles them." % (paths.state, exc.journal or "-", exc,
+                                       exc.backup or "-"),
+                    journal=exc.journal, backup=exc.backup)
     except OSError as exc:
         return fail(args, out, name, started, EXIT_INTERNAL, "internal_error",
                     "cannot write the journal or move the cards (state directory %s): %s"
