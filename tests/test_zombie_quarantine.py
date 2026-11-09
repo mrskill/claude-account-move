@@ -513,5 +513,279 @@ class ClassGuard(unittest.TestCase):
         self.assertTrue(ok, detail)
 
 
+# --- Round 2 (R26-R29) ------------------------------------------------------------
+import contextlib  # noqa: E402
+import io  # noqa: E402
+from unittest import mock  # noqa: E402
+
+from claude_account_move import cli  # noqa: E402
+from claude_account_move import quarantine_zombies as qz  # noqa: E402
+
+SENTINEL = b"SENTINEL-bytes-of-a-file-that-was-already-there"
+
+
+def plan_of(h):
+    paths = common.Paths(h.home, h.state)
+    items, problems = qz.plan(paths, st.scan(paths))
+    return paths, items, problems
+
+
+def card_renames():
+    """Wrap os.rename and os.replace: record every use on a card file, then run
+    the real call (so the old code finishes and the assertion names the reason)."""
+    calls = []
+    real_rename, real_replace = os.rename, os.replace
+
+    def make(real, name):
+        def wrapped(src, dst, *a, **k):
+            if os.path.basename(str(src)).startswith("local_"):
+                calls.append((name, str(src), str(dst)))
+            return real(src, dst, *a, **k)
+        return wrapped
+    return calls, make(real_rename, "rename"), make(real_replace, "replace")
+
+
+class NoReplaceMove(Base):
+    """R26: every move is one atomic no-replace rename."""
+
+    def test_apply_never_uses_rename_or_replace_for_a_card(self):
+        w = World(self.h)
+        paths, items, _ = plan_of(self.h)
+        calls, rn, rp = card_renames()
+        with mock.patch.object(os, "rename", rn), mock.patch.object(os, "replace", rp):
+            res = qz.apply_plan(paths, items)
+        self.assertEqual(calls, [], "a card was moved with a replacing call")
+        self.assertEqual(res["moved"], len(w.zombies))
+
+    def test_apply_destination_that_appears_before_the_move_is_never_replaced(self):
+        w = World(self.h)
+        paths, items, _ = plan_of(self.h)
+        items = items[:1]
+        src = items[0]["source"]
+        src_sum = sha(src)
+        planted = []
+        real_write = qz.write_json
+
+        def hook(path, doc, *a, **k):
+            real_write(path, doc, *a, **k)
+            for e in doc.get("entries", []):
+                if e.get("status") == "moving" and not planted:
+                    os.makedirs(os.path.dirname(e["destination"]), exist_ok=True)
+                    with open(e["destination"], "wb") as fh:
+                        fh.write(SENTINEL)
+                    planted.append(e["destination"])
+        with mock.patch.object(qz, "write_json", hook):
+            res = qz.apply_plan(paths, items)
+        self.assertTrue(planted, "the hook never ran: the move is not journaled first")
+        with open(planted[0], "rb") as fh:
+            self.assertEqual(fh.read(), SENTINEL, "the file that was already there was replaced")
+        self.assertTrue(os.path.isfile(src))
+        self.assertEqual(sha(src), src_sum)
+        self.assertEqual(res["moved"], 0)
+        self.assertEqual(res["failed"], 1)
+        self.assertEqual(res["entries"][0]["status"], "failed")
+
+    def test_undo_source_that_appears_before_the_move_is_never_replaced(self):
+        w = World(self.h)
+        rep = self.apply_ok()
+        dest = os.path.join(backups(self.h)[0], rel_to_support(self.h, w.zombies[0]))
+        src = real(w.zombies[0])
+        dest_sum = sha(dest)
+        planted = []
+        real_sha, real_makedirs = qz.sha256_file, os.makedirs
+
+        def plant():
+            if not planted and not os.path.lexists(src):
+                with open(src, "wb") as fh:
+                    fh.write(SENTINEL)
+                planted.append(src)
+
+        def sha_hook(p, *a, **k):
+            out = real_sha(p, *a, **k)
+            if os.path.realpath(p) == os.path.realpath(dest):
+                plant()
+            return out
+
+        def mk_hook(p, *a, **k):
+            out = real_makedirs(p, *a, **k)
+            if os.path.realpath(p) == os.path.dirname(src):
+                plant()
+            return out
+        paths = common.Paths(self.h.home, self.h.state)
+        with mock.patch.object(qz, "sha256_file", sha_hook), \
+                mock.patch.object(os, "makedirs", mk_hook):
+            res = qz.undo(paths, rep["journal"])
+        self.assertTrue(planted, "the hook never ran")
+        with open(src, "rb") as fh:
+            self.assertEqual(fh.read(), SENTINEL, "the file that was already there was replaced")
+        self.assertTrue(os.path.isfile(dest))
+        self.assertEqual(sha(dest), dest_sum)
+        self.assertGreaterEqual(res["kept"] + res["failed"], 1)
+
+    def test_undo_never_uses_rename_or_replace_for_a_card(self):
+        w = World(self.h)
+        rep = self.apply_ok()
+        calls, rn, rp = card_renames()
+        paths = common.Paths(self.h.home, self.h.state)
+        with mock.patch.object(os, "rename", rn), mock.patch.object(os, "replace", rp):
+            res = qz.undo(paths, rep["journal"])
+        self.assertEqual(calls, [], "a card was moved back with a replacing call")
+        self.assertEqual(res["restored"], len(w.zombies))
+
+
+class InterruptedJournal(Base):
+    """R27: undo settles entries left as moving or failed."""
+
+    def setup_journal(self, status):
+        w = World(self.h)
+        rep = self.apply_ok()
+        with open(rep["journal"], encoding="utf-8") as fh:
+            doc = json.load(fh)
+        for e in doc["entries"]:
+            e["status"] = status
+        with open(rep["journal"], "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        return w, rep, doc
+
+    def test_moving_entry_with_the_card_in_the_backup_is_restored(self):
+        w, rep, _ = self.setup_journal("moving")
+        r = self.h.run(CMD, "--undo", rep["journal"])
+        self.assertEqual(r.returncode, 0, "exit %s: %s" % (r.returncode, r.stdout + r.stderr))
+        for p in w.zombies:
+            self.assertTrue(os.path.isfile(real(p)), "not restored: %s" % p)
+            self.assertEqual(sha(real(p)), w.sums[p])
+
+    def test_failed_entry_with_the_card_in_the_backup_is_restored(self):
+        w, rep, _ = self.setup_journal("failed")
+        r = self.h.run(CMD, "--undo", rep["journal"])
+        self.assertEqual(r.returncode, 0, "exit %s: %s" % (r.returncode, r.stdout + r.stderr))
+        for p in w.zombies:
+            self.assertTrue(os.path.isfile(real(p)), "not restored: %s" % p)
+            self.assertEqual(sha(real(p)), w.sums[p])
+
+    def test_moving_entry_with_both_names_present_is_kept_and_reported(self):
+        w, rep, doc = self.setup_journal("moving")
+        taken = real(w.zombies[0])
+        with open(taken, "wb") as fh:
+            fh.write(SENTINEL)
+        r = self.h.run(CMD, "--undo", rep["journal"])
+        self.assertEqual(r.returncode, EXIT_FAIL, r.stdout + r.stderr)
+        self.assertIn(taken, r.stdout + r.stderr)
+        with open(taken, "rb") as fh:
+            self.assertEqual(fh.read(), SENTINEL)
+        dest = [e["destination"] for e in doc["entries"] if e["source"] == taken][0]
+        self.assertEqual(sha(dest), w.sums[w.zombies[0]])
+
+    def test_unsettled_moving_entry_gives_a_nonzero_exit(self):
+        """The card is in neither place: nothing can be restored, never success."""
+        w, rep, doc = self.setup_journal("moving")
+        lost = [e for e in doc["entries"] if e["source"] == real(w.zombies[0])][0]
+        os.unlink(lost["destination"])
+        r = self.h.run(CMD, "--undo", rep["journal"])
+        self.assertEqual(r.returncode, EXIT_FAIL, r.stdout + r.stderr)
+        self.assertFalse(os.path.lexists(lost["source"]))
+
+    def test_moving_entry_with_a_changed_backup_is_not_restored(self):
+        w, rep, doc = self.setup_journal("moving")
+        e = [e for e in doc["entries"] if e["source"] == real(w.zombies[0])][0]
+        with open(e["destination"], "wb") as fh:
+            fh.write(SENTINEL)
+        r = self.h.run(CMD, "--undo", rep["journal"])
+        self.assertEqual(r.returncode, EXIT_FAIL, r.stdout + r.stderr)
+        self.assertFalse(os.path.lexists(e["source"]), "a card with another sha was put back")
+
+    def test_all_entries_unsettled_is_never_success_with_zeros(self):
+        w, rep, doc = self.setup_journal("moving")
+        for e in doc["entries"]:
+            os.unlink(e["destination"])
+        r = self.h.run(CMD, "--undo", rep["journal"])
+        self.assertEqual(r.returncode, EXIT_FAIL, r.stdout + r.stderr)
+
+
+class OutsideWithoutMarks(Base):
+    """R28: an outside org folder holds both the mark and its card; no indexed
+    store holds any mark."""
+
+    def build(self):
+        d = self.h.pair(CC, A, O1)
+        live = os.path.join(d, self.h.card(d, 30, uid(30)))
+        out = os.path.join(self.tmp, "outside-org")
+        os.makedirs(out)
+        card = os.path.join(out, cname(31))
+        with open(card, "w") as fh:
+            json.dump({"cliSessionId": uid(31), "title": "x"}, fh)
+        tomb(out, 31)
+        link(out, os.path.join(self.h.support, CC, A, uid(6)))
+        self.h.accounts(cli=A, app=A)
+        return live, card
+
+    def test_apply_reports_the_card_exits_3_and_moves_nothing(self):
+        live, card = self.build()
+        before = tree_digest(self.tmp)
+        r = self.h.run(CMD, "--apply")
+        self.refused(r, real(card))
+        self.assertEqual(tree_digest(self.tmp), before)
+        self.assertEqual(backups(self.h), [])
+
+    def test_dry_run_reports_the_card(self):
+        live, card = self.build()
+        r = self.h.run(CMD)
+        self.assertEqual(r.returncode, EXIT_FAIL, r.stdout + r.stderr)
+        self.assertIn(real(card), r.stdout + r.stderr)
+
+
+# --- R29: the journal path survives a failing journal write -----------------------
+
+def failing_journal_writes(fail_from=3):
+    """write_json that fails on the Nth and later journal writes (the 3rd is the
+    one after the first card moved)."""
+    real_write = qz.write_json
+    n = [0]
+
+    def wrapped(path, obj, *a, **k):
+        if "journal" in os.path.basename(str(path)):
+            n[0] += 1
+            if n[0] >= fail_from:
+                raise OSError(28, "No space left on device (simulated)")
+        return real_write(path, obj, *a, **k)
+    return wrapped
+
+
+class JournalWriteFails(Base):
+    def run_cli(self, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        argv = [CMD, "--apply", "--json", "--home", self.h.home,
+                "--state-dir", self.h.state] + list(extra)
+        with mock.patch.object(common, "claude_app_running", lambda: False), \
+                mock.patch.object(qz, "write_json", failing_journal_writes()), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_report_still_carries_the_journal_path(self):
+        World(self.h)
+        code, out, err = self.run_cli()
+        self.assertNotEqual(code, 0, out)
+        rep = json.loads(out)
+        jp = rep.get("journal")
+        self.assertTrue(jp, "no journal path in the report: %s" % out)
+        self.assertTrue(os.path.isfile(jp), jp)
+
+
+class AutoJournalWriteFails(AutoBase):
+    def test_auto_stop_line_names_the_journal(self):
+        build_source(self.h)
+        add_zombie(self.h, 21)
+        add_zombie(self.h, 22)
+        with mock.patch.object(qz, "write_json", failing_journal_writes()):
+            code, out, _, m = self.run_auto2()
+        self.assertNotIn(code, (0, PARSE_ERROR), out)
+        self.assertEqual(m["cmd_prepare"].call_count, 0)
+        journals = all_state_files(self.h, r".*journal.*\.json$")
+        self.assertTrue(journals, "no journal file was created")
+        self.assertTrue(any(j in out for j in journals),
+                        "the stop line does not name the journal: %s" % out)
+
+
 if __name__ == "__main__":
     unittest.main()
