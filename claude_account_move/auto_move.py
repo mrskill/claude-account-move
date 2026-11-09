@@ -216,6 +216,66 @@ def run_cli_login(cmd, timeout=None):
         return None
 
 
+RESUME_MAX_AGE_H = 6.0            # a failed auto report older than this: the move landed
+RESUME_MAX_AGE_ENV = "CLAUDE_ACCOUNT_MOVE_RESUME_MAX_AGE_H"   # tests only
+
+
+def _resume_max_age_h():
+    try:
+        v = float(os.environ.get(RESUME_MAX_AGE_ENV, ""))
+        if math.isfinite(v) and v > 0:
+            return v
+    except ValueError:
+        pass
+    return RESUME_MAX_AGE_H
+
+
+def failed_auto_report_age_h(mdir):
+    """Age in hours (by file mtime) of the failed `auto` report of a move dir,
+    or None when there is no failed auto report."""
+    path = os.path.join(mdir, "report-auto.json")
+    arep, aerr = common.read_json(path)
+    if aerr or not isinstance(arep, dict) or arep.get("exit_code") in (None, EXIT_OK):
+        return None
+    try:
+        return max(0.0, (time.time() - os.path.getmtime(path)) / 3600.0)
+    except OSError:
+        return None
+
+
+def resume_age_h(mdir):
+    """Age in hours of a move that resumes: the failed auto report when there is
+    one, else the mtime of before.json. None when neither can be read."""
+    age = failed_auto_report_age_h(mdir)
+    if age is not None:
+        return age
+    try:
+        return max(0.0, (time.time() - os.path.getmtime(os.path.join(mdir, "before.json"))) / 3600.0)
+    except OSError:
+        return None
+
+
+def _newest_move_name(paths):
+    root = snap.moves_dir(paths)
+    if os.path.islink(root) or not os.path.isdir(root):
+        return None
+    names = sorted((n for n in os.listdir(root) if snap.MOVE_ID_RE.match(n)),
+                   reverse=True)
+    return names[0] if names else None
+
+
+def find_landed_move(paths):
+    """(move_id, age_hours) of the newest move when its failed `auto` report is
+    older than the resume limit, so it counts as landed; else None."""
+    name = _newest_move_name(paths)
+    if not name:
+        return None
+    age = failed_auto_report_age_h(os.path.join(snap.moves_dir(paths), name))
+    if age is not None and age > _resume_max_age_h():
+        return (name, age)
+    return None
+
+
 def find_unfinished_move(paths, current_app_account):
     """Look at the newest move directory only. Returns one of:
 
@@ -236,6 +296,9 @@ def find_unfinished_move(paths, current_app_account):
         return None
     name = names[0]
     mdir = os.path.join(root, name)
+    age_h = failed_auto_report_age_h(mdir)
+    if age_h is not None and age_h > _resume_max_age_h():
+        return None                               # landed long ago: a new move starts
     rep, err = common.read_json(os.path.join(mdir, "report-finish.json"))
     if not err and isinstance(rep, dict) and rep.get("exit_code") == EXIT_OK:
         # An `auto` run that stopped after its first finish (no app start, repair
@@ -448,8 +511,14 @@ def cmd_auto(args, cli):
         if resumed:
             ctx["move_id"], ctx["move_dir"], source = resumed
             step("resume", True, move_id=ctx["move_id"])
-            out.say(ru.RESUME_MOVE % ctx["move_dir"])
+            age_h = resume_age_h(ctx["move_dir"])
+            age_txt = (ru.RESUME_AGE_UNKNOWN if age_h is None
+                       else ru.RESUME_AGE % int(age_h + 0.5))
+            out.say(ru.RESUME_MOVE % (source, current, age_txt, ctx["move_dir"]))
         else:
+            landed = None if args.new_move or not current else find_landed_move(paths)
+            if landed:
+                out.say(ru.LANDED_MOVE_SKIPPED % (landed[0], int(landed[1] + 0.5)))
             # 2. prepare
             out.say(ru.PREPARE_START)
             code, rep = run_step(cli.cmd_prepare, _ns(args, wait_sync=0.0, full_copy=False))
