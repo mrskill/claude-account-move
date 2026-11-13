@@ -174,10 +174,10 @@ def real_pair_problem(paths, store, pair):
 
 
 def active_cc_pair(paths, account):
-    """(acc dir name, org dir name) of the claude-code-sessions pair the card
-    signal may watch: the CLI account's organization (.claude.json) when its
-    dir exists (a link is returned too, the walk refuses it); when that dir does
-    not exist, the one org dir of the account if there is exactly one."""
+    """(acc dir name, org dir name) of the claude-code-sessions pair of the CLI
+    account: the organization of .claude.json (C4: no fallback to another org).
+    None when the CLI account is not `account`, no org is known, or the dir does
+    not exist (a symlink counts as existing, the lstat walk refuses it later)."""
     acc = (account or "").lower()
     root = os.path.join(paths.support, STORES[0])
     if not acc:
@@ -188,16 +188,11 @@ def active_cc_pair(paths, account):
         return None
     if len(names) != 1:
         return None
-    adir = names[0]
     ident = read_identity(paths)
     org = ident.get("cli_org") if (ident.get("cli") or {}).get("value") == acc else None
-    if org and os.path.lexists(os.path.join(root, adir, org)):
-        return (adir, org)
-    try:
-        orgs = os.listdir(os.path.join(root, adir))
-    except OSError:
-        return None
-    return (adir, orgs[0]) if len(orgs) == 1 else None
+    if org and os.path.lexists(os.path.join(root, names[0], org)):
+        return (names[0], org)
+    return None
 
 
 def card_mtimes(paths, pair):
@@ -232,30 +227,32 @@ def fresh_card_pair(paths, account, before, pair=None):
     return None
 
 
-def wait_app_start(paths, account, mark, limit_s, poll_s, out, require_running=False):
+def wait_app_start(paths, account, mark, limit_s, poll_s, out):
     """{store: (acc, org)} once the app is running and the claude-code-sessions
-    store has a store-root load of `account` appended to main.log after `mark`
-    (heal_active.log_mark), or a card of the account's active claude-code-sessions
-    pair changed after this call began; None when the time is up. With require_running (verify-start) a process that
-    is not running is never a start, whatever the log holds. A store without a
-    signal (the agent store loads lazily) is named in a note, not a failure; the
-    agent store alone is not a start. Prints a countdown at the start and every
-    30 s (like wait_app_closed); the seconds left are rounded up, never 0."""
+    store decides the start (C3, C5): the LATEST store-root load of that store
+    after `mark` names `account` (a later load of another account cancels it),
+    or a card of the CLI account's active org pair changed after this call began.
+    A process that is not running is never a start, whatever the log holds. The
+    agent store is only a note (named when silent or not of `account`) and alone
+    is never a start. None when the time is up. Prints a countdown at the start
+    and every 30 s (like wait_app_closed); the seconds left are rounded up."""
     t0 = time.monotonic()
     deadline = t0 + max(0.0, limit_s)
     last = -1
     card_pair = active_cc_pair(paths, account)
     before = card_mtimes(paths, card_pair) if card_pair else {}
     while True:
-        if (not require_running) or common.claude_app_running():
+        if common.claude_app_running():
             loads = heal_active.fresh_root_loads(paths, account, mark)
             if STORES[0] not in loads:
                 card = fresh_card_pair(paths, account, before, card_pair)
                 if card:
                     loads = dict(loads)
                     loads[STORES[0]] = card
+            else:
+                loads = dict(loads)
             if STORES[0] in loads:
-                silent = [s for s in STORES if s not in loads]
+                silent = [x for x in STORES if x not in loads]
                 if silent:
                     out.say(ru.START_PARTIAL % ", ".join(silent))
                 return loads
@@ -943,32 +940,43 @@ def cmd_verify_start(args, cli):
     name = _newest_move_name(paths)
     mdir = os.path.join(snap.moves_dir(paths), name) if name else None
     out.say(ru.VS_TITLE)
-    acc = (read_identity(paths).get("cli") or {}).get("value")
+    ident = read_identity(paths)
+    acc = (ident.get("cli") or {}).get("value")
     if not acc:
         return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
                         "no_account", ru.VS_NO_ACCOUNT, mdir)
+    # C1: the desktop app must be on the account of the CLI
+    app_acc = (ident.get("app") or {}).get("value")
+    if app_acc != acc:
+        text = ru.VS_WRONG_ACCOUNT % (STORES[0], app_acc or "?")
+        return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                        "wrong_account", text, mdir)
+    # C4: the active org dir must exist, nothing else is guessed
+    cli_org = ident.get("cli_org")
+    acc_dir = None
+    try:
+        acc_dir = next((n for n in os.listdir(os.path.join(paths.support, STORES[0]))
+                        if n.lower() == acc.lower()), None)
+    except OSError:
+        pass
+    if not cli_org or not acc_dir or not os.path.lexists(
+            os.path.join(paths.support, STORES[0], acc_dir, cli_org)):
+        text = ru.VS_NO_ORG_DIR % os.path.join(paths.support, STORES[0], acc_dir or acc,
+                                                cli_org or "?")
+        return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                        "bad_pair", text, mdir)
     poll = _poll(START_POLL_S, "CLAUDE_ACCOUNT_MOVE_START_POLL_S")
     loads = wait_app_start(paths, acc, (None, 0), getattr(args, "wait_start", 0.0),
-                           poll, out, require_running=True)
-    running = bool(common.claude_app_running())
+                           poll, out)
     if loads is None:
+        running = bool(common.claude_app_running())
         missing = list(STORES)
         text = start_timeout_text(running, missing, True, paths.state)
         return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
                         "app_not_started", text, mdir, app_running=running,
                         missing_stores=missing)
-    # per store only the newest load of the whole log counts, and it must be
-    # the account of the CLI; the pair must be real from the store root down
-    latest = heal_active.latest_root_loads(paths)
+    # the pair of the deciding store must be real from the store root down
     final = dict(loads)
-    for store in STORES:
-        if store in latest:
-            final[store] = latest[store]
-    for store in STORES:
-        if store in latest and latest[store][0] != acc.lower():
-            text = ru.VS_WRONG_ACCOUNT % (store, latest[store][0])
-            return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
-                            "wrong_account", text, mdir, app_running=running)
     for store in STORES:
         if store in final:
             why = real_pair_problem(paths, store, final[store])
@@ -976,12 +984,20 @@ def cmd_verify_start(args, cli):
                 text = ru.VS_BAD_PAIR % (store, heal_active.pair_path(
                     paths, store, final[store]), why)
                 return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
-                                "bad_pair", text, mdir, app_running=running,
+                                "bad_pair", text, mdir, app_running=True,
                                 loads=sorted("%s/%s/%s" % (s2, a, o)
                                              for s2, (a, o) in final.items()))
+    # C2: the app must still be running after every other check
+    running = bool(common.claude_app_running())
+    if not running:
+        missing = [x for x in STORES if x not in final]
+        text = start_timeout_text(False, missing, True, paths.state)
+        return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                        "app_not_started", text, mdir, app_running=False,
+                        missing_stores=missing)
     out.say(ru.VS_OK)
     cli.emit(args, out, cli._report(
-        "verify-start", EXIT_OK, "ok", started, app_running=running,
+        "verify-start", EXIT_OK, "ok", started, app_running=True,
         missing_stores=[x for x in STORES if x not in final],
         loads=sorted("%s/%s/%s" % (s2, a, o) for s2, (a, o) in final.items()),
         write_verified=False), mdir)

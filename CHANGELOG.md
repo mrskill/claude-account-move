@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- start detection, round 3 (judge contract C1-C6): `verify-start` needs the app
+  account to equal the CLI account (else `wrong_account`), the active org dir
+  of `.claude.json` must exist (else `bad_pair`, no guessing of another org),
+  only `claude-code-sessions` decides (a foreign or old agent-store line is a
+  note in `missing_stores`), and the running process is polled again after all
+  other checks (else `app_not_started`). `wait_app_start` counts only the latest
+  "Loaded" line per store after the mark, and a start needs the app running at
+  that moment. The recovery text lists: close, `heal-active --apply`, open,
+  `verify-start`.
+
 - start detection, review round 1 fixes: `verify-start` counts only the latest
   "Loaded" line per store and fails (exit 3) when it is not the CLI account; a
   process that is not running is never a start (`app_not_started`); every path

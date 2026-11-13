@@ -595,15 +595,13 @@ def log_mark(paths):
     return (sb.st_ino, sb.st_size)
 
 
-def fresh_root_loads(paths, acc, mark):
-    """{store: (acc, org)} of the newest store-root load (same definition as
-    _root_loads) of account `acc` in the bytes appended to main.log after
-    `mark` (from log_mark). A log whose inode changed or that is shorter than
-    the mark (rotated, truncated) counts as all new. No clock decides."""
-    acc = acc.lower() if acc else None
+def latest_root_loads(paths, mark=(None, 0)):
+    """{store: (acc, org)} of the LATEST store-root load per store (same
+    definition as _root_loads), of any account, in the bytes appended to
+    main.log after `mark` (from log_mark; (None, 0) is the whole log). A log
+    whose inode changed or that is shorter than the mark (rotated, truncated)
+    counts as all new. No clock decides."""
     found = {}
-    if not acc:
-        return found
     ino, size = mark
     try:
         with open(paths.main_log, "rb") as fh:
@@ -615,19 +613,18 @@ def fresh_root_loads(paths, acc, mark):
         return found
     for line in text.splitlines():
         for store, a, o in _root_loads(line):
-            if a == acc:
-                found[store] = (a, o)
-    return found
-
-
-def latest_root_loads(paths):
-    """{store: (acc, org)} of the LAST store-root load of any account in the
-    whole main.log (lower-cased): per store only the newest line counts."""
-    found = {}
-    for line in _log_text(paths).splitlines():
-        for store, a, o in _root_loads(line):
             found[store] = (a, o)
     return found
+
+
+def fresh_root_loads(paths, acc, mark):
+    """{store: (acc, org)} of the stores whose LATEST load after `mark` names
+    account `acc` (a later load of another account cancels an earlier one)."""
+    acc = acc.lower() if acc else None
+    if not acc:
+        return {}
+    return dict((s, v) for s, v in latest_root_loads(paths, mark).items()
+                if v[0] == acc)
 
 
 def recent_enotdir(paths, now=None, max_age_s=ENOTDIR_MAX_AGE_S):
