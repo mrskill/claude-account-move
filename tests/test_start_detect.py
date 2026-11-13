@@ -77,8 +77,11 @@ class WaitAppStart(Base):
         build_source(self.h)
         self.h.pair(CC, B, O2)
         self.h.pair(LAM, B, O2)
-        self.h.accounts(cli=B, app=B)
+        self.h.accounts(cli=B, app=B, org=O2)
         self.paths = Paths(self.h.home, self.h.state)
+        p = mock.patch.object(common, "claude_app_running", lambda: True)
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_t1_cc_loaded_lam_silent_is_a_start_with_a_note(self):
         mark = heal_active.log_mark(self.paths)

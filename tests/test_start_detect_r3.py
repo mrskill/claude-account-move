@@ -122,7 +122,10 @@ class F3SymlinkedParents(VerifyBase):
     def test_f3_fresh_card_under_a_symlinked_account_dir_is_no_start(self):
         build_source(self.h)
         self.h.pair(CC, B, O2)
-        self.h.accounts(cli=B, app=B)
+        self.h.accounts(cli=B, app=B, org=O2)
+        p = mock.patch.object(common, "claude_app_running", lambda: True)
+        p.start()
+        self.addCleanup(p.stop)
         acc_dir = os.path.join(self.h.support, CC, B)
         old = time.time() - 7200
         for n in os.listdir(os.path.join(acc_dir, O2)):
@@ -147,13 +150,16 @@ class F4F5CardSignal(Base):
     def setUp(self):
         Base.setUp(self)
         self.paths = Paths(self.h.home, self.h.state)
+        p = mock.patch.object(common, "claude_app_running", lambda: True)
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_f4_an_unchanged_card_with_a_future_mtime_is_no_start(self):
         build_source(self.h)
         pair = self.h.pair(CC, B, O2)
         self.h.pair(LAM, B, O2)
         self.h.card(pair, 98, "cid-98")
-        self.h.accounts(cli=B, app=B)
+        self.h.accounts(cli=B, app=B, org=O2)
         future = time.time() + 3600          # another computer's clock; never changes
         for n in os.listdir(pair):
             os.utime(os.path.join(pair, n), (future, future))

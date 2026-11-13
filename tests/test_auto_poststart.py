@@ -416,12 +416,30 @@ class NoFreshLoad(PostStart):
         self.app.silent = True
 
         def one_store(pair):
-            threading.Timer(0.05, lambda: self.app.append(
-                [(CC, B, O2)], stamp(int(time.time()) + 1))).start()
+            def go():
+                self.app.append([(CC, B, O2)], stamp(int(time.time()) + 1))
+                self.app.polls = 0
+                self.app.open = True      # C5: a start needs the app running
+            threading.Timer(0.05, go).start()
         self.app.start = one_store
-        code, out, err, _ = self.run_ps("--wait-start", "2")
+        with mock.patch.object(sys.modules[__name__], "QUIT_AFTER_POLLS", 10 ** 9):
+            code, out, err, _ = self.run_ps("--wait-start", "2")
         self.assertNotEqual(code, 3, out + err)
         self.assertIn(LAM, out + err, "the silent agent store must be named in a note")
+
+    def test_a_fresh_load_with_the_app_not_running_is_not_a_start(self):
+        """C5: the line proves a load, not a running process."""
+        build_source(self.h)
+        self.app.silent = True
+
+        def load_then_quit(pair):
+            threading.Timer(0.05, lambda: self.app.append(
+                [(CC, B, O2), (LAM, B, O2)], stamp(int(time.time()) + 1))).start()
+        self.app.start = load_then_quit        # app.open stays False
+        code, out, err, _ = self.run_ps("--wait-start", "0.6")
+        self.assertEqual(code, 3, out + err)
+        self.assertNotIn(ru.VERDICT_OK, out)
+        self.assertEqual(len(self.finish_log), 1)
 
     def test_a_fresh_load_of_only_the_agent_store_is_not_a_start(self):
         build_source(self.h)

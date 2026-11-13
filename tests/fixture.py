@@ -73,7 +73,7 @@ class Home(object):
             fh.write(json.dumps({"type": "queue-operation",
                                  "timestamp": iso(last_ms + 99999)}) + "\n")
 
-    def accounts(self, cli=None, app=None, raw_cli=None, raw_app=None):
+    def accounts(self, cli=None, app=None, raw_cli=None, raw_app=None, org=None):
         os.makedirs(self.support, exist_ok=True)
         if raw_cli is not None:
             with open(os.path.join(self.home, ".claude.json"), "w") as fh:
@@ -81,7 +81,7 @@ class Home(object):
         elif cli:
             with open(os.path.join(self.home, ".claude.json"), "w") as fh:
                 json.dump({"oauthAccount": {"accountUuid": cli,
-                                            "organizationUuid": uid(7)}}, fh)
+                                            "organizationUuid": org or uid(7)}}, fh)
         if raw_app is not None:
             with open(os.path.join(self.support, "config.json"), "w") as fh:
                 fh.write(raw_app)
