@@ -258,7 +258,9 @@ class NoRerunAdviceAnywhere(unittest.TestCase):
     BAD = (u"\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u043f\u0435\u0440\u0435\u043d\u043e\u0441 "
            u"\u0435\u0449\u0435 \u0440\u0430\u0437",       # run the move again (RU)
            u"\u043f\u0435\u0440\u0435\u043d\u043e\u0441 \u0435\u0449\u0435 \u0440\u0430\u0437",
-           "run the move again", "run auto again", "run the transfer again")
+           "run the move again", "run auto again", "run the transfer again",
+           u"\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u044d\u0442\u043e\u0442 "
+           u"\u0444\u0430\u0439\u043b \u0435\u0449\u0435 \u0440\u0430\u0437")   # F6: run this file again
     ALLOWED = ()      # (module, fragment) pairs that are legit, none today
 
     def test_no_message_tells_to_run_the_move_again(self):
