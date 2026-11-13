@@ -19,7 +19,7 @@ Contract (names chosen here, the implementer must follow them):
      signal for store X" (the second names the store).
   T4 app_not_started after a green finish never says "run the move again"; it
      gives `claude-account-move verify-start --state-dir <dir>` and says the data
-     already moved ("уже перенесен...").
+     already moved (Russian "already moved" wording).
   T5 `verify-start --state-dir D [--wait-start N]`: no login, no prepare, no
      stamp, no sync; waits for start (a load already in main.log counts, the app
      may have started long ago), checks the active pair of the CLI account is a
@@ -173,12 +173,12 @@ class TimeoutReport(Base):
         self.assertIsNotNone(rep, "no report-auto.json written")
         steps = {s["step"]: s for s in rep["steps"]}
         self.assertTrue(steps["finish_before_start"]["ok"], "premise: the data moved")
-        low = text.lower().replace(u"ё", u"е")
-        self.assertNotIn(u"запустите "
-                         u"перенос еще раз",
+        low = text.lower().replace(u"\u0451", u"\u0435")
+        self.assertNotIn(u"\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 "
+                         u"\u043f\u0435\u0440\u0435\u043d\u043e\u0441 \u0435\u0449\u0435 \u0440\u0430\u0437",
                          low, "the move already finished: never tell to run it again")
         self.assertIn("claude-account-move verify-start --state-dir %s" % self.h.state, text)
-        self.assertTrue(re.search(u"уже перенес", low),
+        self.assertTrue(re.search(u"\u0443\u0436\u0435 \u043f\u0435\u0440\u0435\u043d\u0435\u0441", low),
                         "say plainly that the data already moved")
 
 
@@ -255,9 +255,9 @@ class VerifyStart(Base):
 class NoRerunAdviceAnywhere(unittest.TestCase):
     """T6 class guard over every string constant of the package."""
 
-    BAD = (u"запустите перенос "
-           u"еще раз",       # run the move again (RU)
-           u"перенос еще раз",
+    BAD = (u"\u0437\u0430\u043f\u0443\u0441\u0442\u0438\u0442\u0435 \u043f\u0435\u0440\u0435\u043d\u043e\u0441 "
+           u"\u0435\u0449\u0435 \u0440\u0430\u0437",       # run the move again (RU)
+           u"\u043f\u0435\u0440\u0435\u043d\u043e\u0441 \u0435\u0449\u0435 \u0440\u0430\u0437",
            "run the move again", "run auto again", "run the transfer again")
     ALLOWED = ()      # (module, fragment) pairs that are legit, none today
 
@@ -271,7 +271,7 @@ class NoRerunAdviceAnywhere(unittest.TestCase):
                 tree = ast.parse(fh.read())
             for node in ast.walk(tree):
                 if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                    low = node.value.lower().replace(u"ё", u"е")
+                    low = node.value.lower().replace(u"\u0451", u"\u0435")
                     for bad in self.BAD:
                         if bad in low and (name, bad) not in self.ALLOWED:
                             hits.append("%s:%d %r" % (name, node.lineno, node.value[:90]))
