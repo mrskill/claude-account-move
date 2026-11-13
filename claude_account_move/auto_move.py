@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import subprocess
 import time
 
@@ -151,67 +152,113 @@ def wait_app_closed(limit_s, poll_s, out):
     return False
 
 
-def fresh_card_pair(paths, account, since_wall):
-    """(acc, org) of a pair dir of `account` in the claude-code-sessions store
-    that holds a card file with an mtime after `since_wall` (wall clock taken
-    when the wait began); None when there is none. The second start signal: the
-    app rewrote a card although it logged no Loaded line."""
+CARD_FUTURE_SLACK_S = 5.0     # a card mtime further ahead than this is not "now"
+
+
+def real_pair_problem(paths, store, pair):
+    """None when every component from the store root down to the org dir is a
+    real directory (lstat, no symlink anywhere on the way); else a short reason."""
+    cur = os.path.join(paths.support, store)
+    for part in (None, pair[0], pair[1]):
+        if part is not None:
+            cur = os.path.join(cur, part)
+        try:
+            mode = os.lstat(cur).st_mode
+        except OSError:
+            return "missing"
+        if stat.S_ISLNK(mode):
+            return "a symlink (%s)" % cur
+        if not stat.S_ISDIR(mode):
+            return "not a directory"
+    return None
+
+
+def active_cc_pair(paths, account):
+    """(acc dir name, org dir name) of the claude-code-sessions pair the card
+    signal may watch: the CLI account's organization (.claude.json) when its
+    dir exists (a link is returned too, the walk refuses it); when that dir does
+    not exist, the one org dir of the account if there is exactly one."""
     acc = (account or "").lower()
     root = os.path.join(paths.support, STORES[0])
     if not acc:
         return None
     try:
-        accs = [n for n in os.listdir(root) if n.lower() == acc]
+        names = [n for n in os.listdir(root) if n.lower() == acc]
     except OSError:
         return None
-    for a in accs:
-        try:
-            orgs = sorted(os.listdir(os.path.join(root, a)))
-        except OSError:
-            continue
-        for o in orgs:
-            pair = os.path.join(root, a, o)
-            if os.path.islink(pair) or not os.path.isdir(pair):
-                continue
-            try:
-                names = os.listdir(pair)
-            except OSError:
-                continue
-            for n in names:
-                if not n.startswith(common.CARD_PREFIX):
-                    continue
+    if len(names) != 1:
+        return None
+    adir = names[0]
+    ident = read_identity(paths)
+    org = ident.get("cli_org") if (ident.get("cli") or {}).get("value") == acc else None
+    if org and os.path.lexists(os.path.join(root, adir, org)):
+        return (adir, org)
+    try:
+        orgs = os.listdir(os.path.join(root, adir))
+    except OSError:
+        return None
+    return (adir, orgs[0]) if len(orgs) == 1 else None
+
+
+def card_mtimes(paths, pair):
+    """{card name: mtime_ns} of the cards of one pair dir (empty when unreadable)."""
+    d = os.path.join(paths.support, STORES[0], pair[0], pair[1])
+    snap_ = {}
+    try:
+        for n in os.listdir(d):
+            if n.startswith(common.CARD_PREFIX):
                 try:
-                    if os.path.getmtime(os.path.join(pair, n)) > since_wall:
-                        return (a, o)
+                    snap_[n] = os.stat(os.path.join(d, n)).st_mtime_ns
                 except OSError:
-                    continue
+                    pass
+    except OSError:
+        pass
+    return snap_
+
+
+def fresh_card_pair(paths, account, before, pair=None):
+    """(acc, org) of the active claude-code-sessions pair of `account` when a card
+    in it changed against `before` (the snapshot taken when the wait began, from
+    card_mtimes) and its mtime is not more than a few seconds ahead of now; None
+    otherwise. The pair is the CLI account's active org only, and every path
+    component down to it must be a real directory."""
+    pair = pair or active_cc_pair(paths, account)
+    if not pair or real_pair_problem(paths, STORES[0], pair):
+        return None
+    limit = int((time.time() + CARD_FUTURE_SLACK_S) * 1e9)
+    for n, m in card_mtimes(paths, pair).items():
+        if before.get(n) != m and m <= limit:
+            return pair
     return None
 
 
-def wait_app_start(paths, account, mark, limit_s, poll_s, out):
-    """{store: (acc, org)} once the claude-code-sessions store has a store-root
-    load of `account` appended to main.log after `mark` (heal_active.log_mark),
-    or a card file of the account's claude-code-sessions pair was written after
-    this call began; None when the time is up. A store without a signal (the
-    agent store loads lazily) is named in a note, not a failure; the agent store
-    alone is not a start. Prints a countdown at the start and every 30 s (like
-    wait_app_closed); the seconds left are rounded up and never printed at 0."""
+def wait_app_start(paths, account, mark, limit_s, poll_s, out, require_running=False):
+    """{store: (acc, org)} once the app is running and the claude-code-sessions
+    store has a store-root load of `account` appended to main.log after `mark`
+    (heal_active.log_mark), or a card of the account's active claude-code-sessions
+    pair changed after this call began; None when the time is up. With require_running (verify-start) a process that
+    is not running is never a start, whatever the log holds. A store without a
+    signal (the agent store loads lazily) is named in a note, not a failure; the
+    agent store alone is not a start. Prints a countdown at the start and every
+    30 s (like wait_app_closed); the seconds left are rounded up, never 0."""
     t0 = time.monotonic()
-    wall0 = time.time()
     deadline = t0 + max(0.0, limit_s)
     last = -1
+    card_pair = active_cc_pair(paths, account)
+    before = card_mtimes(paths, card_pair) if card_pair else {}
     while True:
-        loads = heal_active.fresh_root_loads(paths, account, mark)
-        if STORES[0] not in loads:
-            card = fresh_card_pair(paths, account, wall0)
-            if card:
-                loads = dict(loads)
-                loads[STORES[0]] = card
-        if STORES[0] in loads:
-            silent = [s for s in STORES if s not in loads]
-            if silent:
-                out.say(ru.START_PARTIAL % ", ".join(silent))
-            return loads
+        if (not require_running) or common.claude_app_running():
+            loads = heal_active.fresh_root_loads(paths, account, mark)
+            if STORES[0] not in loads:
+                card = fresh_card_pair(paths, account, before, card_pair)
+                if card:
+                    loads = dict(loads)
+                    loads[STORES[0]] = card
+            if STORES[0] in loads:
+                silent = [s for s in STORES if s not in loads]
+                if silent:
+                    out.say(ru.START_PARTIAL % ", ".join(silent))
+                return loads
         now = time.monotonic()           # one reading for every decision below
         if now >= deadline:
             return None
@@ -814,7 +861,9 @@ def cmd_auto(args, cli):
                 step("app_closed", False)
                 ctx["finish"] = frep
                 ctx["problem"] = ru.PROBLEM_PAIR
-                return stop(EXIT_FAIL, "app_running", ru.APP_TIMEOUT, show_summary=True)
+                return stop(EXIT_FAIL, "app_running", ru.APP_TIMEOUT_AFTER % (
+                    shlex.quote(paths.state), shlex.quote(paths.state)),
+                    show_summary=True)
             # a loaded pair that is missing or not a directory cannot be healed
             for store in st.STORES:
                 if store in loads and heal_active.loaded_pair_problem(
@@ -900,7 +949,7 @@ def cmd_verify_start(args, cli):
                         "no_account", ru.VS_NO_ACCOUNT, mdir)
     poll = _poll(START_POLL_S, "CLAUDE_ACCOUNT_MOVE_START_POLL_S")
     loads = wait_app_start(paths, acc, (None, 0), getattr(args, "wait_start", 0.0),
-                           poll, out)
+                           poll, out, require_running=True)
     running = bool(common.claude_app_running())
     if loads is None:
         missing = list(STORES)
@@ -908,20 +957,32 @@ def cmd_verify_start(args, cli):
         return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
                         "app_not_started", text, mdir, app_running=running,
                         missing_stores=missing)
+    # per store only the newest load of the whole log counts, and it must be
+    # the account of the CLI; the pair must be real from the store root down
+    latest = heal_active.latest_root_loads(paths)
+    final = dict(loads)
     for store in STORES:
-        if store in loads:
-            why = heal_active.loaded_pair_problem(paths, store, loads[store])
+        if store in latest:
+            final[store] = latest[store]
+    for store in STORES:
+        if store in latest and latest[store][0] != acc.lower():
+            text = ru.VS_WRONG_ACCOUNT % (store, latest[store][0])
+            return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                            "wrong_account", text, mdir, app_running=running)
+    for store in STORES:
+        if store in final:
+            why = real_pair_problem(paths, store, final[store])
             if why:
                 text = ru.VS_BAD_PAIR % (store, heal_active.pair_path(
-                    paths, store, loads[store]), why)
+                    paths, store, final[store]), why)
                 return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
                                 "bad_pair", text, mdir, app_running=running,
                                 loads=sorted("%s/%s/%s" % (s2, a, o)
-                                             for s2, (a, o) in loads.items()))
+                                             for s2, (a, o) in final.items()))
     out.say(ru.VS_OK)
     cli.emit(args, out, cli._report(
         "verify-start", EXIT_OK, "ok", started, app_running=running,
-        missing_stores=[x for x in STORES if x not in loads],
-        loads=sorted("%s/%s/%s" % (s2, a, o) for s2, (a, o) in loads.items()),
+        missing_stores=[x for x in STORES if x not in final],
+        loads=sorted("%s/%s/%s" % (s2, a, o) for s2, (a, o) in final.items()),
         write_verified=False), mdir)
     return EXIT_OK

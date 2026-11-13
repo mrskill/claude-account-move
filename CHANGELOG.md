@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- start detection, review round 1 fixes: `verify-start` counts only the latest
+  "Loaded" line per store and fails (exit 3) when it is not the CLI account; a
+  process that is not running is never a start (`app_not_started`); every path
+  component from the store root to the org dir must be a real directory (no
+  symlink); the card signal compares card mtimes against a snapshot taken when
+  the wait began, ignores mtimes more than 5 s in the future, and watches only
+  the CLI account's active org. The app-timeout text is split: before the move
+  nothing changed; after it the data is moved and the text gives the
+  `heal-active` and `verify-start` commands. Two other messages no longer say
+  "run this file again".
+
 - `auto` no longer fails the app start when the agent store
   (`local-agent-mode-sessions`) has no "Loaded" line: `claude-code-sessions`
   loaded after the mark is a start (the silent store is named in a note), and a
