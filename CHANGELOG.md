@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `auto` no longer fails the app start when the agent store
+  (`local-agent-mode-sessions`) has no "Loaded" line: `claude-code-sessions`
+  loaded after the mark is a start (the silent store is named in a note), and a
+  card of the new `claude-code-sessions` pair written after the wait began is a
+  second start signal. The `app_not_started` report carries `app_running` and
+  `missing_stores`; its text differs for "not running" and "running, no signal
+  for store X", and after a green finish it says the data already moved and
+  points to the new read-only `claude-account-move verify-start --state-dir D
+  [--wait-start N]` instead of telling to run the move again.
 - `auto` shows a countdown while it waits for the app to start under the new
   account (`wait_app_start` printed nothing for up to 300 s): a line at the
   start and every 30 s, like the wait for the app to quit (seconds left rounded

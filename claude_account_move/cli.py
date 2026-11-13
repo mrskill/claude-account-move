@@ -156,6 +156,12 @@ def build_parser():
                    help="heal every pair named by an ENOTDIR line of the last 10 "
                    "minutes that is still a symlink; allowed while the app runs "
                    "(for the launchd agent)")
+    v = sub.add_parser("verify-start", help="read-only: did the app start under the "
+                       "new account and load a real working folder (no move is run)")
+    add_common(v)
+    v.add_argument("--wait-start", type=float, default=60.0,
+                   help="seconds to wait for the app to start (default 60); a load "
+                   "already in the app log counts at once")
     q = sub.add_parser("quarantine-zombies", help="move aside the cards of sessions deleted in the panel "
                        "(dry run; writes with --apply; never deletes)",
                        description="Move aside the cards of sessions deleted in the panel, with a "
@@ -1072,6 +1078,11 @@ def cmd_auto(args):
     return auto_move.cmd_auto(args, sys.modules[__name__])
 
 
+def cmd_verify_start(args):
+    from . import auto_move
+    return auto_move.cmd_verify_start(args, sys.modules[__name__])
+
+
 def _pause(args):
     """Keep the launcher window open until Enter; never fails the run."""
     if args.command != "auto" or not getattr(args, "pause", False):
@@ -1101,6 +1112,7 @@ def _run(args):
         return {"prepare": cmd_prepare, "finish": cmd_finish,
                 "sync": cmd_sync, "repair": cmd_repair, "stamp": cmd_stamp,
                 "heal-active": cmd_heal_active, "auto": cmd_auto,
+                "verify-start": cmd_verify_start,
                 "quarantine-zombies": cmd_quarantine_zombies}[args.command](args)
     except st.PairError as exc:
         return fail(args, Out.of(args), args.command, started, EXIT_INPUT,

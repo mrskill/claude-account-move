@@ -151,17 +151,66 @@ def wait_app_closed(limit_s, poll_s, out):
     return False
 
 
+def fresh_card_pair(paths, account, since_wall):
+    """(acc, org) of a pair dir of `account` in the claude-code-sessions store
+    that holds a card file with an mtime after `since_wall` (wall clock taken
+    when the wait began); None when there is none. The second start signal: the
+    app rewrote a card although it logged no Loaded line."""
+    acc = (account or "").lower()
+    root = os.path.join(paths.support, STORES[0])
+    if not acc:
+        return None
+    try:
+        accs = [n for n in os.listdir(root) if n.lower() == acc]
+    except OSError:
+        return None
+    for a in accs:
+        try:
+            orgs = sorted(os.listdir(os.path.join(root, a)))
+        except OSError:
+            continue
+        for o in orgs:
+            pair = os.path.join(root, a, o)
+            if os.path.islink(pair) or not os.path.isdir(pair):
+                continue
+            try:
+                names = os.listdir(pair)
+            except OSError:
+                continue
+            for n in names:
+                if not n.startswith(common.CARD_PREFIX):
+                    continue
+                try:
+                    if os.path.getmtime(os.path.join(pair, n)) > since_wall:
+                        return (a, o)
+                except OSError:
+                    continue
+    return None
+
+
 def wait_app_start(paths, account, mark, limit_s, poll_s, out):
-    """{store: (acc, org)} once every store has a store-root load of `account`
-    appended to main.log after `mark` (heal_active.log_mark); None when the
-    time is up. Prints a countdown at the start and every 30 s (like
+    """{store: (acc, org)} once the claude-code-sessions store has a store-root
+    load of `account` appended to main.log after `mark` (heal_active.log_mark),
+    or a card file of the account's claude-code-sessions pair was written after
+    this call began; None when the time is up. A store without a signal (the
+    agent store loads lazily) is named in a note, not a failure; the agent store
+    alone is not a start. Prints a countdown at the start and every 30 s (like
     wait_app_closed); the seconds left are rounded up and never printed at 0."""
     t0 = time.monotonic()
+    wall0 = time.time()
     deadline = t0 + max(0.0, limit_s)
     last = -1
     while True:
         loads = heal_active.fresh_root_loads(paths, account, mark)
-        if all(s in loads for s in STORES):
+        if STORES[0] not in loads:
+            card = fresh_card_pair(paths, account, wall0)
+            if card:
+                loads = dict(loads)
+                loads[STORES[0]] = card
+        if STORES[0] in loads:
+            silent = [s for s in STORES if s not in loads]
+            if silent:
+                out.say(ru.START_PARTIAL % ", ".join(silent))
             return loads
         now = time.monotonic()           # one reading for every decision below
         if now >= deadline:
@@ -173,6 +222,16 @@ def wait_app_start(paths, account, mark, limit_s, poll_s, out):
                 out.say(ru.START_WAIT % math.ceil(left))
             last = tick
         time.sleep(min(poll_s, max(0.01, left)))
+
+
+def start_timeout_text(running, missing, moved, state_dir):
+    """Final text of app_not_started: the cause, then what to do. Never a
+    rerun of the move: the data was checked before the start."""
+    head = (ru.START_TIMEOUT_NO_SIGNAL % ", ".join(missing) if running
+            else ru.START_TIMEOUT_NOT_RUNNING)
+    tail = ru.START_MOVED_TAIL if moved else ru.START_UNCHECKED_TAIL
+    return "%s %s\n    claude-account-move verify-start --state-dir %s" % (
+        head, tail, shlex.quote(state_dir))
 
 
 def only_active_pair_failed(rep):
@@ -725,8 +784,14 @@ def cmd_auto(args, cli):
             if loads is None:
                 step("app_start", False)
                 ctx["problem"] = ru.PROBLEM_START
-                return None, stop(EXIT_FAIL, "app_not_started", ru.START_TIMEOUT,
-                                  show_summary=True)
+                running = bool(common.claude_app_running())
+                got = heal_active.fresh_root_loads(paths, new_acc, mark)
+                missing = [x for x in STORES if x not in got]
+                moved = any(x["step"] == "finish_before_start" and x["ok"]
+                            for x in steps)
+                return None, stop(EXIT_FAIL, "app_not_started", start_timeout_text(
+                    running, missing, moved, paths.state), show_summary=True,
+                    app_running=running, missing_stores=missing)
             step("app_start", True, loads=sorted("%s/%s/%s" % (s, a, o)
                                                  for s, (a, o) in loads.items()))
             ctx["store_pairs"] = dict(loads)    # every later check: per store
@@ -812,3 +877,51 @@ def cmd_auto(args, cli):
         return flow()
     except st.PairError as exc:
         return stop(EXIT_INPUT, "input_error", ru.BAD_PAIR % exc)
+
+
+def cmd_verify_start(args, cli):
+    """Read-only check that the app runs under the account of the CLI: a Loaded
+    line already in main.log counts (the app may have started long ago), the
+    pair it loaded must be a real directory. No login, prepare, stamp or sync.
+    Writes report-verify-start.json into the newest move dir."""
+    started = time.monotonic()
+    out = cli.Out.of(args)
+    paths = cli.make_paths(args)
+    prob = state_dir_problem(paths)
+    if prob:
+        return cli.fail(args, out, "verify-start", started, EXIT_INPUT,
+                        "input_error", "error: " + prob)
+    name = _newest_move_name(paths)
+    mdir = os.path.join(snap.moves_dir(paths), name) if name else None
+    out.say(ru.VS_TITLE)
+    acc = (read_identity(paths).get("cli") or {}).get("value")
+    if not acc:
+        return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                        "no_account", ru.VS_NO_ACCOUNT, mdir)
+    poll = _poll(START_POLL_S, "CLAUDE_ACCOUNT_MOVE_START_POLL_S")
+    loads = wait_app_start(paths, acc, (None, 0), getattr(args, "wait_start", 0.0),
+                           poll, out)
+    running = bool(common.claude_app_running())
+    if loads is None:
+        missing = list(STORES)
+        text = start_timeout_text(running, missing, True, paths.state)
+        return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                        "app_not_started", text, mdir, app_running=running,
+                        missing_stores=missing)
+    for store in STORES:
+        if store in loads:
+            why = heal_active.loaded_pair_problem(paths, store, loads[store])
+            if why:
+                text = ru.VS_BAD_PAIR % (store, heal_active.pair_path(
+                    paths, store, loads[store]), why)
+                return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                                "bad_pair", text, mdir, app_running=running,
+                                loads=sorted("%s/%s/%s" % (s2, a, o)
+                                             for s2, (a, o) in loads.items()))
+    out.say(ru.VS_OK)
+    cli.emit(args, out, cli._report(
+        "verify-start", EXIT_OK, "ok", started, app_running=running,
+        missing_stores=[x for x in STORES if x not in loads],
+        loads=sorted("%s/%s/%s" % (s2, a, o) for s2, (a, o) in loads.items()),
+        write_verified=False), mdir)
+    return EXIT_OK
