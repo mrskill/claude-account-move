@@ -447,7 +447,8 @@ def syncable(rep):
     (loss folds the lagging directories in), so the checks alone cannot say
     whether anything is really lost: the per-store counters decide.
     """
-    failed = [c["id"] for c in (rep.get("checks") or []) if not c["ok"]]
+    failed = [c["id"] for c in (rep.get("checks") or []) if not c["ok"]
+              and c["id"] != "sessions_no_card"]      # orphans are adopted, not synced
     if not any(i.endswith(":target_names") for i in failed):
         return False
     if not all(":" in i and i.split(":", 1)[1] in SYNC_FIXABLE for i in failed):
@@ -498,6 +499,9 @@ def describe_check(c, rep):
             if r:
                 num = ": " + ru.OF % (r[1] - r[0], r[1])
         line = ru.FINISH_CHECKS.get(cid, cid) + num
+    tag = "[%s] " % ru.TAG_BAD
+    if detail.startswith(tag):          # the summary line carries its own tag
+        detail = detail[len(tag):]
     if not ok:
         line += " (%s)" % detail
     return ok, line
@@ -536,10 +540,12 @@ def print_summary(out, args, ctx):
         out.say("  " + ru.LINE_STAMP_JOURNAL % ctx["stamp_journal"])
     if ctx.get("sync_journal"):
         out.say("  " + ru.LINE_SYNC_JOURNAL % ctx["sync_journal"])
+    if ctx.get("adopt_journal"):
+        out.say("  " + ru.LINE_ADOPT_JOURNAL % ctx["adopt_journal"])
     out.say("  " + ru.LINE_STATE_DIR % ctx["state_dir"])
     out.say("")
     out.say(ru.UNDO_TITLE)
-    if ctx.get("stamp_journal") or ctx.get("sync_journal"):
+    if ctx.get("stamp_journal") or ctx.get("sync_journal") or ctx.get("adopt_journal"):
         out.say("  " + ru.UNDO_CLOSE_FIRST)
         if ctx.get("sync_journal"):
             out.say("  " + ru.UNDO_SYNC)
@@ -547,6 +553,9 @@ def print_summary(out, args, ctx):
         if ctx.get("stamp_journal"):
             out.say("  " + ru.UNDO_STAMP)
             out.say("    " + _undo_cmd("stamp", ctx["stamp_journal"], args))
+        if ctx.get("adopt_journal"):
+            out.say("  " + ru.UNDO_ADOPT)
+            out.say("    " + _undo_cmd("adopt", ctx["adopt_journal"], args))
     else:
         out.say("  " + ru.UNDO_NOTHING)
     if ctx.get("synced"):
@@ -577,7 +586,8 @@ def cmd_auto(args, cli):
             "auto", code, verdict, started, reason=message, steps=steps,
             write_verified=False, move_id=ctx.get("move_id"),
             stamp_journal=ctx.get("stamp_journal"),
-            sync_journal=ctx.get("sync_journal"), **extra), ctx.get("move_dir"))
+            sync_journal=ctx.get("sync_journal"),
+            adopt_journal=ctx.get("adopt_journal"), **extra), ctx.get("move_dir"))
         return code
 
     def flow():
@@ -771,6 +781,43 @@ def cmd_auto(args, cli):
                 hcode, (hrep or {}).get("reason") or (hrep or {}).get("verdict")),
                 show_summary=True)
 
+        # 5c. sessions with a transcript and no card would vanish from the panel
+        # of the new account: give each one a card (the app is closed here). The
+        # card format is copied from a card of the new pair, so an empty pair is
+        # retried once more after the sync below. A failure is not fatal: the
+        # final check "sessions without a card" shows it.
+        def adopt_step():
+            acode, arep = run_step(cli.cmd_adopt, _ns(
+                args, post_login=True, apply=True, undo=None, only=None))
+            arep = arep or {}
+            verdict = arep.get("verdict")
+            if arep.get("journal"):
+                ctx["adopt_journal"] = arep["journal"]
+            if verdict in ("nothing_to_do", "dry_run"):
+                ctx.pop("adopt_pending", None)
+                return
+            if not ctx.get("adopt_told"):
+                ctx["adopt_told"] = True
+                out.say(ru.ADOPT_START)
+            if verdict == "no_template" and not ctx.get("adopt_retried"):
+                ctx["adopt_pending"] = True
+                out.say(ru.ADOPT_NO_TEMPLATE)
+                return
+            ctx.pop("adopt_pending", None)
+            step("adopt", acode == EXIT_OK, exit_code=acode, verdict=verdict,
+                 journal=ctx.get("adopt_journal"))
+            if acode == EXIT_OK:
+                out.say(ru.ADOPT_OK % (arep.get("created", 0),
+                                       ctx.get("adopt_journal") or ru.NONE_WORD))
+            elif verdict == "applied":
+                out.say(ru.ADOPT_FAIL % (arep.get("created", 0), arep.get("refused", 0),
+                                         arep.get("failed", 0),
+                                         ctx.get("adopt_journal") or ru.NONE_WORD))
+            else:
+                out.say(ru.ADOPT_REFUSED % (arep.get("reason") or verdict))
+
+        adopt_step()
+
         # 6. finish (and sync when only deliverable names are missing)
         def finish_once():
             return run_step(cli.cmd_finish, _ns(
@@ -803,6 +850,12 @@ def cmd_auto(args, cli):
         res, stopped = finish_sync()
         if stopped is not None:
             return stopped
+        if ctx.get("adopt_pending"):        # the pair held no card to copy before the sync
+            ctx["adopt_retried"] = True
+            adopt_step()
+            res, stopped = finish_sync()    # the verdict sees the new cards
+            if stopped is not None:
+                return stopped
         fcode, frep = res
         ctx["finish"] = frep
         step("finish_before_start", fcode == EXIT_OK, exit_code=fcode)
@@ -915,7 +968,8 @@ def cmd_auto(args, cli):
         cli.emit(args, out, cli._report(
             "auto", code, verdict, started, steps=steps, write_verified=False,
             move_id=ctx["move_id"], stamp_journal=ctx.get("stamp_journal"),
-            sync_journal=ctx.get("sync_journal"), move_dir=ctx["move_dir"],
+            sync_journal=ctx.get("sync_journal"), adopt_journal=ctx.get("adopt_journal"),
+            move_dir=ctx["move_dir"],
             finish=frep), ctx["move_dir"])
         return code
 

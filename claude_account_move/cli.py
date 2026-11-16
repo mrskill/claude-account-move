@@ -11,6 +11,7 @@ repair   optional repair: rebind target cards bound to a session other than the 
          the move snapshot recorded (dry run; writes with --apply).
 heal-active  optional repair: turn a symlinked active pair into a real directory
          (dry run; writes with --apply; the app must be quit).
+adopt    optional: a card for every session the app has none for (dry run; writes with --apply).
 stamp    optional: last-message time into every session title (writes with --apply).
 """
 import argparse
@@ -26,6 +27,7 @@ from . import post_move_check as post
 from . import pre_move_check as pre
 from . import store as st
 from . import common
+from . import adopt_orphans
 from . import heal_active
 from . import post_move_verify as verify
 from . import progress as prog
@@ -172,6 +174,18 @@ def build_parser():
     add_common(q)
     q.add_argument("--apply", action="store_true", help="really move (default: dry run)")
     q.add_argument("--undo", metavar="JOURNAL", help="put the cards a journal moved back")
+    o = sub.add_parser("adopt", help="give a card to every session the app has no card for "
+                       "(dry run; writes with --apply)",
+                       description="List the sessions that have a transcript but no card in any "
+                       "store (orphans: they vanish from the panel after an account change) and, "
+                       "with --apply, write one new card per orphan into the active pair, "
+                       "journaled, never over an existing file. The Claude app must be closed. "
+                       "Transcripts are never written.")
+    add_common(o)
+    o.add_argument("--apply", action="store_true", help="really write (default: dry run)")
+    o.add_argument("--undo", metavar="JOURNAL", help="remove the cards a journal created")
+    o.add_argument("--only", action="append", metavar="ID",
+                   help="limit the run to this session id (repeatable)")
     a = sub.add_parser("auto", help="the whole move in one run: prepare, stamp, wait for "
                        "login, heal-active, finish, app start check, sync if needed (writes)")
     add_common(a)
@@ -303,6 +317,10 @@ def _cmd_prepare(args, out):
     code = EXIT_OK if ready else EXIT_FAIL
     out.say("checks:")
     print_checks(out, checks)
+    orphans = adopt_orphans.find(paths, index)
+    notes = adopt_orphans.readiness_notes(orphans)
+    for n in notes:
+        out.say(n)
     for name in st.STORES:
         s = index.stores[name]
         out.say("  %s: cards %d, real dirs %d, aliases %d, deletion marks %d"
@@ -321,7 +339,8 @@ def _cmd_prepare(args, out):
         observation=index.obs.as_dict(), write_verified=False,
         pair_source=pair_source or None,
         pairs_physical=sum(len(s.dirs) for s in index.stores.values()),
-        transcripts=len(tmap), cards_copied=copied)
+        transcripts=len(tmap), cards_copied=copied,
+        notes=notes, orphans=len(orphans))
     emit(args, out, rep, mdir)
     return code
 
@@ -987,6 +1006,98 @@ def cmd_quarantine_zombies(args):
     return code
 
 
+def cmd_adopt(args):
+    started = time.monotonic()
+    out = Out.of(args)
+    paths = make_paths(args)
+    name = "adopt"
+    prob = state_dir_problem(paths)
+    if prob:
+        return fail(args, out, name, started, EXIT_INPUT, "input_error", "error: " + prob)
+    if args.apply or args.undo:
+        if common.claude_app_running():
+            return fail(args, out, name, started, EXIT_FAIL, "app_running",
+                        "Quit the Claude app first (Cmd+Q), then run this command "
+                        "again: the cards are files the app keeps open."
+                        + common.app_blockers_note())
+    if args.undo:
+        try:
+            with write_lock(paths):
+                res = adopt_orphans.undo(paths, args.undo)
+        except adopt_orphans.JournalError as exc:
+            return fail(args, out, name, started, EXIT_FAIL, "journal_rejected",
+                        "journal rejected: %s" % exc)
+        out.say("removed %(removed)d cards, already gone %(gone)d, ambiguous "
+                "%(ambiguous)d (changed since the write: kept)" % res)
+        for p in res["ambiguous_paths"]:
+            out.say("  ambiguous, left in place: %s" % p)
+        code = EXIT_OK if not res["ambiguous"] else EXIT_FAIL
+        emit(args, out, _report(name, code, "undo", started, undo=res, write_verified=False))
+        return code
+    if not os.path.isdir(paths.support):
+        return fail(args, out, name, started, EXIT_NO_STORE, "no_store",
+                    "storage not found: %s" % paths.support)
+    index = st.scan(paths)
+    if not index.obs.complete():
+        out.say("warning: %d cards could not be read (%d errors): a session may "
+                "already have a card among them" % (index.obs.unreadable_cards,
+                                                    len(index.obs.errors)))
+    found = adopt_orphans.find(paths, index)
+    wanted = [i.lower() for i in (args.only or [])]
+    chosen = [o for o in found if not wanted or o["id"] in wanted]
+    ids = {o["id"] for o in found}
+    not_orphans = [i for i in wanted if i not in ids]
+    for o in chosen:
+        out.say(adopt_orphans.describe(o))
+    for i in not_orphans:
+        out.say("not an orphan, left alone: %s" % i)
+    base = dict(orphans=[{"id": o["id"], "cwd": o["cwd"], "first": o["first"],
+                          "prompts": o["prompts"], "last_ms": o["last_ms"]}
+                         for o in chosen],
+                not_orphans=not_orphans, dry_run=not args.apply)
+    if not args.apply:
+        out.say("dry run: nothing written. Add --apply to write %d cards." % len(chosen))
+        emit(args, out, _report(name, EXIT_OK, "dry_run", started,
+                                write_verified=False, **base))
+        return EXIT_OK
+    if not chosen:
+        out.say("nothing to adopt")
+        emit(args, out, _report(name, EXIT_OK, "nothing_to_do", started,
+                                write_verified=False, **base))
+        return EXIT_OK
+    try:
+        pair = adopt_orphans.active_pair(paths, read_identity(paths), args.active_pair)
+        pair_dir = os.path.join(paths.support, st.STORES[0], pair[0], pair[1])
+        tpl_path, tpl = adopt_orphans.pick_template(pair_dir)
+    except adopt_orphans.PairProblem as exc:
+        return fail(args, out, name, started, EXIT_FAIL, "no_template", "refused: %s" % exc,
+                    **base)
+    try:
+        with write_lock(paths):
+            res = adopt_orphans.apply_plan(paths, chosen, pair, tpl_path, tpl)
+    except adopt_orphans.PairProblem as exc:
+        return fail(args, out, name, started, EXIT_FAIL, "no_template", "refused: %s" % exc,
+                    **base)
+    except OSError as exc:
+        return fail(args, out, name, started, EXIT_INTERNAL, "internal_error",
+                    "cannot write the journal or the cards (state directory %s): %s"
+                    % (paths.state, exc))
+    out.say("created %d cards, refused %d, failed %d"
+            % (len(res["created"]), len(res["refused"]), len(res["failed"])))
+    for e in res["refused"]:
+        out.say("  refused (the new name exists, nothing overwritten): %s" % e["orphan"])
+    for e in res["failed"]:
+        out.say("  failed: %s: %s" % (e["orphan"], e.get("error")))
+    out.say("journal: %s (`adopt --undo JOURNAL` removes the cards it created)"
+            % res["journal"])
+    code = EXIT_FAIL if (res["refused"] or res["failed"]) else EXIT_OK
+    emit(args, out, _report(name, code, "applied", started, journal=res["journal"],
+                            created=len(res["created"]), refused=len(res["refused"]),
+                            failed=len(res["failed"]), write_verified=False,
+                            **base))
+    return code
+
+
 def cmd_stamp(args):
     started = time.monotonic()
     out = Out.of(args)
@@ -1113,7 +1224,8 @@ def _run(args):
                 "sync": cmd_sync, "repair": cmd_repair, "stamp": cmd_stamp,
                 "heal-active": cmd_heal_active, "auto": cmd_auto,
                 "verify-start": cmd_verify_start,
-                "quarantine-zombies": cmd_quarantine_zombies}[args.command](args)
+                "quarantine-zombies": cmd_quarantine_zombies,
+                "adopt": cmd_adopt}[args.command](args)
     except st.PairError as exc:
         return fail(args, Out.of(args), args.command, started, EXIT_INPUT,
                     "input_error", "error: %s" % exc)

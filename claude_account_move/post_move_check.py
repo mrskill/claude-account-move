@@ -11,9 +11,11 @@ not yet in the target pair and a sync job is alive, 0 otherwise.
 import os
 from datetime import datetime
 
+from . import adopt_orphans
 from . import panel_snapshot as snap
 from . import post_move_verify as verify
 from . import pre_move_check as pre
+from . import ru_text as ru
 from . import store as st
 from .common import EXIT_FAIL, EXIT_OK, EXIT_WAIT, STORES
 
@@ -425,6 +427,19 @@ def evaluate(paths, before, index, tmap, identity, target, source,
         _check(checks, "newest_message", newest_now >= newest_before,
                "newest message before %d, now %d (ms)" % (newest_before, newest_now))
         lost |= newest_now < newest_before
+
+    # A session with a transcript and no card in any store is not in the panel
+    # of the new account: it is part of the verdict (CAM-ADOPT-ORPHANS G3).
+    orphans = adopt_orphans.find(paths, index)
+    if orphans:
+        detail = "[%s] %s" % (ru.TAG_BAD, ru.NO_CARD_BAD % (
+            len(orphans), "; ".join(o["first"] for o in orphans[:5])))
+    else:
+        detail = ru.NO_CARD_OK % len(tmap)
+    checks.append({"id": "sessions_no_card", "name": ru.NO_CARD_NAME,
+                   "ok": not orphans, "detail": detail})
+    report["sessions_without_card"] = len(orphans)
+    lost |= bool(orphans)
 
     report["wrong_id_lines"] = cap_lines(report["wrong_id_lines"])
     report["checks"] = checks
