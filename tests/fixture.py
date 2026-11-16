@@ -17,6 +17,11 @@ def uid(n, k=0):
     return "%08x-0000-4000-8000-%012x" % (n, k)
 
 
+def v5(n, k=0):
+    """A version-5 session id (the shape of the orphans of the 16.11.2026 move)."""
+    return "%08x-5a2f-5fc5-8c7a-%012x" % (n, k)
+
+
 def iso(ms):
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -72,6 +77,43 @@ class Home(object):
                                  "message": {"content": "hi"}}) + "\n")
             fh.write(json.dumps({"type": "queue-operation",
                                  "timestamp": iso(last_ms + 99999)}) + "\n")
+
+    def orphan(self, sid, cwd="/work/proj", prompts=("first prompt",), owner=True,
+               titles=(), first_ms=1760000000000, tool_result_only=False):
+        """A transcript with no card behind it. `titles` is a list of
+        (kind, text), kind "custom-title" or "ai-title". Returns (first_ms, last_ms)
+        of the timestamped lines. `tool_result_only` writes one user line that is a
+        tool result, never a real prompt."""
+        os.makedirs(self.projects, exist_ok=True)
+        lines = []
+        if owner:
+            lines.append({"type": "session-owner", "accountUuid": uid(1),
+                          "organizationUuid": uid(2)})
+        t = first_ms
+        n = 1 if tool_result_only else len(prompts)
+        for i in range(n):
+            if tool_result_only:
+                content = [{"type": "tool_result", "tool_use_id": "x", "content": "ok"}]
+            else:
+                content = prompts[i]
+            lines.append({"type": "user", "timestamp": iso(t), "cwd": cwd,
+                          "sessionId": sid,
+                          "message": {"role": "user", "content": content}})
+            t += 30000
+            lines.append({"type": "assistant", "timestamp": iso(t), "cwd": cwd,
+                          "sessionId": sid,
+                          "message": {"role": "assistant",
+                                      "content": [{"type": "text", "text": "ok"}]}})
+            t += 30000
+        for kind, text in titles:
+            key = "customTitle" if kind == "custom-title" else "aiTitle"
+            lines.append({"type": kind, key: text, "title": text, "sessionId": sid})
+        last_ms = t - 30000
+        path = os.path.join(self.projects, sid + ".jsonl")
+        with open(path, "w") as fh:
+            for ln in lines:
+                fh.write(json.dumps(ln) + "\n")
+        return first_ms, last_ms
 
     def accounts(self, cli=None, app=None, raw_cli=None, raw_app=None):
         os.makedirs(self.support, exist_ok=True)
