@@ -35,7 +35,7 @@ def build_source(h, empty_cid_live=False):
 def switch_to_target(h):
     h.pair(CC, B, O2)
     h.pair(LAM, B, O2)
-    h.accounts(cli=B, app=B)
+    h.accounts(cli=B, app=B, org=O2)
     h.log((A, O1), (B, O2))
 
 

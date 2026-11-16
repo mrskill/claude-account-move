@@ -25,7 +25,7 @@ def package_files(root):
     for dp, dns, fns in os.walk(root):
         dns[:] = [d for d in dns if d not in SKIP_DIRS]
         for f in fns:
-            if f != ".DS_Store":
+            if f != ".DS_Store" and f not in SKIP_DIRS:    # a worktree .git is a file
                 yield os.path.join(dp, f)
 
 
@@ -75,6 +75,12 @@ class Mechanism(unittest.TestCase):
         self.put(".git/x", "zorblax")
         self.put("__pycache__/y", "zorblax")
         self.assertEqual(find_hits(self.root, [re.compile("zorblax")]), [])
+
+    def test_skips_a_git_file_of_a_worktree_but_not_other_files(self):
+        self.put(".git", "gitdir: %sx/wt" % HOME_PATH)
+        self.put("n.txt", "see %sx" % HOME_PATH)
+        hits = find_hits(self.root, [re.compile(re.escape(HOME_PATH))])
+        self.assertEqual([h[0] for h in hits], ["n.txt"])
 
     def test_generic_classes_are_detected(self):
         self.put("p.txt", "see %shome/x" % HOME_PATH)

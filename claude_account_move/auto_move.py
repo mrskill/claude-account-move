@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import subprocess
 import time
 
@@ -151,18 +152,110 @@ def wait_app_closed(limit_s, poll_s, out):
     return False
 
 
+CARD_FUTURE_SLACK_S = 5.0     # a card mtime further ahead than this is not "now"
+
+
+def real_pair_problem(paths, store, pair):
+    """None when every component from the store root down to the org dir is a
+    real directory (lstat, no symlink anywhere on the way); else a short reason."""
+    cur = os.path.join(paths.support, store)
+    for part in (None, pair[0], pair[1]):
+        if part is not None:
+            cur = os.path.join(cur, part)
+        try:
+            mode = os.lstat(cur).st_mode
+        except OSError:
+            return "missing"
+        if stat.S_ISLNK(mode):
+            return "a symlink (%s)" % cur
+        if not stat.S_ISDIR(mode):
+            return "not a directory"
+    return None
+
+
+def active_cc_pair(paths, account):
+    """(acc dir name, org dir name) of the claude-code-sessions pair of the CLI
+    account: the organization of .claude.json (C4: no fallback to another org).
+    None when the CLI account is not `account`, no org is known, or the dir does
+    not exist (a symlink counts as existing, the lstat walk refuses it later)."""
+    acc = (account or "").lower()
+    root = os.path.join(paths.support, STORES[0])
+    if not acc:
+        return None
+    try:
+        names = [n for n in os.listdir(root) if n.lower() == acc]
+    except OSError:
+        return None
+    if len(names) != 1:
+        return None
+    ident = read_identity(paths)
+    org = ident.get("cli_org") if (ident.get("cli") or {}).get("value") == acc else None
+    if org and os.path.lexists(os.path.join(root, names[0], org)):
+        return (names[0], org)
+    return None
+
+
+def card_mtimes(paths, pair):
+    """{card name: mtime_ns} of the cards of one pair dir (empty when unreadable)."""
+    d = os.path.join(paths.support, STORES[0], pair[0], pair[1])
+    snap_ = {}
+    try:
+        for n in os.listdir(d):
+            if n.startswith(common.CARD_PREFIX):
+                try:
+                    snap_[n] = os.stat(os.path.join(d, n)).st_mtime_ns
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return snap_
+
+
+def fresh_card_pair(paths, account, before, pair=None):
+    """(acc, org) of the active claude-code-sessions pair of `account` when a card
+    in it changed against `before` (the snapshot taken when the wait began, from
+    card_mtimes) and its mtime is not more than a few seconds ahead of now; None
+    otherwise. The pair is the CLI account's active org only, and every path
+    component down to it must be a real directory."""
+    pair = pair or active_cc_pair(paths, account)
+    if not pair or real_pair_problem(paths, STORES[0], pair):
+        return None
+    limit = int((time.time() + CARD_FUTURE_SLACK_S) * 1e9)
+    for n, m in card_mtimes(paths, pair).items():
+        if before.get(n) != m and m <= limit:
+            return pair
+    return None
+
+
 def wait_app_start(paths, account, mark, limit_s, poll_s, out):
-    """{store: (acc, org)} once every store has a store-root load of `account`
-    appended to main.log after `mark` (heal_active.log_mark); None when the
-    time is up. Prints a countdown at the start and every 30 s (like
-    wait_app_closed); the seconds left are rounded up and never printed at 0."""
+    """{store: (acc, org)} once the app is running and the claude-code-sessions
+    store decides the start (C3, C5): the LATEST store-root load of that store
+    after `mark` names `account` (a later load of another account cancels it),
+    or a card of the CLI account's active org pair changed after this call began.
+    A process that is not running is never a start, whatever the log holds. The
+    agent store is only a note (named when silent or not of `account`) and alone
+    is never a start. None when the time is up. Prints a countdown at the start
+    and every 30 s (like wait_app_closed); the seconds left are rounded up."""
     t0 = time.monotonic()
     deadline = t0 + max(0.0, limit_s)
     last = -1
+    card_pair = active_cc_pair(paths, account)
+    before = card_mtimes(paths, card_pair) if card_pair else {}
     while True:
-        loads = heal_active.fresh_root_loads(paths, account, mark)
-        if all(s in loads for s in STORES):
-            return loads
+        if common.claude_app_running():
+            loads = heal_active.fresh_root_loads(paths, account, mark)
+            if STORES[0] not in loads:
+                card = fresh_card_pair(paths, account, before, card_pair)
+                if card:
+                    loads = dict(loads)
+                    loads[STORES[0]] = card
+            else:
+                loads = dict(loads)
+            if STORES[0] in loads:
+                silent = [x for x in STORES if x not in loads]
+                if silent:
+                    out.say(ru.START_PARTIAL % ", ".join(silent))
+                return loads
         now = time.monotonic()           # one reading for every decision below
         if now >= deadline:
             return None
@@ -173,6 +266,16 @@ def wait_app_start(paths, account, mark, limit_s, poll_s, out):
                 out.say(ru.START_WAIT % math.ceil(left))
             last = tick
         time.sleep(min(poll_s, max(0.01, left)))
+
+
+def start_timeout_text(running, missing, moved, state_dir):
+    """Final text of app_not_started: the cause, then what to do. Never a
+    rerun of the move: the data was checked before the start."""
+    head = (ru.START_TIMEOUT_NO_SIGNAL % ", ".join(missing) if running
+            else ru.START_TIMEOUT_NOT_RUNNING)
+    tail = ru.START_MOVED_TAIL if moved else ru.START_UNCHECKED_TAIL
+    return "%s %s\n    claude-account-move verify-start --state-dir %s" % (
+        head, tail, shlex.quote(state_dir))
 
 
 def only_active_pair_failed(rep):
@@ -725,8 +828,14 @@ def cmd_auto(args, cli):
             if loads is None:
                 step("app_start", False)
                 ctx["problem"] = ru.PROBLEM_START
-                return None, stop(EXIT_FAIL, "app_not_started", ru.START_TIMEOUT,
-                                  show_summary=True)
+                running = bool(common.claude_app_running())
+                got = heal_active.fresh_root_loads(paths, new_acc, mark)
+                missing = [x for x in STORES if x not in got]
+                moved = any(x["step"] == "finish_before_start" and x["ok"]
+                            for x in steps)
+                return None, stop(EXIT_FAIL, "app_not_started", start_timeout_text(
+                    running, missing, moved, paths.state), show_summary=True,
+                    app_running=running, missing_stores=missing)
             step("app_start", True, loads=sorted("%s/%s/%s" % (s, a, o)
                                                  for s, (a, o) in loads.items()))
             ctx["store_pairs"] = dict(loads)    # every later check: per store
@@ -749,7 +858,9 @@ def cmd_auto(args, cli):
                 step("app_closed", False)
                 ctx["finish"] = frep
                 ctx["problem"] = ru.PROBLEM_PAIR
-                return stop(EXIT_FAIL, "app_running", ru.APP_TIMEOUT, show_summary=True)
+                return stop(EXIT_FAIL, "app_running", ru.APP_TIMEOUT_AFTER % (
+                    shlex.quote(paths.state), shlex.quote(paths.state)),
+                    show_summary=True)
             # a loaded pair that is missing or not a directory cannot be healed
             for store in st.STORES:
                 if store in loads and heal_active.loaded_pair_problem(
@@ -812,3 +923,82 @@ def cmd_auto(args, cli):
         return flow()
     except st.PairError as exc:
         return stop(EXIT_INPUT, "input_error", ru.BAD_PAIR % exc)
+
+
+def cmd_verify_start(args, cli):
+    """Read-only check that the app runs under the account of the CLI: a Loaded
+    line already in main.log counts (the app may have started long ago), the
+    pair it loaded must be a real directory. No login, prepare, stamp or sync.
+    Writes report-verify-start.json into the newest move dir."""
+    started = time.monotonic()
+    out = cli.Out.of(args)
+    paths = cli.make_paths(args)
+    prob = state_dir_problem(paths)
+    if prob:
+        return cli.fail(args, out, "verify-start", started, EXIT_INPUT,
+                        "input_error", "error: " + prob)
+    name = _newest_move_name(paths)
+    mdir = os.path.join(snap.moves_dir(paths), name) if name else None
+    out.say(ru.VS_TITLE)
+    ident = read_identity(paths)
+    acc = (ident.get("cli") or {}).get("value")
+    if not acc:
+        return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                        "no_account", ru.VS_NO_ACCOUNT, mdir)
+    # C1: the desktop app must be on the account of the CLI
+    app_acc = (ident.get("app") or {}).get("value")
+    if app_acc != acc:
+        text = ru.VS_WRONG_ACCOUNT % (STORES[0], app_acc or "?")
+        return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                        "wrong_account", text, mdir)
+    # C4: the active org dir must exist, nothing else is guessed
+    cli_org = ident.get("cli_org")
+    acc_dir = None
+    try:
+        acc_dir = next((n for n in os.listdir(os.path.join(paths.support, STORES[0]))
+                        if n.lower() == acc.lower()), None)
+    except OSError:
+        pass
+    if not cli_org or not acc_dir or not os.path.lexists(
+            os.path.join(paths.support, STORES[0], acc_dir, cli_org)):
+        text = ru.VS_NO_ORG_DIR % os.path.join(paths.support, STORES[0], acc_dir or acc,
+                                                cli_org or "?")
+        return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                        "bad_pair", text, mdir)
+    poll = _poll(START_POLL_S, "CLAUDE_ACCOUNT_MOVE_START_POLL_S")
+    loads = wait_app_start(paths, acc, (None, 0), getattr(args, "wait_start", 0.0),
+                           poll, out)
+    if loads is None:
+        running = bool(common.claude_app_running())
+        missing = list(STORES)
+        text = start_timeout_text(running, missing, True, paths.state)
+        return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                        "app_not_started", text, mdir, app_running=running,
+                        missing_stores=missing)
+    # the pair of the deciding store must be real from the store root down
+    final = dict(loads)
+    for store in STORES:
+        if store in final:
+            why = real_pair_problem(paths, store, final[store])
+            if why:
+                text = ru.VS_BAD_PAIR % (store, heal_active.pair_path(
+                    paths, store, final[store]), why)
+                return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                                "bad_pair", text, mdir, app_running=True,
+                                loads=sorted("%s/%s/%s" % (s2, a, o)
+                                             for s2, (a, o) in final.items()))
+    # C2: the app must still be running after every other check
+    running = bool(common.claude_app_running())
+    if not running:
+        missing = [x for x in STORES if x not in final]
+        text = start_timeout_text(False, missing, True, paths.state)
+        return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                        "app_not_started", text, mdir, app_running=False,
+                        missing_stores=missing)
+    out.say(ru.VS_OK)
+    cli.emit(args, out, cli._report(
+        "verify-start", EXIT_OK, "ok", started, app_running=True,
+        missing_stores=[x for x in STORES if x not in final],
+        loads=sorted("%s/%s/%s" % (s2, a, o) for s2, (a, o) in final.items()),
+        write_verified=False), mdir)
+    return EXIT_OK
