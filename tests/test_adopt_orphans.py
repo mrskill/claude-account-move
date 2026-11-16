@@ -45,6 +45,10 @@ from claude_account_move import cli, common  # noqa: E402
 CMD = "adopt"
 STUB_OPEN = os.path.join(HERE, "stub_pgrep_open.sh")
 PARSE_ERROR = 2
+NO_CARD = "\u0431\u0435\u0437 \u043a\u0430\u0440\u0442\u043e\u0447\u043a\u0438"
+CHECK_NAME = "\u0441\u0435\u0441\u0441\u0438\u0438 " + NO_CARD
+PROBLEM = "[\u041f\u0420\u041e\u0411\u041b\u0415\u041c\u0410]"
+NOTE_RE = "(?i)orphan|\u0431\u0435\u0437 \u043a\u0430\u0440\u0442\u043e\u0447|\u0441\u0435\u0441\u0441\u0438|vanish|\u043f\u0440\u043e\u043f\u0430\u0434|\u0438\u0441\u0447\u0435\u0437"
 EXIT_FAIL = 3
 
 
@@ -522,7 +526,7 @@ class G1Prepare(Base):
         self.assertIn("video pipeline for the song", out)
         self.assertIn("second lost session", out)
         lines = [l for l in out.splitlines() if re.search(r"\b2\b", l)
-                 and re.search(u"(?i)orphan|без карточ|сесси|vanish|пропад|исчез", l)]
+                 and re.search(NOTE_RE, l)]
         self.assertTrue(lines, "the count 2 is on a line about the sessions: " + out)
 
     def test_g1_prepare_without_orphans_says_nothing_of_them(self):
@@ -583,13 +587,13 @@ class G3Finish(Base):
         out = r.stdout + r.stderr
         self.assertNotEqual(r.returncode, 0, out)
         self.assertNotEqual(r.returncode, PARSE_ERROR, out)
-        self.assertIn(u"сессии без карточки", out)
-        self.assertIn(u"[ПРОБЛЕМА]", out)
+        self.assertIn(CHECK_NAME, out)
+        self.assertIn(PROBLEM, out)
         shown = [p for p in prompts if p in out]
         self.assertEqual(len(shown), 5, "up to 5 are named by first prompt: %s" % shown)
         rep = json.loads(r.stdout)
-        chk = [c for c in rep["checks"] if u"без карточки" in (c.get("detail", "") + c.get("id", ""))
-               or u"без карточки" in str(c)]
+        chk = [c for c in rep["checks"] if NO_CARD in (c.get("detail", "") + c.get("id", ""))
+               or NO_CARD in str(c)]
         self.assertTrue(chk and not chk[0]["ok"], rep["checks"])
         self.assertTrue(re.search(r"\b6\b", chk[0]["detail"]), "the total is named: " + str(chk[0]))
 
@@ -598,7 +602,7 @@ class G3Finish(Base):
         r = self.h.run("finish", "--wait-login", "3", "--json")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         rep = json.loads(r.stdout)
-        chk = [c for c in rep["checks"] if u"без карточки" in str(c)]
+        chk = [c for c in rep["checks"] if NO_CARD in str(c)]
         self.assertTrue(chk and chk[0]["ok"], "the check exists and is ok: %s" % rep["checks"])
 
 
