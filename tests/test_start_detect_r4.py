@@ -126,9 +126,9 @@ class C4NoFallback(VerifyBase):
         append_log(self.h, loaded_line(self.h, CC, acc=B, org=org_x))
         code, out, err = self.run_verify(True)
         self.assertNotEqual(self.verdict()["verdict"], "bad_pair", out + err)
-        low = (out + err).lower().replace(u"ё", u"е")
-        self.assertIn(u"нет папки актив"
-                      u"ной организации", low,
+        low = (out + err).lower().replace(u"\u0451", u"\u0435")
+        self.assertIn(u"\u043d\u0435\u0442 \u043f\u0430\u043f\u043a\u0438 \u0430\u043a\u0442\u0438\u0432"
+                      u"\u043d\u043e\u0439 \u043e\u0440\u0433\u0430\u043d\u0438\u0437\u0430\u0446\u0438\u0438", low,
                       "the missing CLI org dir is printed as a note")
 
     def test_c4_verify_start_missing_cli_org_dir_is_bad_pair(self):
