@@ -651,15 +651,26 @@ def latest_loaded_pair(paths, account, store=STORES[0], mark=(None, 0)):
         return None
     best = None
     for line, s, a, o in root_load_events(paths, mark):
-        if s == store and a == acc:
+        if s == store:             # K2': the LATEST load of the store, any account
             best = (line, a, o)
-    if best is None:
+    if best is None or best[1] != acc:
         return None
     m = _LINE_TS.match(best[0])
     when = m.group(1).replace("T", " ") if m else "time unknown"
     return {"pair": (best[1], best[2]),
             "source": "the latest \"Loaded N persisted sessions\" line of the "
                       "app log (main.log, %s)" % when}
+
+
+def loaded_by_another(paths, account, store=STORES[0], mark=(None, 0)):
+    """True when the latest load of `store` after the latest launch line names an
+    account other than `account` (K2': the app runs that one; no pair exists)."""
+    acc = account.lower() if account else None
+    last = None
+    for _line, s, a, _o in root_load_events(paths, mark):
+        if s == store:
+            last = a
+    return last is not None and last != acc
 
 
 def fresh_root_loads(paths, acc, mark):

@@ -240,6 +240,10 @@ def active_pair(paths, identity, override=None):
                                                            cli_acc.lower()))
     else:
         want = None
+        if heal_active.loaded_by_another(paths, cli_acc):
+            raise PairProblem("the app loaded another account last, so it does "
+                              "not run the CLI account %s: nothing is written"
+                              % cli_acc.lower())
         hit = heal_active.latest_loaded_pair(paths, cli_acc)
         if hit:
             want = hit["pair"]

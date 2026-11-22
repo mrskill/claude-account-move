@@ -736,6 +736,10 @@ def cmd_sync(args):
         return fail(args, out, "sync", started, EXIT_FAIL, "no_target",
                     "the app account is not readable: nothing to sync to")
     pair_notes = []
+    if not args.active_pair and heal_active.loaded_by_another(paths, target):
+        return fail(args, out, "sync", started, EXIT_FAIL, "no_target",
+                    "the app loaded another account last, so it does not run "
+                    "the target account: nothing is written")
     hit = None if args.active_pair else heal_active.latest_loaded_pair(paths, target)
     if hit:                  # F1: the pair the app loaded, not the last mention
         pair = tuple(hit["pair"])
