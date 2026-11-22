@@ -595,13 +595,14 @@ def log_mark(paths):
     return (sb.st_ino, sb.st_size)
 
 
-def latest_root_loads(paths, mark=(None, 0)):
-    """{store: (acc, org)} of the LATEST store-root load per store (same
-    definition as _root_loads), of any account, in the bytes appended to
-    main.log after `mark` (from log_mark; (None, 0) is the whole log). A log
-    whose inode changed or that is shorter than the mark (rotated, truncated)
-    counts as all new. No clock decides."""
-    found = {}
+def root_load_events(paths, mark=(None, 0)):
+    """[(line, store, acc, org)] of every store-root load (same definition as
+    _root_loads) in the bytes appended to main.log after `mark` (from
+    log_mark; (None, 0) is the whole log), oldest first. A log whose inode
+    changed or that is shorter than the mark (rotated, truncated) counts as all
+    new. This is the ONE reader of the app log's "Loaded N persisted sessions
+    from <store>/<acc>/<org>" lines: the functions below, adopt, finish, the
+    post-move check and verify-start all go through it."""
     ino, size = mark
     try:
         with open(paths.main_log, "rb") as fh:
@@ -610,11 +611,40 @@ def latest_root_loads(paths, mark=(None, 0)):
             fh.seek(start)
             text = fh.read().decode("utf-8", "ignore")
     except OSError:
-        return found
-    for line in text.splitlines():
-        for store, a, o in _root_loads(line):
-            found[store] = (a, o)
+        return []
+    return [(line, store, a, o) for line in text.splitlines()
+            for store, a, o in _root_loads(line)]
+
+
+def latest_root_loads(paths, mark=(None, 0)):
+    """{store: (acc, org)} of the LATEST store-root load per store, of any
+    account, after `mark`. No clock decides."""
+    found = {}
+    for _line, store, a, o in root_load_events(paths, mark):
+        found[store] = (a, o)
     return found
+
+
+def latest_loaded_pair(paths, account, store=STORES[0], mark=(None, 0)):
+    """The pair the APP loads for `account` in `store`: the latest "Loaded N
+    persisted sessions from <store>/<acc>/<org>" line of the app log (after
+    `mark`) that names `account`. A load of another account is never used.
+    Returns {"pair": (acc, org), "source": text} or None when the log holds no
+    such line ("pair not seen in the app log")."""
+    acc = account.lower() if account else None
+    if not acc:
+        return None
+    best = None
+    for line, s, a, o in root_load_events(paths, mark):
+        if s == store and a == acc:
+            best = (line, a, o)
+    if best is None:
+        return None
+    m = _LINE_TS.match(best[0])
+    when = m.group(1).replace("T", " ") if m else "time unknown"
+    return {"pair": (best[1], best[2]),
+            "source": "the latest \"Loaded N persisted sessions\" line of the "
+                      "app log (main.log, %s)" % when}
 
 
 def fresh_root_loads(paths, acc, mark):

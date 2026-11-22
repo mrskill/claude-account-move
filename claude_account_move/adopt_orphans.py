@@ -34,6 +34,7 @@ import stat
 import time
 import uuid
 
+from . import heal_active
 from . import panel_snapshot as snap
 from . import store as st
 from .common import (CARD_PREFIX, STORES, TRANSCRIPT_RE, fmt_ms, inside,
@@ -204,20 +205,37 @@ def describe(o):
 # --------------------------------------------------------------- active pair ---
 
 def active_pair(paths, identity, override=None):
-    """(acc dir, org dir) of the active claude-code-sessions pair, or raise
-    PairProblem with a plain reason."""
+    """((acc dir, org dir), source text) of the pair to write into, or raise
+    PairProblem with a plain reason. The pair is the one the APP loads for the
+    CLI account (the latest "Loaded N persisted sessions" line of the app log,
+    heal_active.latest_loaded_pair); never another account's pair (A9)."""
     from . import auto_move              # late: auto_move imports this module
+    source = None
     if override:
         want = st.parse_override(override)
+        source = "--active-pair"
     else:
         want = None
+        cli_acc = (identity.get("cli") or {}).get("value")
         app_acc = (identity.get("app") or {}).get("value")
-        if app_acc:                    # the pair the app log names, as sync does
-            want = st.live_pair(paths, account=app_acc)
-        if want is None:               # else the organization of the CLI account
-            cli_pair = auto_move.active_cc_pair(
-                paths, (identity.get("cli") or {}).get("value"))
-            want = tuple(x.lower() for x in cli_pair) if cli_pair else None
+        hit = None
+        for acc in (cli_acc, app_acc):     # the CLI account first, then the app's
+            hit = hit or heal_active.latest_loaded_pair(paths, acc)
+        if hit:
+            want = hit["pair"]
+            source = hit["source"]
+        else:                          # no Loaded line for the CLI account
+            if app_acc:                # the pair the app log names, as sync does
+                want = st.live_pair(paths, account=app_acc)
+                if want:
+                    source = ("pair not seen in the app log (no Loaded line for "
+                              "this account); the last pair the app log mentions")
+            if want is None:           # else the organization of the CLI account
+                cli_pair = auto_move.active_cc_pair(paths, cli_acc)
+                want = tuple(x.lower() for x in cli_pair) if cli_pair else None
+                if want:
+                    source = ("pair not seen in the app log (no Loaded line for "
+                              "this account); the organization of the CLI account")
     if want is None:
         raise PairProblem("no active pair of claude-code-sessions is known (the "
                           "app log and the CLI account name none): nothing to "
@@ -240,7 +258,7 @@ def active_pair(paths, identity, override=None):
     if why:
         raise PairProblem("the active pair is not a plain directory (%s); "
                           "run heal-active first" % why)
-    return pair
+    return pair, source
 
 
 def pick_template(pair_dir):

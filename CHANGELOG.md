@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- the pair the program judges and writes into is the pair the APP loads (contract
+  item A9): the latest "Loaded N persisted sessions from <store>/<acc>/<org>"
+  line of the app log for the account, never another account's pair. One shared
+  reader, `heal_active.latest_loaded_pair` (on `root_load_events`), is used by
+  `adopt`, the post-move check (`finish`) and `verify-start`. `adopt --apply`
+  prints "pair used: <acc>/<org> (source: ...)". `finish` judges target_names,
+  lagging and tasks on that pair and, when it differs from the last pair the log
+  mentions, prints both in a note. With no Loaded line for the account the
+  check says "pair not seen in the app log" and claims no loss.
+
 - `adopt` (CAM-ADOPT-ORPHANS, judge contract A1-A8, G1-G3): a session with a
   real user prompt, a `session-owner` line or a version-5 id and no card in any
   store (any account, any organization) is invisible to prepare, finish and the

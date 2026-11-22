@@ -12,6 +12,7 @@ import os
 from datetime import datetime
 
 from . import adopt_orphans
+from . import heal_active
 from . import panel_snapshot as snap
 from . import post_move_verify as verify
 from . import pre_move_check as pre
@@ -154,8 +155,24 @@ def evaluate(paths, before, index, tmap, identity, target, source,
     pair_notes = []
     pair = st.live_pair(paths, account=target, override=active_override,
                         index=index, notes=pair_notes, command="finish")
+    mentioned = pair
+    pair_unseen = False
+    unseen_any = False
     if store_pairs and STORES[0] in store_pairs:
         pair = store_pairs[STORES[0]]       # the pair THIS store loaded
+    elif not active_override:
+        # A9: the pair the app LOADS for the target account decides, not the
+        # last plain mention of the log
+        hit = heal_active.latest_loaded_pair(paths, target)
+        if hit:
+            pair = hit["pair"]
+        else:
+            pair_unseen = True
+    if pair and mentioned and tuple(pair) != tuple(mentioned):
+        pair_notes = []
+        notes.append("judged on the pair the app loaded, %s/%s; the last pair the "
+                     "app log mentions is %s/%s" % (pair[0], pair[1],
+                                                    mentioned[0], mentioned[1]))
     active_dir = st.pair_dir(paths, pair[0], pair[1]) if pair else None
     cc = index.stores[STORES[0]]
     if active_dir and active_dir not in cc.dirs:
@@ -223,6 +240,14 @@ def evaluate(paths, before, index, tmap, identity, target, source,
                          if r not in t_set and r not in lag_wait}
         lag_loss = {r: m for r, m in lag_eff.items()
                     if r not in lag_wait and r not in lag_noted}
+        # No Loaded line names the target pair, and the pair judged instead (the
+        # last mention) holds nothing at all: that is the sign of a pair the app
+        # does not load (case 20.11.2026), so no loss is claimed from it.
+        unseen_empty = bool(pair_unseen and t_names is not None
+                            and not t_names and missing_in_target)
+        if unseen_empty:
+            unseen_any = True
+            lag_loss = {}        # the target pair is unknown: no lagging claim
         lag_noted_names = len({n for m in lag_noted.values() for n in m})
         empty_cid_target = 0
         for r in t_dirs:
@@ -324,7 +349,21 @@ def evaluate(paths, before, index, tmap, identity, target, source,
                 waiting = True
             else:
                 lost = True
-        if missing_in_target:
+        if unseen_empty:
+            _check(checks, "%s:target_names" % name, True,
+                   "NOT MEASURED: pair not seen in the app log, so no claim is "
+                   "made about the target pair (open the app, then run finish "
+                   "again)")
+            lag_loss = {}
+            # not measured is not success: the move is not proven, but no loss
+            # is claimed; the "app_pair_seen" check below carries the failure
+            if missing_anywhere:
+                lost = True
+            elif sync_alive:
+                waiting = True
+            else:
+                lost = True
+        elif missing_in_target:
             _check(checks, "%s:target_names" % name, False,
                    "%d of %d names missing in the target pair (present elsewhere: %s)"
                    % (len(missing_in_target), len(names_before),
@@ -363,10 +402,23 @@ def evaluate(paths, before, index, tmap, identity, target, source,
                    "target directory still receiving names (sync job alive)")
             waiting = True
 
+    if unseen_any:
+        _check(checks, "app_pair_seen", False,
+               "pair not seen in the app log: the pair the app loads for this "
+               "account is unknown, so the move is not proven yet and no loss is "
+               "claimed; open the Claude app, wait for it to load, run finish "
+               "again")
     tmissing, ttotal = verify.compare_tasks(before, index, target, active_dir)
-    _check(checks, "tasks", not tmissing,
-           "%d of %d recorded scheduled tasks missing in the target%s"
-           % (len(tmissing), ttotal, ": " + ", ".join(tmissing[:5]) if tmissing else ""))
+    if unseen_any and tmissing:
+        _check(checks, "tasks", True,
+               "NOT MEASURED: pair not seen in the app log, so no claim is made "
+               "about the recorded scheduled tasks")
+        tmissing = []
+    else:
+        _check(checks, "tasks", not tmissing,
+               "%d of %d recorded scheduled tasks missing in the target%s"
+               % (len(tmissing), ttotal,
+                  ": " + ", ".join(tmissing[:5]) if tmissing else ""))
     lost |= bool(tmissing)
 
     changed, now_settings = verify.compare_settings(before, paths)

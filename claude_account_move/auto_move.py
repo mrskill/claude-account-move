@@ -449,7 +449,11 @@ def syncable(rep):
     """
     failed = [c["id"] for c in (rep.get("checks") or []) if not c["ok"]
               and c["id"] != "sessions_no_card"]      # orphans are adopted, not synced
-    if not any(i.endswith(":target_names") for i in failed):
+    # "app_pair_seen": no Loaded line named the target pair, so the empty target
+    # is not judged as loss; cards are still delivered the same way
+    unseen = "app_pair_seen" in failed
+    failed = [i for i in failed if i != "app_pair_seen"]
+    if not unseen and not any(i.endswith(":target_names") for i in failed):
         return False
     if not all(":" in i and i.split(":", 1)[1] in SYNC_FIXABLE for i in failed):
         return False

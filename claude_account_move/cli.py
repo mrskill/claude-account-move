@@ -1066,7 +1066,11 @@ def cmd_adopt(args):
                                 write_verified=False, **base))
         return EXIT_OK
     try:
-        pair = adopt_orphans.active_pair(paths, read_identity(paths), args.active_pair)
+        pair, pair_source = adopt_orphans.active_pair(
+            paths, read_identity(paths), args.active_pair)
+        out.say("pair used: %s/%s (source: %s)" % (pair[0], pair[1], pair_source))
+        base["pair_used"] = "%s/%s" % (pair[0], pair[1])
+        base["pair_source"] = pair_source
         pair_dir = os.path.join(paths.support, st.STORES[0], pair[0], pair[1])
         tpl_path, tpl = adopt_orphans.pick_template(pair_dir)
     except adopt_orphans.PairProblem as exc:
