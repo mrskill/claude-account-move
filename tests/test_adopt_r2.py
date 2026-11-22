@@ -203,7 +203,12 @@ class F2LaunchBoundary(a9.FinishBase):
 
 class F3NoLossWithoutLoaded(a9.FinishBase):
     def only_plain_mentions(self):
+        # ruling R2-C case (ii): after the launch line a Loaded line names a pair
+        # of ANOTHER account (A), none names the CLI account (B); the last plain
+        # mention is the empty pair of B
         self.h.log_file("main.log", [plain(CC, A, O1, ts="2026-11-22 08:00:00"),
+                                     "2026-11-22 09:59:00 info: app starting",
+                                     loaded(self.h, CC, A, O1, n=3),
                                      plain(CC, B, O2)])
 
     def test_f3_partial_pair_claims_no_loss(self):
@@ -236,6 +241,33 @@ class F3NoLossWithoutLoaded(a9.FinishBase):
         self.assertIn(PHRASE_NOT_SEEN, text)
         self.assertNotEqual(r.returncode, 0,
                             "an unproven pair is not a proven move: " + r.stdout)
+
+
+# --- R2-C case (iii): no Loaded line at all, the last mention is judged ----------
+
+class F3IiiNoLoadedAtAll(a9.FinishBase):
+    PHRASE_BY_MENTION = "pair not seen in the app log, judged by the last mention"
+
+    def test_r2c_iii_plain_mentions_only_judged_by_last_mention_loss_stays(self):
+        """Ruling R2-C (iii): an app log with plain mentions and no Loaded line at
+        all. Finish prints the phrase on its own line and judges the pair of the
+        last mention as before: that pair (B/O2) is empty, so the loss claim
+        stays (target_names not ok, exit not 0)."""
+        self.moved_world(with_sync_to_loaded=False)      # B/O2 holds nothing
+        self.h.log_file("main.log", [plain(CC, A, O1, ts="2026-11-22 08:00:00"),
+                                     plain(CC, B, O2)])
+        r, ids = self.finish_json()
+        t = self.h.run("finish", "--wait-login", "0")
+        text = t.stdout + t.stderr
+        own_line = [ln for ln in text.splitlines()
+                    if self.PHRASE_BY_MENTION in ln]
+        self.assertTrue(own_line, "the case (iii) phrase is missing: " + text)
+        chk = ids.get(CC + ":target_names")
+        self.assertIsNotNone(chk, "target_names is judged on the last-mention "
+                             "pair: %s" % sorted(ids))
+        self.assertFalse(chk["ok"], "the loss claim stays for an empty last-mention "
+                         "pair: %s" % chk)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
 # --- F4: title ------------------------------------------------------------------

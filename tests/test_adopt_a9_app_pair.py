@@ -164,8 +164,11 @@ class A9cPairNotSeen(FinishBase):
     def test_a9c_no_loaded_line_says_pair_not_seen_and_claims_no_loss(self):
         self.moved_world(with_sync_to_loaded=False)   # target pair B/O2 is empty
         h = self.h
-        # only plain mentions: no `Loaded ... from <store>/B/<org>` line at all
+        # ruling R2-C case (ii): after the launch line a Loaded line names a pair
+        # of ANOTHER account (A); no Loaded line names the CLI account (B)
         h.log_file("main.log", [plain(CC, A, O1, ts="2026-11-22 08:00:00"),
+                                "2026-11-22 09:59:00 info: app starting",
+                                loaded(h, CC, A, O1, n=3),
                                 plain(CC, B, O2)])
         r, ids = self.finish_json()
         out = r.stdout + r.stderr
