@@ -243,8 +243,9 @@ def evaluate(paths, before, index, tmap, identity, target, source,
         # No Loaded line names the target pair, and the pair judged instead (the
         # last mention) holds nothing at all: that is the sign of a pair the app
         # does not load (case 20.11.2026), so no loss is claimed from it.
-        unseen_empty = bool(pair_unseen and t_names is not None
-                            and not t_names and missing_in_target)
+        # F3 (A9 c): whatever the guessed pair holds (empty, partial, full), no
+        # Loaded line means the pair is unproven and no loss is claimed from it.
+        unseen_empty = bool(pair_unseen and t_names is not None)
         if unseen_empty:
             unseen_any = True
             lag_loss = {}        # the target pair is unknown: no lagging claim
@@ -486,6 +487,9 @@ def evaluate(paths, before, index, tmap, identity, target, source,
     if orphans:
         detail = "[%s] %s" % (ru.TAG_BAD, ru.NO_CARD_BAD % (
             len(orphans), "; ".join(o["first"] for o in orphans[:5])))
+        # F11: name the exact command that returns them (the app closed)
+        detail += ru.NO_CARD_CMD % (
+            "./claude-account-move adopt --apply --state-dir %s" % paths.state)
     else:
         detail = ru.NO_CARD_OK % len(tmap)
     checks.append({"id": "sessions_no_card", "name": ru.NO_CARD_NAME,

@@ -24,6 +24,7 @@ ENOTDIR_MAX_AGE_S = 2 * 24 * 3600
 FROM_LOG_MAX_AGE_S = 10 * 60
 LOG_TAIL_BYTES = 8 * 1024 * 1024
 _LINE_TS = re.compile(r"^\s*\[?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
+_LAUNCH_RE = re.compile(r"(?i)\bapp starting\b")
 _PAIR_PATH = re.compile(r"(claude-code-sessions|local-agent-mode-sessions)/"
                         r"([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})")
 
@@ -612,7 +613,13 @@ def root_load_events(paths, mark=(None, 0)):
             text = fh.read().decode("utf-8", "ignore")
     except OSError:
         return []
-    return [(line, store, a, o) for line in text.splitlines()
+    lines = text.splitlines()
+    # F2: a load before the latest app launch line belongs to a dead process
+    for i in range(len(lines) - 1, -1, -1):
+        if _LAUNCH_RE.search(lines[i]):
+            lines = lines[i + 1:]
+            break
+    return [(line, store, a, o) for line in lines
             for store, a, o in _root_loads(line)]
 
 

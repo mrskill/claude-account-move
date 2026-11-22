@@ -74,11 +74,16 @@ def card_ids(index):
 
 
 def _head_has_owner(path):
+    """True when a `session-owner` line is anywhere in the transcript (F10): the
+    file is read line by line and the read stops at the first match."""
     try:
         with open(path, "rb") as fh:
-            return bool(OWNER_RE.search(fh.read(HEAD_BYTES)))
+            for raw in fh:
+                if OWNER_RE.search(raw):
+                    return True
     except OSError:
         return False
+    return False
 
 
 def _real_prompt(rec):
@@ -99,8 +104,9 @@ def read_transcript(path):
     prompts = 0
     cwd = None
     first_ms = last_ms = None
-    custom = ai = None
+    title = None                  # the latest title line of either kind wins (F4)
     try:
+        mtime_ms = os.stat(path).st_mtime_ns // 1000000
         with open(path, "rb") as fh:
             for raw in fh:
                 raw = raw.strip()
@@ -123,11 +129,11 @@ def read_transcript(path):
                 if kind == "custom-title":
                     t = rec.get("customTitle") or rec.get("title")
                     if isinstance(t, str) and t.strip():
-                        custom = t
+                        title = t
                 elif kind == "ai-title":
                     t = rec.get("aiTitle") or rec.get("title")
                     if isinstance(t, str) and t.strip():
-                        ai = t
+                        title = t
                 text = _real_prompt(rec)
                 if text is not None:
                     prompts += 1
@@ -137,9 +143,12 @@ def read_transcript(path):
         return None
     if not prompts:
         return None
-    title = custom or ai or first_prompt
+    # a ready title is never cut; only the first-prompt fallback is (F4)
+    title = _squash(title, None) if title else _squash(first_prompt, TITLE_CUT)
+    if first_ms is None:            # no readable timestamp: the file mtime (F5)
+        first_ms = last_ms = mtime_ms
     return {"cwd": cwd, "first": _squash(first_prompt, FIRST_SHOWN),
-            "title": _squash(title, TITLE_CUT), "prompts": prompts,
+            "title": title, "prompts": prompts,
             "created_ms": first_ms, "last_ms": last_ms}
 
 
@@ -211,22 +220,31 @@ def active_pair(paths, identity, override=None):
     heal_active.latest_loaded_pair); never another account's pair (A9)."""
     from . import auto_move              # late: auto_move imports this module
     source = None
+    cli_acc = (identity.get("cli") or {}).get("value")
+    app_acc = (identity.get("app") or {}).get("value")
+    if not cli_acc:                       # F9: the CLI account decides everything
+        raise PairProblem("the account of the CLI is not readable: nothing is "
+                          "written")
     if override:
         want = st.parse_override(override)
         source = "--active-pair"
+        if want[0] != cli_acc.lower():
+            raise PairProblem("--active-pair %s/%s belongs to another account "
+                              "than the CLI account %s" % (want[0], want[1],
+                                                           cli_acc.lower()))
     else:
+        if app_acc and app_acc.lower() != cli_acc.lower():
+            raise PairProblem("the app is on account %s but the CLI is on %s: "
+                              "sign in to the app with the CLI account first"
+                              % (app_acc.lower(), cli_acc.lower()))
         want = None
-        cli_acc = (identity.get("cli") or {}).get("value")
-        app_acc = (identity.get("app") or {}).get("value")
-        hit = None
-        for acc in (cli_acc, app_acc):     # the CLI account first, then the app's
-            hit = hit or heal_active.latest_loaded_pair(paths, acc)
+        hit = heal_active.latest_loaded_pair(paths, cli_acc)
         if hit:
             want = hit["pair"]
             source = hit["source"]
         else:                          # no Loaded line for the CLI account
             if app_acc:                # the pair the app log names, as sync does
-                want = st.live_pair(paths, account=app_acc)
+                want = st.live_pair(paths, account=cli_acc)
                 if want:
                     source = ("pair not seen in the app log (no Loaded line for "
                               "this account); the last pair the app log mentions")
@@ -361,14 +379,47 @@ def _tmp_name(pair_dir, n):
         TMP_PREFIX, os.getpid(), n, uuid.uuid4().hex[:6]))
 
 
-def apply_plan(paths, orphans, pair, template_path, template):
-    """Write one card per orphan. Returns {"journal","created","refused",
+def open_pair(paths, pair):
+    """(real path, directory fd) of the pair, resolved ONCE (F9): every later
+    write goes through the fd, so a pair swapped for a link afterwards is never
+    followed. The caller closes the fd."""
+    pair_real = os.path.realpath(os.path.join(paths.support, STORES[0],
+                                              pair[0], pair[1]))
+    if not inside(pair_real, os.path.realpath(paths.support)):
+        raise PairProblem("the active pair resolves outside the support folder")
+    try:
+        dfd = os.open(pair_real, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                      | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise PairProblem("cannot open the active pair: %s" % exc)
+    return pair_real, dfd
+
+
+def check_pair_unchanged(pair_real, dfd):
+    """Refuse when the path no longer names the directory the fd holds."""
+    try:
+        now = os.lstat(pair_real)
+        held = os.fstat(dfd)
+    except OSError as exc:
+        raise PairProblem("the active pair changed while it was being read: %s" % exc)
+    if stat.S_ISLNK(now.st_mode) or (now.st_dev, now.st_ino) != (held.st_dev,
+                                                                  held.st_ino):
+        raise PairProblem("the active pair was replaced while it was being read: "
+                          "nothing written")
+
+
+def _quiet_unlink(name, dfd):
+    try:
+        os.unlink(name, dir_fd=dfd)
+    except OSError:
+        pass
+
+
+def apply_plan(paths, orphans, pair, template_path, template, pair_dir, dfd):
+    """Write one card per orphan into the directory held by `dfd` (`pair_dir` is
+    its real path, for the journal). Returns {"journal","created","refused",
     "failed","entries"}. `created` entries carry the path, name and orphan id."""
     jdir = safe_subdir(paths)
-    pair_dir = os.path.realpath(os.path.join(paths.support, STORES[0], pair[0], pair[1]))
-    support_real = os.path.realpath(paths.support)
-    if not inside(pair_dir, support_real):
-        raise PairProblem("the active pair resolves outside the support folder")
     mode = stat.S_IMODE(os.stat(template_path).st_mode)
     op_id = uuid.uuid4().hex
     jr = Journal(new_journal_path(jdir), op_id, snap.path_id(paths.home))
@@ -388,31 +439,41 @@ def apply_plan(paths, orphans, pair, template_path, template):
                      sha256=digest, tmp=tmp)           # journaled before the write
             entry = {"orphan": o["id"], "name": name, "path": final,
                      "sha256": digest}
+            tname = os.path.basename(tmp)
             try:
-                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                             0o600)
-                with os.fdopen(fd, "wb") as fh:
-                    fh.write(data)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.chmod(tmp, mode)
                 try:
-                    os.link(tmp, final)                # never replaces an existing name
-                except FileExistsError:
-                    entry["status"] = "refused"
-                    jr.write("refused", orphan=o["id"], name=name, path=final,
-                             why="the name exists")
-                    refused.append(entry)
-                    entries.append(entry)
-                    continue
-                finally:
+                    fd = os.open(tname, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(data)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.chmod(tname, mode, dir_fd=dfd)
                     try:
-                        os.unlink(tmp)
-                    except OSError:
-                        pass
-                if sha256_file(final) != digest:
+                        # never replaces an existing name
+                        os.link(tname, name, src_dir_fd=dfd, dst_dir_fd=dfd,
+                                follow_symlinks=False)
+                    except FileExistsError:
+                        entry["status"] = "refused"
+                        jr.write("refused", orphan=o["id"], name=name, path=final,
+                                 why="the name exists")
+                        refused.append(entry)
+                        entries.append(entry)
+                        continue
+                finally:
+                    _quiet_unlink(tname, dfd)          # F8: no temp file stays
+                rfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+                try:
+                    h = hashlib.sha256()
+                    with os.fdopen(os.dup(rfd), "rb") as rfh:
+                        for chunk in iter(lambda: rfh.read(1 << 20), b""):
+                            h.update(chunk)
+                    ino = os.fstat(rfd).st_ino
+                finally:
+                    os.close(rfd)
+                if h.hexdigest() != digest:
                     raise OSError("the card read back differs from what was written")
-                entry["inode"] = os.stat(final).st_ino
+                entry["inode"] = ino
                 entry["status"] = "created"
                 jr.write("done", orphan=o["id"], name=name, path=final,
                          sha256=digest, inode=entry["inode"])
@@ -453,8 +514,9 @@ def undo(paths, journal):
     """Remove the cards this journal created, when unchanged (same sha256 and
     inode). Returns {"removed","gone","ambiguous","removed_paths","ambiguous_paths"}."""
     recs = _read_journal(journal, paths)
+    begin_op = str(recs[0].get("op_id"))[:12]
     support_real = os.path.realpath(paths.support)
-    done = {r["path"]: r for r in recs if r.get("op") == "done"
+    done ={r["path"]: r for r in recs if r.get("op") == "done"
             and isinstance(r.get("path"), str)}
     intents = {r["path"]: r for r in recs if r.get("op") == "intent"
                and isinstance(r.get("path"), str)}
@@ -476,22 +538,54 @@ def undo(paths, journal):
         if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
             ambiguous.append(path)
             continue
+        # F7: check and removal are one atomic step. The file is renamed to a
+        # quarantine name first; inode and sha256 are verified on the renamed
+        # file; only then it is deleted, else it is put back without replacing
+        # anything and reported as ambiguous.
+        quarantine = os.path.join(os.path.dirname(path), "%sundo-%s-%s" % (
+            TMP_PREFIX, begin_op, uuid.uuid4().hex[:8]))
         try:
-            same = (sha256_file(path) == rec.get("sha256")
-                    and lst.st_ino == rec.get("inode"))
+            os.rename(path, quarantine)
+        except FileNotFoundError:
+            gone += 1
+            continue
         except OSError:
-            same = False
-        if not same:
             ambiguous.append(path)
             continue
         try:
-            os.unlink(path)
-            removed.append(path)
+            q = os.lstat(quarantine)
+            same = (stat.S_ISREG(q.st_mode) and q.st_ino == rec.get("inode")
+                    and sha256_file(quarantine) == rec.get("sha256"))
         except OSError:
-            ambiguous.append(path)
+            same = False
+        if same:
+            try:
+                os.unlink(quarantine)
+                removed.append(path)
+            except OSError:
+                ambiguous.append(path)
+            continue
+        try:
+            os.link(quarantine, path)          # puts it back, never replaces
+            os.unlink(quarantine)
+        except OSError:
+            path = quarantine                  # the name is taken again: keep it
+        ambiguous.append(path)
     for path in sorted(set(intents) - set(done)):
         # an intent with no done line: the write may or may not have happened
         if os.path.lexists(path):
             ambiguous.append(path)
+    # F8: temp files this operation left behind (a crash between write and link)
+    for rec in intents.values():
+        tmp = rec.get("tmp")
+        if not (isinstance(tmp, str) and os.path.basename(tmp).startswith(TMP_PREFIX)):
+            continue
+        if not inside(os.path.realpath(os.path.dirname(tmp)), support_real):
+            continue
+        try:
+            if stat.S_ISREG(os.lstat(tmp).st_mode):
+                os.unlink(tmp)
+        except OSError:
+            pass
     return {"removed": len(removed), "gone": gone, "ambiguous": len(ambiguous),
             "removed_paths": removed, "ambiguous_paths": ambiguous}

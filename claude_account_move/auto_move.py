@@ -684,10 +684,16 @@ def cmd_auto(args, cli):
             pair_notes = []
             # Filter the app log by the expected account (a rotated log may name only
             # the other account's pair); an unreadable account (None) means no filter.
-            pair = st.live_pair(paths, account=ident["app"]["value"],
-                                override=args.active_pair, index=st.scan(paths),
-                                notes=pair_notes, auto_account=ident["app"]["value"],
-                                command="auto")
+            hit = None if args.active_pair else heal_active.latest_loaded_pair(
+                paths, ident["app"]["value"])
+            if hit:          # F1: the pair the app loaded decides
+                pair = tuple(hit["pair"])
+            else:
+                pair = st.live_pair(paths, account=ident["app"]["value"],
+                                    override=args.active_pair, index=st.scan(paths),
+                                    notes=pair_notes,
+                                    auto_account=ident["app"]["value"],
+                                    command="auto")
             for n in pair_notes:
                 out.say(n)
             target_dir = st.pair_dir(paths, pair[0], pair[1]) if pair else None
@@ -1017,8 +1023,11 @@ def cmd_verify_start(args, cli):
                         if n.lower() == acc.lower()), None)
     except OSError:
         pass
-    if not cli_org or not acc_dir or not os.path.lexists(
-            os.path.join(paths.support, STORES[0], acc_dir, cli_org)):
+    # F1: when a Loaded line names the account, the pair the app loaded decides
+    # (judged below); the organization of the CLI is checked only without one.
+    loaded_seen = heal_active.latest_loaded_pair(paths, acc) is not None
+    if not loaded_seen and (not cli_org or not acc_dir or not os.path.lexists(
+            os.path.join(paths.support, STORES[0], acc_dir, cli_org))):
         text = ru.VS_NO_ORG_DIR % os.path.join(paths.support, STORES[0], acc_dir or acc,
                                                 cli_org or "?")
         return cli.fail(args, out, "verify-start", started, EXIT_FAIL,

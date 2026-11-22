@@ -517,15 +517,23 @@ def _symlink_guard(paths, args, report, code):
                and heal_active.loaded_pair_problem(paths, s, per_store[s])]
         pairs = [per_store[s] for s in st.STORES if s in per_store]
     else:
-        chosen = heal_active.active_pair(paths, ident, args.active_pair)[0]
-        if chosen:
-            pairs.append(chosen)
-        try:
-            live = st.live_pair(paths, account=target, override=args.active_pair)
-        except st.PairError:
-            live = None
-        if live and tuple(live) not in [tuple(p) for p in pairs]:
-            pairs.append(live)
+        # F1: the pair the app LOADED decides (heal_active.latest_loaded_pair);
+        # the last plain mention is only the fallback when no Loaded line names
+        # the account and no explicit pair was given.
+        hit = None if args.active_pair else heal_active.latest_loaded_pair(
+            paths, target)
+        if hit:
+            pairs.append(tuple(hit["pair"]))
+        else:
+            chosen = heal_active.active_pair(paths, ident, args.active_pair)[0]
+            if chosen:
+                pairs.append(chosen)
+            try:
+                live = st.live_pair(paths, account=target, override=args.active_pair)
+            except st.PairError:
+                live = None
+            if live and tuple(live) not in [tuple(p) for p in pairs]:
+                pairs.append(live)
     if not pairs:
         report["checks"].append({
             "id": "active_pair_real", "name": "active pair is a real directory",
@@ -728,8 +736,12 @@ def cmd_sync(args):
         return fail(args, out, "sync", started, EXIT_FAIL, "no_target",
                     "the app account is not readable: nothing to sync to")
     pair_notes = []
-    pair = st.live_pair(paths, account=target, override=args.active_pair,
-                        index=index, notes=pair_notes, command="sync")
+    hit = None if args.active_pair else heal_active.latest_loaded_pair(paths, target)
+    if hit:                  # F1: the pair the app loaded, not the last mention
+        pair = tuple(hit["pair"])
+    else:
+        pair = st.live_pair(paths, account=target, override=args.active_pair,
+                            index=index, notes=pair_notes, command="sync")
     for n in pair_notes:
         out.say(n)
     active = st.pair_dir(paths, pair[0], pair[1]) if pair else None
@@ -1037,6 +1049,25 @@ def cmd_adopt(args):
     if not os.path.isdir(paths.support):
         return fail(args, out, name, started, EXIT_NO_STORE, "no_store",
                     "storage not found: %s" % paths.support)
+    if not args.apply:
+        return _adopt_run(args, out, paths, name, started)
+    # F6: the orphan scan and the app check are done INSIDE the write lock,
+    # right before the write, so a second apply or an app start cannot slip in
+    try:
+        with write_lock(paths):
+            if common.claude_app_running():
+                return fail(args, out, name, started, EXIT_FAIL, "app_running",
+                            "Quit the Claude app first (Cmd+Q), then run this "
+                            "command again: the cards are files the app keeps open."
+                            + common.app_blockers_note())
+            return _adopt_run(args, out, paths, name, started)
+    except OSError as exc:
+        return fail(args, out, name, started, EXIT_INTERNAL, "internal_error",
+                    "cannot write the journal or the cards (state directory %s): %s"
+                    % (paths.state, exc))
+
+
+def _adopt_run(args, out, paths, name, started):
     index = st.scan(paths)
     if not index.obs.complete():
         out.say("warning: %d cards could not be read (%d errors): a session may "
@@ -1065,27 +1096,34 @@ def cmd_adopt(args):
         emit(args, out, _report(name, EXIT_OK, "nothing_to_do", started,
                                 write_verified=False, **base))
         return EXIT_OK
+    dfd = None
     try:
-        pair, pair_source = adopt_orphans.active_pair(
-            paths, read_identity(paths), args.active_pair)
-        out.say("pair used: %s/%s (source: %s)" % (pair[0], pair[1], pair_source))
-        base["pair_used"] = "%s/%s" % (pair[0], pair[1])
-        base["pair_source"] = pair_source
-        pair_dir = os.path.join(paths.support, st.STORES[0], pair[0], pair[1])
-        tpl_path, tpl = adopt_orphans.pick_template(pair_dir)
-    except adopt_orphans.PairProblem as exc:
-        return fail(args, out, name, started, EXIT_FAIL, "no_template", "refused: %s" % exc,
-                    **base)
-    try:
-        with write_lock(paths):
-            res = adopt_orphans.apply_plan(paths, chosen, pair, tpl_path, tpl)
-    except adopt_orphans.PairProblem as exc:
-        return fail(args, out, name, started, EXIT_FAIL, "no_template", "refused: %s" % exc,
-                    **base)
-    except OSError as exc:
-        return fail(args, out, name, started, EXIT_INTERNAL, "internal_error",
-                    "cannot write the journal or the cards (state directory %s): %s"
-                    % (paths.state, exc))
+        try:
+            pair, pair_source = adopt_orphans.active_pair(
+                paths, read_identity(paths), args.active_pair)
+            out.say("pair used: %s/%s (source: %s)" % (pair[0], pair[1], pair_source))
+            base["pair_used"] = "%s/%s" % (pair[0], pair[1])
+            base["pair_source"] = pair_source
+            # F9: the real path is resolved once; the write goes through the fd
+            pair_dir, dfd = adopt_orphans.open_pair(paths, pair)
+            tpl_path, tpl = adopt_orphans.pick_template(pair_dir)
+            adopt_orphans.check_pair_unchanged(pair_dir, dfd)
+        except adopt_orphans.PairProblem as exc:
+            return fail(args, out, name, started, EXIT_FAIL, "no_template",
+                        "refused: %s" % exc, **base)
+        try:
+            res = adopt_orphans.apply_plan(paths, chosen, pair, tpl_path, tpl,
+                                           pair_dir, dfd)
+        except adopt_orphans.PairProblem as exc:
+            return fail(args, out, name, started, EXIT_FAIL, "no_template",
+                        "refused: %s" % exc, **base)
+        except OSError as exc:
+            return fail(args, out, name, started, EXIT_INTERNAL, "internal_error",
+                        "cannot write the journal or the cards (state directory "
+                        "%s): %s" % (paths.state, exc))
+    finally:
+        if dfd is not None:
+            os.close(dfd)
     out.say("created %d cards, refused %d, failed %d"
             % (len(res["created"]), len(res["refused"]), len(res["failed"])))
     for e in res["refused"]:
