@@ -34,6 +34,7 @@ import stat
 import time
 import uuid
 
+from . import common
 from . import heal_active
 from . import panel_snapshot as snap
 from . import store as st
@@ -225,6 +226,11 @@ def active_pair(paths, identity, override=None):
     if not cli_acc:                       # F9: the CLI account decides everything
         raise PairProblem("the account of the CLI is not readable: nothing is "
                           "written")
+    # K1: the app/CLI account guard runs on every path, with or without --active-pair
+    if app_acc and app_acc.lower() != cli_acc.lower():
+        raise PairProblem("the app is on account %s but the CLI is on %s: "
+                          "sign in to the app with the CLI account first"
+                          % (app_acc.lower(), cli_acc.lower()))
     if override:
         want = st.parse_override(override)
         source = "--active-pair"
@@ -233,10 +239,6 @@ def active_pair(paths, identity, override=None):
                               "than the CLI account %s" % (want[0], want[1],
                                                            cli_acc.lower()))
     else:
-        if app_acc and app_acc.lower() != cli_acc.lower():
-            raise PairProblem("the app is on account %s but the CLI is on %s: "
-                              "sign in to the app with the CLI account first"
-                              % (app_acc.lower(), cli_acc.lower()))
         want = None
         hit = heal_active.latest_loaded_pair(paths, cli_acc)
         if hit:
@@ -379,19 +381,43 @@ def _tmp_name(pair_dir, n):
         TMP_PREFIX, os.getpid(), n, uuid.uuid4().hex[:6]))
 
 
+def _walk_pair(root, pair):
+    """Path of the pair under `root`, every component checked by lstat: a symlink
+    or a non-directory anywhere on the way is a PairProblem (K1)."""
+    cur = root
+    for part in (STORES[0], pair[0], pair[1]):
+        cur = os.path.join(cur, part)
+        try:
+            mode = os.lstat(cur).st_mode
+        except OSError as exc:
+            raise PairProblem("the active pair cannot be read: %s" % exc)
+        if stat.S_ISLNK(mode):
+            raise PairProblem("the active pair is a symlink (%s); run "
+                              "heal-active first" % cur)
+        if not stat.S_ISDIR(mode):
+            raise PairProblem("the active pair is not a directory (%s)" % cur)
+    return cur
+
+
 def open_pair(paths, pair):
-    """(real path, directory fd) of the pair, resolved ONCE (F9): every later
-    write goes through the fd, so a pair swapped for a link afterwards is never
-    followed. The caller closes the fd."""
-    pair_real = os.path.realpath(os.path.join(paths.support, STORES[0],
-                                              pair[0], pair[1]))
-    if not inside(pair_real, os.path.realpath(paths.support)):
-        raise PairProblem("the active pair resolves outside the support folder")
+    """(path, directory fd) of the pair, opened ONCE (K1): every component under
+    the support folder is checked by lstat (no symlink anywhere), the directory is
+    opened with O_NOFOLLOW, the walk is repeated and the opened directory must be
+    the one the path names. Every write goes through the fd. The caller closes
+    the fd."""
+    root = os.path.realpath(paths.support)
+    pair_real = _walk_pair(root, pair)
     try:
         dfd = os.open(pair_real, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
                       | os.O_NOFOLLOW)
     except OSError as exc:
         raise PairProblem("cannot open the active pair: %s" % exc)
+    try:
+        _walk_pair(root, pair)
+        check_pair_unchanged(pair_real, dfd)
+    except PairProblem:
+        os.close(dfd)
+        raise
     return pair_real, dfd
 
 
@@ -424,11 +450,23 @@ def apply_plan(paths, orphans, pair, template_path, template, pair_dir, dfd):
     op_id = uuid.uuid4().hex
     jr = Journal(new_journal_path(jdir), op_id, snap.path_id(paths.home))
     entries, created, refused, failed = [], [], [], []
+    stopped = None
     try:
         jr.write("begin", version=JOURNAL_VERSION, home_id=jr.home_id,
                  pair=list(pair), dir=pair_dir,
                  template=os.path.basename(template_path))
         for i, o in enumerate(orphans):
+            # K4: the app check is repeated right before each card write
+            if common.claude_app_running():
+                stopped = ("the Claude app is running: stopped before the next "
+                           "card write")
+                break
+            # K1: the path must still name the directory the fd holds
+            try:
+                check_pair_unchanged(pair_dir, dfd)
+            except PairProblem as exc:
+                stopped = str(exc)
+                break
             new_id = str(uuid.uuid4())
             name, card = build_card(template_path, template, o, new_id)
             data = (json.dumps(card, ensure_ascii=False) + "\n").encode("utf-8")
@@ -440,10 +478,14 @@ def apply_plan(paths, orphans, pair, template_path, template, pair_dir, dfd):
             entry = {"orphan": o["id"], "name": name, "path": final,
                      "sha256": digest}
             tname = os.path.basename(tmp)
+            mine = False                  # K7: set only after OUR O_EXCL open
             try:
                 try:
                     fd = os.open(tname, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                                  | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+                    mine = True
+                    jr.write("tmp_created", orphan=o["id"], tmp=tmp,
+                             sha256=digest, inode=os.fstat(fd).st_ino)
                     with os.fdopen(fd, "wb") as fh:
                         fh.write(data)
                         fh.flush()
@@ -461,7 +503,8 @@ def apply_plan(paths, orphans, pair, template_path, template, pair_dir, dfd):
                         entries.append(entry)
                         continue
                 finally:
-                    _quiet_unlink(tname, dfd)          # F8: no temp file stays
+                    if mine:                           # F8 + K7: only our own temp
+                        _quiet_unlink(tname, dfd)
                 rfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
                 try:
                     h = hashlib.sha256()
@@ -488,7 +531,7 @@ def apply_plan(paths, orphans, pair, template_path, template, pair_dir, dfd):
     finally:
         jr.close()
     return {"journal": jr.path, "created": created, "refused": refused,
-            "failed": failed, "entries": entries}
+            "failed": failed, "entries": entries, "stopped": stopped}
 
 
 # ---------------------------------------------------------------------- undo ---
@@ -575,7 +618,12 @@ def undo(paths, journal):
         # an intent with no done line: the write may or may not have happened
         if os.path.lexists(path):
             ambiguous.append(path)
-    # F8: temp files this operation left behind (a crash between write and link)
+    # F8 + K7: temp files this operation left behind (a crash between write and
+    # link). Removed only when the journal recorded the temp file (tmp_created:
+    # sha256 and inode) and both still match; any other file at that path is
+    # not proven ours: kept and reported as ambiguous.
+    made = {r["tmp"]: r for r in recs if r.get("op") == "tmp_created"
+            and isinstance(r.get("tmp"), str)}
     for rec in intents.values():
         tmp = rec.get("tmp")
         if not (isinstance(tmp, str) and os.path.basename(tmp).startswith(TMP_PREFIX)):
@@ -583,9 +631,27 @@ def undo(paths, journal):
         if not inside(os.path.realpath(os.path.dirname(tmp)), support_real):
             continue
         try:
-            if stat.S_ISREG(os.lstat(tmp).st_mode):
-                os.unlink(tmp)
+            lst = os.lstat(tmp)
+        except FileNotFoundError:
+            continue
         except OSError:
-            pass
+            ambiguous.append(tmp)
+            continue
+        if not stat.S_ISREG(lst.st_mode):
+            ambiguous.append(tmp)
+            continue
+        want = made.get(tmp)
+        try:
+            same = (want is not None and lst.st_ino == want.get("inode")
+                    and sha256_file(tmp) == want.get("sha256"))
+        except OSError:
+            same = False
+        if not same:
+            ambiguous.append(tmp)
+            continue
+        try:
+            os.unlink(tmp)
+        except OSError:
+            ambiguous.append(tmp)
     return {"removed": len(removed), "gone": gone, "ambiguous": len(ambiguous),
             "removed_paths": removed, "ambiguous_paths": ambiguous}

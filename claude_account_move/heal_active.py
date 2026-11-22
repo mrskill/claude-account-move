@@ -624,9 +624,11 @@ def root_load_events(paths, mark=(None, 0)):
 
 
 def any_root_load(paths):
-    """True when main.log holds any store-root load line at all, before or after
-    the latest app launch line (R2-C: case (iii) is a log with none)."""
-    return any(_root_loads(line) for line in _log_text(paths).splitlines())
+    """True when main.log holds a store-root load line AFTER the latest app launch
+    line (K3: the case of R2-C is decided only by events of the running process;
+    a Loaded line of a dead process does not make case (ii); case (iii) is a log
+    with no such line)."""
+    return bool(root_load_events(paths))
 
 
 def latest_root_loads(paths, mark=(None, 0)):

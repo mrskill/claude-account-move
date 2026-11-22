@@ -247,7 +247,8 @@ def evaluate(paths, before, index, tmap, identity, target, source,
         # does not load (case 20.11.2026), so no loss is claimed from it.
         # F3 (A9 c): whatever the guessed pair holds (empty, partial, full), no
         # Loaded line means the pair is unproven and no loss is claimed from it.
-        unseen_empty = bool(pair_unseen and t_names is not None)
+        # K3: in case (ii) no loss is claimed even when the target has no dirs.
+        unseen_empty = bool(pair_unseen)
         if unseen_empty:
             unseen_any = True
             lag_loss = {}        # the target pair is unknown: no lagging claim

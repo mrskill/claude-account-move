@@ -21,6 +21,15 @@ def compare_identity(before, identity, target, allow_same_account=False):
     return True, "CLI and app both on target %s (source was %s)" % (target, src)
 
 
+def task_dirs(index, store_name, account, active_dir=None):
+    """Directories whose scheduled tasks count (K5): in the sessions store the
+    loaded pair only, when it is known; else the directories of target_dirs."""
+    s = index.stores[store_name]
+    if active_dir and store_name == STORES[0] and active_dir in s.dirs:
+        return [active_dir]
+    return target_dirs(index, store_name, account, active_dir)
+
+
 def target_dirs(index, store_name, account, active_dir=None):
     """Physical directories reachable through an alias of this account."""
     s = index.stores[store_name]
@@ -39,14 +48,14 @@ def compare_tasks(before, index, account, active_dir):
     missing, total = [], 0
     for name in STORES:
         s = index.stores[name]
-        for real in target_dirs(index, name, account, active_dir):
+        for real in task_dirs(index, name, account, active_dir):
             for prob in s.dirs[real].get("task_problems", []):
                 missing.append("%s:%s" % (name, prob))
         want = ((before.get("stores") or {}).get(name) or {}).get("tasks") or {}
         if not want:
             continue
         have = {}
-        for real in target_dirs(index, name, account, active_dir):
+        for real in task_dirs(index, name, account, active_dir):
             have.update(s.dirs[real]["task_map"])
         for tid, meta in want.items():
             total += 1

@@ -1073,6 +1073,8 @@ def _adopt_run(args, out, paths, name, started):
         out.say("warning: %d cards could not be read (%d errors): a session may "
                 "already have a card among them" % (index.obs.unreadable_cards,
                                                     len(index.obs.errors)))
+        for line in index.obs.errors[:20]:      # K6: name every unreadable file
+            out.say("  " + line)
     found = adopt_orphans.find(paths, index)
     wanted = [i.lower() for i in (args.only or [])]
     chosen = [o for o in found if not wanted or o["id"] in wanted]
@@ -1096,6 +1098,13 @@ def _adopt_run(args, out, paths, name, started):
         emit(args, out, _report(name, EXIT_OK, "nothing_to_do", started,
                                 write_verified=False, **base))
         return EXIT_OK
+    if not index.obs.complete():       # K6: an incomplete index writes nothing
+        return fail(args, out, name, started, EXIT_FAIL, "index_incomplete",
+                    "refused: %d cards could not be read (%d errors), so a "
+                    "session may already have a card among them; nothing is "
+                    "written. Fix the unreadable files listed above, then run "
+                    "again." % (index.obs.unreadable_cards,
+                                len(index.obs.errors)), **base)
     dfd = None
     try:
         try:
@@ -1132,11 +1141,14 @@ def _adopt_run(args, out, paths, name, started):
         out.say("  failed: %s: %s" % (e["orphan"], e.get("error")))
     out.say("journal: %s (`adopt --undo JOURNAL` removes the cards it created)"
             % res["journal"])
-    code = EXIT_FAIL if (res["refused"] or res["failed"]) else EXIT_OK
+    if res.get("stopped"):                       # K1, K4: the run stopped early
+        out.say("stopped: %s" % res["stopped"])
+    code = EXIT_FAIL if (res["refused"] or res["failed"]
+                         or res.get("stopped")) else EXIT_OK
     emit(args, out, _report(name, code, "applied", started, journal=res["journal"],
                             created=len(res["created"]), refused=len(res["refused"]),
-                            failed=len(res["failed"]), write_verified=False,
-                            **base))
+                            failed=len(res["failed"]), stopped=res.get("stopped"),
+                            write_verified=False, **base))
     return code
 
 

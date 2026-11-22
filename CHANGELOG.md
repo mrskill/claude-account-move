@@ -35,7 +35,16 @@
   transcript are searched for the `session-owner` line, so thousands of
   transcripts are not read end to end. The active pair is the one the app log
   names for the app account (as `sync` does), else the organization of the CLI
-  account.
+  account. Review rounds (F1-F14, R2-C, closure K1-K7): the pair is opened once
+  with every path component checked by lstat and every card write goes through
+  that directory fd, rechecked before each write; the app/CLI account guard
+  holds with `--active-pair` too; the app check is repeated before each card
+  write; an unreadable card in any store makes `adopt --apply` refuse (the dry
+  run names it); a temp file is removed only when this run created it, and
+  `adopt --undo` removes a leftover temp only when the journal recorded its
+  sha256 and inode (else it is reported as ambiguous); `finish` decides the log
+  case only by events after the latest launch line, claims no loss in case (ii)
+  and reads the scheduled tasks of the loaded pair only.
 
 - start detection, round 3 (judge contract C1-C6): `verify-start` needs the app
   account to equal the CLI account (else `wrong_account`), the active org dir
