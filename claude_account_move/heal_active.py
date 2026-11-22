@@ -623,6 +623,12 @@ def root_load_events(paths, mark=(None, 0)):
             for store, a, o in _root_loads(line)]
 
 
+def any_root_load(paths):
+    """True when main.log holds any store-root load line at all, before or after
+    the latest app launch line (R2-C: case (iii) is a log with none)."""
+    return any(_root_loads(line) for line in _log_text(paths).splitlines())
+
+
 def latest_root_loads(paths, mark=(None, 0)):
     """{store: (acc, org)} of the LATEST store-root load per store, of any
     account, after `mark`. No clock decides."""

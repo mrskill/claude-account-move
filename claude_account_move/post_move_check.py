@@ -166,8 +166,10 @@ def evaluate(paths, before, index, tmap, identity, target, source,
         hit = heal_active.latest_loaded_pair(paths, target)
         if hit:
             pair = hit["pair"]
-        else:
-            pair_unseen = True
+        elif heal_active.any_root_load(paths):
+            pair_unseen = True      # R2-C (ii): Loaded lines exist, none for target
+        else:                       # R2-C (iii): no Loaded line at all
+            notes.append("pair not seen in the app log, judged by the last mention")
     if pair and mentioned and tuple(pair) != tuple(mentioned):
         pair_notes = []
         notes.append("judged on the pair the app loaded, %s/%s; the last pair the "

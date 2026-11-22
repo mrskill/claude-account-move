@@ -1026,12 +1026,14 @@ def cmd_verify_start(args, cli):
     # F1: when a Loaded line names the account, the pair the app loaded decides
     # (judged below); the organization of the CLI is checked only without one.
     loaded_seen = heal_active.latest_loaded_pair(paths, acc) is not None
-    if not loaded_seen and (not cli_org or not acc_dir or not os.path.lexists(
-            os.path.join(paths.support, STORES[0], acc_dir, cli_org))):
+    if not cli_org or not acc_dir or not os.path.lexists(
+            os.path.join(paths.support, STORES[0], acc_dir, cli_org)):
         text = ru.VS_NO_ORG_DIR % os.path.join(paths.support, STORES[0], acc_dir or acc,
                                                 cli_org or "?")
-        return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
-                        "bad_pair", text, mdir)
+        if not loaded_seen:
+            return cli.fail(args, out, "verify-start", started, EXIT_FAIL,
+                            "bad_pair", text, mdir)
+        out.say("note: " + text)      # R2-C: the loaded pair decides; a note only
     poll = _poll(START_POLL_S, "CLAUDE_ACCOUNT_MOVE_START_POLL_S")
     loads = wait_app_start(paths, acc, (None, 0), getattr(args, "wait_start", 0.0),
                            poll, out)
