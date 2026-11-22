@@ -150,10 +150,12 @@ class K2OneChooserEverywhere(a9.FinishBase):
             lines = [ly, lc]
         h.log_file("main.log", ["2026-11-22 09:59:00 info: app starting"] + lines)
 
-    def verify_start(self):
+    def verify_start(self, cli_last):
+        # build the world FIRST: build_source rewrites main.log (mode "w")
         build_source(self.h)
         self.h.accounts(cli=B, app=B, org=O2)
         self.h.pair(CC, B, O2)           # the active organization folder exists
+        self.two_accounts_loaded(cli_last=cli_last)
         return self.h.run("verify-start", "--wait-start", "2", "--json",
                           CLAUDE_ACCOUNT_MOVE_PGREP=ao.STUB_OPEN)
 
@@ -175,8 +177,7 @@ class K2OneChooserEverywhere(a9.FinishBase):
         """Red on 3b1f1ca: verify-start picks B/ORG_Y out of a store whose latest
         load is C/ORG_C (a hidden earlier load of the CLI account wins). By K2'
         the app now runs account C: app_not_started, exit 3."""
-        self.two_accounts_loaded(cli_last=False)
-        r = self.verify_start()
+        r = self.verify_start(cli_last=False)
         out = r.stdout + r.stderr
         self.assertEqual(r.returncode, EXIT_FAIL, out)
         self.assertEqual(json.loads(r.stdout).get("verdict"), "app_not_started", out)
@@ -231,8 +232,7 @@ class K2OneChooserEverywhere(a9.FinishBase):
 
     def test_k2_verify_start_cli_account_last_acts_on_its_pair(self):
         """Mirror: log C/ORG_C then B/ORG_Y: verify-start ok on B/ORG_Y."""
-        self.two_accounts_loaded(cli_last=True)
-        r = self.verify_start()
+        r = self.verify_start(cli_last=True)
         out = r.stdout + r.stderr
         self.assertEqual(r.returncode, 0, out)
         rep = json.loads(r.stdout)

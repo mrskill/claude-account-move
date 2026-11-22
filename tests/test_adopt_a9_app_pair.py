@@ -195,16 +195,14 @@ class A9dNeverAnotherAccountsPair(AdoptBase):
         before_c, before_a, before_l = cards(d_c), cards(self.d_a), cards(self.d_l)
         r = h.run("adopt", "--apply")
         out = r.stdout + r.stderr
-        self.assertEqual(r.returncode, 0, out)
+        # ruling K2': the latest Loaded line names another account, so there is
+        # no pair: adopt refuses (exit 3) and writes nothing anywhere
+        self.assertEqual(r.returncode, 3, out)
         self.assertEqual(self.new_cards(d_c, before_c), [],
                          "nothing is written into another account's pair: " + out)
         self.assertEqual(self.new_cards(self.d_a, before_a), [], out)
-        self.assertEqual(len(self.new_cards(self.d_l, before_l)), 1,
-                         "the card goes to the loaded pair of the account")
-        said = [ln for ln in out.splitlines()
-                if ORG_LOADED in ln and SOURCE_WORD.search(ln)]
-        self.assertTrue(said, "output names the pair used (the account's own "
-                        "loaded pair) and the source: " + out)
+        self.assertEqual(self.new_cards(self.d_l, before_l), [],
+                         "no write into the account's own earlier pair either: " + out)
         self.assertFalse([ln for ln in out.splitlines()
                           if ORG_C in ln or ACC_C in ln],
                          "the other account's pair is never presented as used: " + out)
