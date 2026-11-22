@@ -385,6 +385,43 @@ class K7TempOwnership(ao.Base):
         with open(foreign, "rb") as fh:
             self.assertEqual(fh.read(), b"someone else's data")
 
+    def test_k7_undo_removes_a_genuine_leftover_the_journal_recorded(self):
+        """Positive pin (green on 1a7cbcc, must stay green after K7): a write of
+        this operation fails after its temp file was created (chmod fails) and
+        the temp file cannot be removed either (a crash is simulated by making
+        the unlink of temp names fail). The journal recorded that temp file
+        (sha256 and inode); undo removes it."""
+        self.world()
+        sid = v5(433)
+        self.h.orphan(sid, cwd="/work/k7", prompts=["k7 leftover"])
+        real_chmod, real_unlink = os.chmod, os.unlink
+        hit = []
+
+        def chmod(p, *a, **kw):
+            if os.path.basename(str(p)).startswith(adopt_orphans.TMP_PREFIX):
+                hit.append(str(p))
+                raise OSError(5, "injected write failure")
+            return real_chmod(p, *a, **kw)
+
+        def unlink(p, *a, **kw):
+            if os.path.basename(str(p)).startswith(adopt_orphans.TMP_PREFIX):
+                raise OSError(5, "injected: the process died before the cleanup")
+            return real_unlink(p, *a, **kw)
+        before = state_files(self.h)
+        code, out = inproc(self.h, "adopt", "--apply",
+                           patches=[(os, "chmod", chmod), (os, "unlink", unlink)])
+        self.assertTrue(hit, "the failure was injected on a temp file: " + out)
+        left = sorted(f for f in os.listdir(self.d)
+                      if f.startswith(adopt_orphans.TMP_PREFIX))
+        self.assertEqual(len(left), 1, "a real leftover stays in the pair: " + out)
+        self.assertEqual(all_cards_naming(self.h, sid), [])
+        journal = find_journal(self.h, out, before)
+        self.assertIsNotNone(journal, out)
+        r2, out2 = self.run_adopt("--undo", journal)
+        self.assertFalse(os.path.lexists(os.path.join(self.d, left[0])),
+                         "undo removes the leftover of its own operation that the "
+                         "journal recorded (sha256 and inode): " + out2)
+
     def test_k7_undo_keeps_a_foreign_file_that_has_the_temp_prefix(self):
         """Red on 1a7cbcc: undo removes any regular file at the recorded temp path
         by its prefix, with no check of the sha256 and the inode; it must keep it

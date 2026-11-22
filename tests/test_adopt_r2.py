@@ -182,8 +182,11 @@ class F2LaunchBoundary(a9.FinishBase):
 
     def test_f2_finish_ignores_a_loaded_line_older_than_the_launch(self):
         """Red on 68b0d7a: finish judges the pair of the stale Loaded line (it
-        holds every card, so no problem is found) and never says «pair not seen
-        in the app log»."""
+        holds every card, so no problem is found) and never says the pair is not
+        seen in the app log. Aligned to ruling K3 (round 3): with only a stale
+        Loaded line before the newest launch, this is case (iii): the phrase
+        "judged by the last mention" and the last-mention pair (empty) judged as
+        before, so the loss claim stays."""
         self.moved_world(with_sync_to_loaded=True)
         h = self.h
         h.log_file("main.log", [
@@ -195,8 +198,12 @@ class F2LaunchBoundary(a9.FinishBase):
         r, ids = self.finish_json()
         t = h.run("finish", "--wait-login", "0")
         text = t.stdout + t.stderr
-        self.assertIn(PHRASE_NOT_SEEN, text)
-        no_loss_claims(self, ids, text)
+        self.assertIn("pair not seen in the app log, judged by the last mention",
+                      text)
+        chk = ids.get(CC + ":target_names")
+        self.assertIsNotNone(chk, sorted(ids))
+        self.assertFalse(chk["ok"], "the stale Loaded line must not decide the "
+                         "pair (it holds every card): %s" % chk)
 
 
 # --- F3: A9(c) exactly: no Loaded line, no loss claim, whatever the pair holds ---
@@ -503,13 +510,17 @@ class F8TempFiles(ao.Base):
         name = card_for(self.d, sid)[0]
         with open(os.path.join(self.d, name), "rb") as fh:
             data = fh.read()
-        with open(tmp, "wb") as fh:           # the leftover of a crash, same bytes
+        with open(tmp, "wb") as fh:           # same bytes, but a NEW inode
             fh.write(data)
         r2, out2 = self.run_adopt("--undo", journal)
-        self.assertEqual(r2.returncode, 0, out2)
-        self.assertFalse(os.path.exists(tmp),
-                         "the leftover temp of this operation is removed: " + out2)
-        self.assertEqual(ao.tree_digest(self.d), pre)
+        # aligned to ruling K7 (round 3): a leftover whose inode is not the one
+        # the journal recorded is kept and reported ambiguous, never removed;
+        # the genuine leftover is removed (test_adopt_r3, K7 positive test)
+        self.assertNotEqual(r2.returncode, 0, out2)
+        self.assertTrue(os.path.exists(tmp),
+                        "a temp file with an unrecorded inode is kept: " + out2)
+        self.assertIn(tmp, out2, "and reported as ambiguous: " + out2)
+        self.assertEqual(card_for(self.d, sid), None, "the card itself is removed")
 
 
 # --- F9: the account of the CLI decides, and the real path is used once -----------
