@@ -192,7 +192,7 @@ class A1DryRun(Base):
         self.world()
         self.h.orphan(v5(11), prompts=["org-v5-with-owner"])               # orphan
         self.h.orphan(v5(12), prompts=["org-v5-no-owner"], owner=False)     # orphan
-        self.h.orphan(uid(13), prompts=["org-v4-with-owner"])               # orphan (owner line)
+        self.h.orphan(uid(23), prompts=["org-v4-with-owner"])               # orphan (owner line)
         self.h.orphan(uid(14), prompts=["not-orphan-v4-no-owner"], owner=False)
         self.h.orphan(v5(15), tool_result_only=True)                       # no real prompt
         cc_other = self.h.pair(CC, B, O2)                                  # card in ANOTHER account
@@ -205,7 +205,7 @@ class A1DryRun(Base):
         self.assertEqual(r.returncode, 0, out)
         for n in (11, 12):
             self.assertIn(v5(n), out)
-        self.assertIn(uid(13), out)
+        self.assertIn(uid(23), out)
         for sid in (uid(14), v5(15), v5(16), v5(17)):
             self.assertNotIn(sid, out)
         for sid in ("not-orphan-v4-no-owner", "has-card-other-account",
@@ -277,12 +277,18 @@ class A2Apply(Base):
 
     def test_a2_one_orphan_card_exists_per_orphan_across_the_stores(self):
         self.setup_orphans()
+
+        def lam_files():
+            top = os.path.join(self.h.support, LAM)
+            return sorted(os.path.relpath(os.path.join(dp, f), top)
+                          for dp, _dn, fns in os.walk(top) for f in fns)
+        lam_before = lam_files()
         r, out = self.run_adopt("--apply")
         self.assertEqual(r.returncode, 0, out)
         for sid in (self.s1, self.s2, self.s3):
             self.assertEqual(len(all_cards_naming(self.h, sid)), 1, sid)
         # nothing lands outside the active pair of claude-code-sessions
-        self.assertEqual(sorted(os.listdir(os.path.join(self.h.support, LAM))), [])
+        self.assertEqual(lam_files(), lam_before)
 
     def test_a2_refuses_while_the_app_runs(self):
         self.setup_orphans()
