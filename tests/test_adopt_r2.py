@@ -613,8 +613,8 @@ class F10OwnerAnywhere(ao.Base):
 
 class F11ReturnCommand(ao.Base):
     def test_f11_finish_names_the_command_that_returns_the_orphans(self):
-        """Red on 68b0d7a: the [ПРОБЛЕМА] detail of the check «сессии без
-        карточки» only counts the sessions and names no command."""
+        """Red on 68b0d7a: the problem detail of the sessions-without-card
+        check only counts the sessions and names no command."""
         build_source(self.h)
         for i in range(3):
             self.h.orphan(v5(210 + i), prompts=["lost %d" % i])
