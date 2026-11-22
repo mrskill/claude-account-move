@@ -129,56 +129,162 @@ class K1PairOpenedOnce(ao.Base):
 # --- K2: one chooser of the pair (latest_loaded_pair) for verify-start too --------
 
 class K2OneChooserEverywhere(a9.FinishBase):
-    def two_accounts_loaded(self):
-        """Log: the app loaded B/ORG_Y, then another account's pair C/ORG_C."""
+    # Ruling K2' (CLOSURE.md): ONE chooser with C5 semantics. The latest Loaded
+    # line of the store after the latest launch line, of ANY account, is the
+    # pair when its account is the CLI account; otherwise there is no pair.
+
+    def two_accounts_loaded(self, cli_last):
+        """Log after the launch line. cli_last False: the app loaded B/ORG_Y,
+        then another account's pair C/ORG_C (no pair). cli_last True: the app
+        loaded C/ORG_C, then B/ORG_Y (the pair is B/ORG_Y)."""
         h = self.h
         self.d_y = h.pair(CC, B, ORG_Y)
-        h.pair(CC, ACC_C, ORG_C)
-        h.log_file("main.log", [
-            "2026-11-22 09:59:00 info: app starting",
-            loaded(h, CC, B, ORG_Y, n=3, ts="2026-11-22 10:00:00"),
-            loaded(h, CC, ACC_C, ORG_C, n=2, ts="2026-11-22 10:01:00"),
-        ])
+        self.d_c = h.pair(CC, ACC_C, ORG_C)
+        ly = loaded(h, CC, B, ORG_Y, n=3, ts="2026-11-22 10:00:00")
+        lc = loaded(h, CC, ACC_C, ORG_C, n=2, ts="2026-11-22 10:01:00")
+        if cli_last:
+            ly = loaded(h, CC, B, ORG_Y, n=3, ts="2026-11-22 10:01:00")
+            lc = loaded(h, CC, ACC_C, ORG_C, n=2, ts="2026-11-22 10:00:00")
+            lines = [lc, ly]
+        else:
+            lines = [ly, lc]
+        h.log_file("main.log", ["2026-11-22 09:59:00 info: app starting"] + lines)
 
-    def test_k2_verify_start_takes_the_pair_of_latest_loaded_pair(self):
-        """Red on 1a7cbcc: verify-start waits through fresh_root_loads, which takes
-        the LATEST load of the store (C/ORG_C) and only then filters by account,
-        so a later load of another account hides B/ORG_Y: app_not_started."""
-        h = self.h
-        build_source(h)
-        h.accounts(cli=B, app=B, org=O2)
-        self.two_accounts_loaded()
-        r = h.run("verify-start", "--wait-start", "2", "--json",
-                  CLAUDE_ACCOUNT_MOVE_PGREP=ao.STUB_OPEN)
-        out = r.stdout + r.stderr
-        self.assertEqual(r.returncode, 0,
-                         "verify-start must act on B/%s, the pair latest_loaded_pair "
-                         "gives, not lose it to a later load of another account: %s"
-                         % (ORG_Y, out))
-        rep = json.loads(r.stdout)
-        self.assertIn("%s/%s/%s" % (CC, B, ORG_Y), rep.get("loads") or [], out)
-        self.assertFalse([x for x in rep.get("loads") or [] if ACC_C in x], out)
+    def verify_start(self):
+        build_source(self.h)
+        self.h.accounts(cli=B, app=B, org=O2)
+        self.h.pair(CC, B, O2)           # the active organization folder exists
+        return self.h.run("verify-start", "--wait-start", "2", "--json",
+                          CLAUDE_ACCOUNT_MOVE_PGREP=ao.STUB_OPEN)
 
-    def test_k2_adopt_writes_into_the_same_pair(self):
-        """Pin (green on 1a7cbcc): adopt acts on B/ORG_Y, never on the later pair
-        of another account."""
+    def adopt_world(self, sid):
         h = self.h
         build_source(h)
         make_template(h, ao.active_dir(h))
         h.accounts(cli=B, app=B, org=O2)
-        self.two_accounts_loaded()
-        d_c = os.path.join(h.support, CC, ACC_C, ORG_C)
+        return sid
+
+    def orphan_for(self, n):
+        sid = v5(n)
+        self.h.orphan(sid, cwd="/work/k2", prompts=["k2 prompt %d" % n])
+        return sid
+
+    # -- negative: another account loaded last: no pair anywhere --------------
+
+    def test_k2_verify_start_other_account_last_is_app_not_started(self):
+        """Red on 3b1f1ca: verify-start picks B/ORG_Y out of a store whose latest
+        load is C/ORG_C (a hidden earlier load of the CLI account wins). By K2'
+        the app now runs account C: app_not_started, exit 3."""
+        self.two_accounts_loaded(cli_last=False)
+        r = self.verify_start()
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, EXIT_FAIL, out)
+        self.assertEqual(json.loads(r.stdout).get("verdict"), "app_not_started", out)
+
+    def test_k2_adopt_apply_other_account_last_refuses_with_no_write(self):
+        """Red on 3b1f1ca: adopt writes into the earlier B/ORG_Y. By K2' there is
+        no pair: exit 3, no card anywhere."""
+        h = self.h
+        self.adopt_world(None)
+        self.two_accounts_loaded(cli_last=False)
         make_template(h, self.d_y)
-        make_template(h, d_c)
-        sid = v5(403)
-        h.orphan(sid, cwd="/work/k2", prompts=["k2 prompt"])
-        before_c = cards(d_c)
+        make_template(h, self.d_c)
+        sid = self.orphan_for(403)
+        before_y, before_c = cards(self.d_y), cards(self.d_c)
+        r = h.run("adopt", "--apply")
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, EXIT_FAIL, out)
+        self.assertEqual(all_cards_naming(h, sid), [], "no write at all: " + out)
+        self.assertEqual(cards(self.d_y), before_y, out)
+        self.assertEqual(cards(self.d_c), before_c, out)
+
+    def test_k2_sync_apply_other_account_last_refuses_with_no_copy(self):
+        """Red on 3b1f1ca: sync copies into the earlier B/ORG_Y. By K2' there is
+        no pair: exit 3, nothing copied into any pair."""
+        h = self.h
+        src = a9.FinishBase.moved_world(self, with_sync_to_loaded=False)
+        self.assertTrue(os.path.isdir(src))
+        self.two_accounts_loaded(cli_last=False)
+        before = (cards(self.d_y), cards(self.d_c), cards(self.d_o2))
+        r = h.run("sync", "--apply")
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, EXIT_FAIL, out)
+        self.assertEqual((cards(self.d_y), cards(self.d_c), cards(self.d_o2)),
+                         before, "no copy anywhere: " + out)
+
+    def test_k2_finish_other_account_last_is_case_ii_no_loss_claim(self):
+        """Red on 3b1f1ca: finish judges the earlier B pair and claims the names
+        or tasks missing in it. By K2' it is case (ii): the phrase "pair not
+        seen in the app log", no loss claim, the move is not proven."""
+        a9.FinishBase.moved_world(self, with_sync_to_loaded=False)
+        self.two_accounts_loaded(cli_last=False)
+        r, ids = self.finish_json()
+        t = self.h.run("finish", "--wait-login", "0")
+        text = t.stdout + t.stderr
+        self.assertIn(a9.PHRASE_NOT_SEEN, text)
+        self.assertNotIn(PHRASE_BY_MENTION, text,
+                         "case (ii), not (iii): " + text)
+        no_loss_claims(self, ids, r.stdout + r.stderr)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    # -- mirror positive: the CLI account loaded last: all four act on B/ORG_Y --
+
+    def test_k2_verify_start_cli_account_last_acts_on_its_pair(self):
+        """Mirror: log C/ORG_C then B/ORG_Y: verify-start ok on B/ORG_Y."""
+        self.two_accounts_loaded(cli_last=True)
+        r = self.verify_start()
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        rep = json.loads(r.stdout)
+        self.assertIn("%s/%s/%s" % (CC, B, ORG_Y), rep.get("loads") or [], out)
+        self.assertFalse([x for x in rep.get("loads") or [] if ACC_C in x], out)
+
+    def test_k2_adopt_cli_account_last_writes_into_its_pair(self):
+        """Mirror: adopt acts on B/ORG_Y, never on C/ORG_C."""
+        h = self.h
+        self.adopt_world(None)
+        self.two_accounts_loaded(cli_last=True)
+        make_template(h, self.d_y)
+        make_template(h, self.d_c)
+        sid = self.orphan_for(404)
+        before_c = cards(self.d_c)
         r = h.run("adopt", "--apply")
         out = r.stdout + r.stderr
         self.assertEqual(r.returncode, 0, out)
-        self.assertEqual(cards(d_c), before_c, out)
+        self.assertEqual(cards(self.d_c), before_c, out)
         self.assertEqual(len([c for c in all_cards_naming(h, sid)
                               if os.path.dirname(c) == self.d_y]), 1, out)
+
+    def test_k2_sync_cli_account_last_copies_into_its_pair(self):
+        """Mirror: sync copies into B/ORG_Y only."""
+        h = self.h
+        a9.FinishBase.moved_world(self, with_sync_to_loaded=False)
+        self.two_accounts_loaded(cli_last=True)
+        before_c = cards(self.d_c)
+        r = h.run("sync", "--apply")
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertEqual(cards(self.d_c), before_c, out)
+        self.assertTrue(cards(self.d_y), "cards copied into B/ORG_Y: " + out)
+
+    def test_k2_finish_cli_account_last_judges_its_pair(self):
+        """Mirror: finish judges B/ORG_X (holds every card and the tasks) loaded
+        after C/ORG_C: green, no case (ii) phrase."""
+        h = self.h
+        a9.FinishBase.moved_world(self, with_sync_to_loaded=True)  # B/ORG_X full
+        h.pair(CC, ACC_C, ORG_C)
+        h.log_file("main.log", [
+            "2026-11-22 09:59:00 info: app starting",
+            loaded(h, CC, ACC_C, ORG_C, n=2, ts="2026-11-22 10:00:00"),
+            loaded(h, CC, B, a9.ORG_X, n=3, ts="2026-11-22 10:01:00"),
+            loaded(h, LAM, B, O2, n=1, ts="2026-11-22 10:01:00"),
+        ])
+        r, ids = self.finish_json()
+        out = r.stdout + r.stderr
+        self.assertTrue(ids[CC + ":target_names"]["ok"], ids[CC + ":target_names"])
+        self.assertEqual(r.returncode, 0, out)
+        t = h.run("finish", "--wait-login", "0")
+        self.assertNotIn(a9.PHRASE_NOT_SEEN, t.stdout + t.stderr)
 
 
 # --- K3: the case is decided only by events after the latest launch line ----------
