@@ -115,6 +115,19 @@ class Home(object):
                 fh.write(json.dumps(ln) + "\n")
         return first_ms, last_ms
 
+    def orphan_raw(self, sid, records, mtime=None):
+        """A transcript with no card behind it, written from the given records
+        exactly as they are (no timestamps or owner line are added). `mtime` sets
+        the file modification time (epoch seconds). Returns the file path."""
+        os.makedirs(self.projects, exist_ok=True)
+        path = os.path.join(self.projects, sid + ".jsonl")
+        with open(path, "w") as fh:
+            for rec in records:
+                fh.write(json.dumps(rec) + "\n")
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
     def accounts(self, cli=None, app=None, raw_cli=None, raw_app=None, org=None):
         os.makedirs(self.support, exist_ok=True)
         if raw_cli is not None:
