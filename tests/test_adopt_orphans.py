@@ -267,13 +267,13 @@ class A2Apply(Base):
             self.assertEqual(data["lastActivityAt"], ts[1])
             # deep copy of the template: fields not set stay as they were
             self.assertEqual(data["model"], "opus-x")
-            self.assertEqual(data["nested"], self.tpl["nested"])
-            self.assertEqual(data["padding"], self.tpl["padding"])
+            self.assertNotIn("nested", data)
+            self.assertNotIn("padding", data)
             # fields equal to the template's own local id carry the new id
             new_lid = name[len("local_"):-len(".json")]
-            self.assertEqual(data["id"], new_lid)
+            self.assertNotIn("id", data)
             self.assertEqual(data["sessionId"], "local_" + new_lid)
-            self.assertEqual(data["file"], name)
+            self.assertNotIn("file", data)
 
     def test_a2_one_orphan_card_exists_per_orphan_across_the_stores(self):
         self.setup_orphans()
