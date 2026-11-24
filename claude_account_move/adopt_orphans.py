@@ -12,8 +12,10 @@ Such a session lives in the panel of the old account outside the disk, so it
 vanishes from the panel after an account change and no other check sees it.
 
 `plan` and `find` only read. `apply_plan` writes one new card per orphan into
-the ACTIVE pair of `claude-code-sessions`: a deep copy of a template (the newest
-parsable card of that pair) with the fields of the session set. Every write is
+the ACTIVE pair of `claude-code-sessions`, built from the allow-list
+CARD_FIELDS, never a copy: the fields of the session, not archived, not
+starred, and only `model`, `effort` and `sessionSettings` taken from a template
+(the newest parsable card of that pair). Every write is
 journaled before it happens (intent), goes through a temp file in the same
 folder and a no-replace hard link (never over an existing file), and is
 acknowledged after it (done). `undo` removes only files that journal says it
@@ -48,6 +50,13 @@ V5_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{
 FIRST_SHOWN = 80
 TITLE_CUT = 60
 TMP_PREFIX = ".claude-account-move-adopt-"
+# the only keys an adopted card may hold (W1): never a copy of the template
+CARD_FIELDS = frozenset([
+    "sessionId", "cliSessionId", "cwd", "originCwd", "folderPlace", "title",
+    "createdAt", "lastActivityAt", "completedTurns", "model", "effort",
+    "sessionSettings", "isArchived", "isStarred"])
+# the only keys read from the template, each only when it has it (W2)
+TEMPLATE_FIELDS = ("model", "effort", "sessionSettings")
 
 
 class JournalError(Exception):
@@ -318,32 +327,25 @@ def pick_template(pair_dir):
     return best[1], best[2]
 
 
-def _swap_ids(value, lid, new_id, new_name):
-    """Deep copy of `value` with every string equal to the template's own local id
-    (bare, with local_ and with local_ ... .json) replaced by the new one."""
-    if isinstance(value, str):
-        if value == lid:
-            return new_id
-        if value == CARD_PREFIX + lid:
-            return CARD_PREFIX + new_id
-        if value == CARD_PREFIX + lid + ".json":
-            return new_name
-        return value
-    if isinstance(value, list):
-        return [_swap_ids(v, lid, new_id, new_name) for v in value]
-    if isinstance(value, dict):
-        return {k: _swap_ids(v, lid, new_id, new_name) for k, v in value.items()}
-    return value
-
-
 def build_card(template_path, template, orphan, new_id):
-    """The new card (a dict): a deep copy of the template with the session set.
-    Timestamps and counts are ints, never digit strings."""
+    """The new card (a dict), built from scratch from the allow-list CARD_FIELDS,
+    never a copy of the template: per-session state of the template (pinned,
+    PRs, folder, snapshots, any key the app adds later) never leaks into it.
+    Only `model`, `effort` and `sessionSettings` are taken from the template
+    (deep copies, each only when present), and its `cwd` only as the fallback.
+    Timestamps and counts are ints, never digit strings. The template is never
+    changed."""
     name = "%s%s.json" % (CARD_PREFIX, new_id)
-    lid = os.path.basename(template_path)[len(CARD_PREFIX):-len(".json")]
-    card = _swap_ids(copy.deepcopy(template), lid, new_id, name)
-    card["cliSessionId"] = orphan["id"]
-    card["cwd"] = orphan["cwd"] or card.get("cwd", "")
+    cwd = orphan["cwd"] or template.get("cwd", "")
+    card = {"sessionId": CARD_PREFIX + new_id, "cliSessionId": orphan["id"],
+            "cwd": cwd, "originCwd": cwd}
+    if isinstance(cwd, str) and cwd:
+        card["folderPlace"] = {"cwd": cwd, "realPath": cwd}
+    for key in TEMPLATE_FIELDS:
+        if key in template:
+            card[key] = copy.deepcopy(template[key])
+    card["isArchived"] = False
+    card["isStarred"] = False
     card["title"] = orphan["title"]
     if orphan["created_ms"] is not None:
         card["createdAt"] = int(orphan["created_ms"])

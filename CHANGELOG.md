@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- an adopted card is built from an allow-list, never a copy of the template
+  (CAM-ADOPT-TEMPLATE-FIELDS, W1-W6; case of 25.11.2026: 15 adopted cards
+  inherited `isStarred: true`, `prs`, `spawnedFrom`, `folderPlace` and more from
+  the template card, and the app refused to archive them as pinned). The card
+  holds only the keys of `adopt_orphans.CARD_FIELDS`: `sessionId`,
+  `cliSessionId`, `cwd`, `originCwd` (the same cwd), `folderPlace` (`{cwd,
+  realPath}`, absent when the cwd is empty), `title`, `createdAt`,
+  `lastActivityAt`, `completedTurns`, `isArchived` and `isStarred` (always
+  false), and `model`, `effort`, `sessionSettings` copied by value from the
+  template only when it has them. No other template key reaches the card, a key
+  the app adds later included. The template file and dict stay untouched.
+
 - the pair the program judges and writes into is the pair the APP loads (contract
   item A9): the latest "Loaded N persisted sessions from <store>/<acc>/<org>"
   line of the app log for the account, never another account's pair. One shared
@@ -18,10 +30,11 @@
   post-move check and vanishes from the panel on an account change (case of the
   16.11.2026 move). New command `adopt` lists these orphans (dry run, writes
   nothing); `adopt --apply` writes one card per orphan into the active
-  `claude-code-sessions` pair as a deep copy of the newest parsable card, with
+  `claude-code-sessions` pair, built from the allow-list `CARD_FIELDS` (see the
+  entry above; at first it was a deep copy of the newest parsable card), with
   `cliSessionId`, `cwd`, `title` (last custom/ai title, else the first prompt
   cut to 60), `createdAt`, `lastActivityAt` and `completedTurns` set, all as
-  ints, and every field equal to the template's own local id set to the new id.
+  ints.
   Each write is journaled (intent, then done with sha256 and inode) before and
   after a temp file and a no-replace hard link; a name that exists is refused;
   the app must be closed; a second run writes nothing. `adopt --undo JOURNAL`
