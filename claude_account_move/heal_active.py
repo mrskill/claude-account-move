@@ -24,6 +24,7 @@ ENOTDIR_MAX_AGE_S = 2 * 24 * 3600
 FROM_LOG_MAX_AGE_S = 10 * 60
 LOG_TAIL_BYTES = 8 * 1024 * 1024
 _LINE_TS = re.compile(r"^\s*\[?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})")
+_LAUNCH_RE = re.compile(r"(?i)\bapp starting\b")
 _PAIR_PATH = re.compile(r"(claude-code-sessions|local-agent-mode-sessions)/"
                         r"([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})")
 
@@ -595,13 +596,14 @@ def log_mark(paths):
     return (sb.st_ino, sb.st_size)
 
 
-def latest_root_loads(paths, mark=(None, 0)):
-    """{store: (acc, org)} of the LATEST store-root load per store (same
-    definition as _root_loads), of any account, in the bytes appended to
-    main.log after `mark` (from log_mark; (None, 0) is the whole log). A log
-    whose inode changed or that is shorter than the mark (rotated, truncated)
-    counts as all new. No clock decides."""
-    found = {}
+def root_load_events(paths, mark=(None, 0)):
+    """[(line, store, acc, org)] of every store-root load (same definition as
+    _root_loads) in the bytes appended to main.log after `mark` (from
+    log_mark; (None, 0) is the whole log), oldest first. A log whose inode
+    changed or that is shorter than the mark (rotated, truncated) counts as all
+    new. This is the ONE reader of the app log's "Loaded N persisted sessions
+    from <store>/<acc>/<org>" lines: the functions below, adopt, finish, the
+    post-move check and verify-start all go through it."""
     ino, size = mark
     try:
         with open(paths.main_log, "rb") as fh:
@@ -610,11 +612,65 @@ def latest_root_loads(paths, mark=(None, 0)):
             fh.seek(start)
             text = fh.read().decode("utf-8", "ignore")
     except OSError:
-        return found
-    for line in text.splitlines():
-        for store, a, o in _root_loads(line):
-            found[store] = (a, o)
+        return []
+    lines = text.splitlines()
+    # F2: a load before the latest app launch line belongs to a dead process
+    for i in range(len(lines) - 1, -1, -1):
+        if _LAUNCH_RE.search(lines[i]):
+            lines = lines[i + 1:]
+            break
+    return [(line, store, a, o) for line in lines
+            for store, a, o in _root_loads(line)]
+
+
+def any_root_load(paths):
+    """True when main.log holds a store-root load line AFTER the latest app launch
+    line (K3: the case of R2-C is decided only by events of the running process;
+    a Loaded line of a dead process does not make case (ii); case (iii) is a log
+    with no such line)."""
+    return bool(root_load_events(paths))
+
+
+def latest_root_loads(paths, mark=(None, 0)):
+    """{store: (acc, org)} of the LATEST store-root load per store, of any
+    account, after `mark`. No clock decides."""
+    found = {}
+    for _line, store, a, o in root_load_events(paths, mark):
+        found[store] = (a, o)
     return found
+
+
+def latest_loaded_pair(paths, account, store=STORES[0], mark=(None, 0)):
+    """The pair the APP loads for `account` in `store`: the latest "Loaded N
+    persisted sessions from <store>/<acc>/<org>" line of the app log (after
+    `mark`) that names `account`. A load of another account is never used.
+    Returns {"pair": (acc, org), "source": text} or None when the log holds no
+    such line ("pair not seen in the app log")."""
+    acc = account.lower() if account else None
+    if not acc:
+        return None
+    best = None
+    for line, s, a, o in root_load_events(paths, mark):
+        if s == store:             # K2': the LATEST load of the store, any account
+            best = (line, a, o)
+    if best is None or best[1] != acc:
+        return None
+    m = _LINE_TS.match(best[0])
+    when = m.group(1).replace("T", " ") if m else "time unknown"
+    return {"pair": (best[1], best[2]),
+            "source": "the latest \"Loaded N persisted sessions\" line of the "
+                      "app log (main.log, %s)" % when}
+
+
+def loaded_by_another(paths, account, store=STORES[0], mark=(None, 0)):
+    """True when the latest load of `store` after the latest launch line names an
+    account other than `account` (K2': the app runs that one; no pair exists)."""
+    acc = account.lower() if account else None
+    last = None
+    for _line, s, a, _o in root_load_events(paths, mark):
+        if s == store:
+            last = a
+    return last is not None and last != acc
 
 
 def fresh_root_loads(paths, acc, mark):

@@ -109,9 +109,32 @@ class C4NoFallback(VerifyBase):
             json.dump({"oauthAccount": {"accountUuid": B,
                                         "organizationUuid": uid(0x99)}}, fh)
 
+    def no_loaded_line(self):
+        """Ruling R2-C 2: the bad_pair rule applies only when no Loaded line names
+        a pair of the CLI account; the log keeps a launch line and nothing else."""
+        self.h.log_file("main.log", ["2026-11-22 09:59:00 info: app starting"])
+
+    def test_c4_verify_start_loaded_pair_of_cli_account_judged_missing_org_is_a_note(self):
+        """Ruling R2-C 2: a Loaded line names an existing pair of the CLI account
+        while the CLI org dir is missing: not bad_pair, the missing dir is a note."""
+        self.finished_move()
+        self.cli_org_gone()
+        org_x = uid(0x55)
+        pair = self.h.pair(CC, B, org_x)
+        self.h.card(pair, 96, "cid-96")
+        self.no_loaded_line()
+        append_log(self.h, loaded_line(self.h, CC, acc=B, org=org_x))
+        code, out, err = self.run_verify(True)
+        self.assertNotEqual(self.verdict()["verdict"], "bad_pair", out + err)
+        low = (out + err).lower().replace(u"\u0451", u"\u0435")
+        self.assertIn(u"\u043d\u0435\u0442 \u043f\u0430\u043f\u043a\u0438 \u0430\u043a\u0442\u0438\u0432"
+                      u"\u043d\u043e\u0439 \u043e\u0440\u0433\u0430\u043d\u0438\u0437\u0430\u0446\u0438\u0438", low,
+                      "the missing CLI org dir is printed as a note")
+
     def test_c4_verify_start_missing_cli_org_dir_is_bad_pair(self):
         self.finished_move()
         self.cli_org_gone()                 # O2 is the lone org dir, it must not be used
+        self.no_loaded_line()               # no Loaded line names a CLI-account pair
         code, out, err = self.run_verify(True)
         self.assertEqual(code, 3, out + err)
         self.assertEqual(self.verdict()["verdict"], "bad_pair")

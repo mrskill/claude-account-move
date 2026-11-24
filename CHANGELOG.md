@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+- the pair the program judges and writes into is the pair the APP loads (contract
+  item A9): the latest "Loaded N persisted sessions from <store>/<acc>/<org>"
+  line of the app log for the account, never another account's pair. One shared
+  reader, `heal_active.latest_loaded_pair` (on `root_load_events`), is used by
+  `adopt`, the post-move check (`finish`) and `verify-start`. `adopt --apply`
+  prints "pair used: <acc>/<org> (source: ...)". `finish` judges target_names,
+  lagging and tasks on that pair and, when it differs from the last pair the log
+  mentions, prints both in a note. With no Loaded line for the account the
+  check says "pair not seen in the app log" and claims no loss.
+
+- `adopt` (CAM-ADOPT-ORPHANS, judge contract A1-A8, G1-G3): a session with a
+  real user prompt, a `session-owner` line or a version-5 id and no card in any
+  store (any account, any organization) is invisible to prepare, finish and the
+  post-move check and vanishes from the panel on an account change (case of the
+  16.11.2026 move). New command `adopt` lists these orphans (dry run, writes
+  nothing); `adopt --apply` writes one card per orphan into the active
+  `claude-code-sessions` pair as a deep copy of the newest parsable card, with
+  `cliSessionId`, `cwd`, `title` (last custom/ai title, else the first prompt
+  cut to 60), `createdAt`, `lastActivityAt` and `completedTurns` set, all as
+  ints, and every field equal to the template's own local id set to the new id.
+  Each write is journaled (intent, then done with sha256 and inode) before and
+  after a temp file and a no-replace hard link; a name that exists is refused;
+  the app must be closed; a second run writes nothing. `adopt --undo JOURNAL`
+  removes only what that journal created and only while sha256 and inode still
+  match. `--only ID` limits the run. No active pair, or no parsable template
+  card: refusal, exit 3. Transcripts are never written. `prepare` names the
+  orphans in a readiness note, `auto` runs `adopt --apply` after heal-active
+  (once more after the sync when the new pair held no card to copy; it records
+  the journal in the summary and the report), and `finish` has the check
+  "sessions without a card", part of the verdict. Only the first 64 KiB of a
+  transcript are searched for the `session-owner` line, so thousands of
+  transcripts are not read end to end. The active pair is the one the app log
+  names for the app account (as `sync` does), else the organization of the CLI
+  account. Review rounds (F1-F14, R2-C, closure K1-K7): the pair is opened once
+  with every path component checked by lstat and every card write goes through
+  that directory fd, rechecked before each write; the app/CLI account guard
+  holds with `--active-pair` too; the app check is repeated before each card
+  write; an unreadable card in any store makes `adopt --apply` refuse (the dry
+  run names it); a temp file is removed only when this run created it, and
+  `adopt --undo` removes a leftover temp only when the journal recorded its
+  sha256 and inode (else it is reported as ambiguous); `finish` decides the log
+  case only by events after the latest launch line, claims no loss in case (ii)
+  and reads the scheduled tasks of the loaded pair only.
+
 - start detection, round 3 (judge contract C1-C6): `verify-start` needs the app
   account to equal the CLI account (else `wrong_account`), the active org dir
   of `.claude.json` must exist (else `bad_pair`, no guessing of another org),
